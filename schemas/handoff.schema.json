@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/handoff.schema.json",
+  "title": "Implementation handoff",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "unit_id",
+    "status",
+    "outcome",
+    "files_changed",
+    "behavior",
+    "commands",
+    "unresolved_failures",
+    "assumptions",
+    "risks",
+    "next_action",
+    "commit",
+    "usage",
+    "user_input_required"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "unit_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "failed",
+        "partial",
+        "blocked"
+      ]
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths."
+      }
+    },
+    "behavior": {
+      "type": "string"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "command",
+          "exit_code",
+          "result"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "string"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "unresolved_failures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "object",
+      "required": [
+        "sha",
+        "branch",
+        "worktree"
+      ],
+      "properties": {
+        "sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worktree": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "usage": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "user_input_required": {
+      "type": "boolean"
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "description": "Semantic rules enforced in Python: succeeded requires commands all exiting 0 and no unresolved_failures; files_changed must fall inside the unit scope; no secret-looking strings."
+}

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/run_status.schema.json",
+  "title": "Run status",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "unit_id",
+    "state",
+    "tier",
+    "attempt",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "unit_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "verifying",
+        "succeeded",
+        "failed",
+        "escalated",
+        "blocked",
+        "cancelled"
+      ]
+    },
+    "tier": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "runner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "example-open-small-2",
+      "object": "model",
+      "active": true,
+      "context_window": 131072
+    },
+    {
+      "id": "example-open-small-legacy",
+      "object": "model",
+      "active": true
+    },
+    {
+      "id": "example-open-small-1",
+      "object": "model",
+      "active": false
+    }
+  ]
+}

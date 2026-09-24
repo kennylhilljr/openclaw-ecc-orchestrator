@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "unit_id": "P1-03",
+  "status": "succeeded",
+  "outcome": "Downloader implemented with a size bound and atomic rename.",
+  "files_changed": [
+    "research_mcp/security.py",
+    "tests/test_security_foundation.py"
+  ],
+  "behavior": "Downloads stop at the byte limit and land via rename into place.",
+  "commands": [
+    {
+      "command": "pytest -q tests/test_security_foundation.py",
+      "exit_code": 0,
+      "result": "12 passed"
+    }
+  ],
+  "unresolved_failures": [],
+  "assumptions": [
+    "Target directory is writable."
+  ],
+  "risks": [],
+  "next_action": "Independent tier 2 review.",
+  "commit": {
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "branch": "unit/P1-03",
+    "worktree": ".worktrees/P1-03"
+  },
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 300,
+    "cost_usd": 0.42,
+    "model": "example-model"
+  },
+  "user_input_required": false
+}

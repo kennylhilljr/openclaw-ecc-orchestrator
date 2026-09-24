@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "id": "D-01",
+  "title": "Fix typos in the routing guide",
+  "depends_on": [],
+  "scope": {
+    "files": [
+      "docs/routing.md"
+    ]
+  },
+  "acceptance": {
+    "commands": [
+      "python3 -m unittest"
+    ]
+  },
+  "risk": "low",
+  "capabilities": {
+    "network": false,
+    "secrets": []
+  },
+  "routing": {
+    "initial_tier": 0,
+    "maximum_tier": 1,
+    "reviewer_must_differ_from_author": true
+  },
+  "budget": {
+    "attempts": 2,
+    "minutes": 10,
+    "maximum_cost_usd": 0.25
+  },
+  "rollback": "Revert the documentation commit.",
+  "traits": [
+    "mechanical"
+  ]
+}

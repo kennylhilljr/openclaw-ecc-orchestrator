@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/routing_decision.schema.json",
+  "title": "Routing decision",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "unit_id",
+    "score",
+    "signals",
+    "risk",
+    "minimum_tier",
+    "chosen_tier",
+    "maximum_tier",
+    "reasons",
+    "decided_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "unit_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "score": {
+      "type": "integer"
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "points",
+          "reason"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "points": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "minimum_tier": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "chosen_tier": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "maximum_tier": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "review_tier": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "estimated_cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "decided_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

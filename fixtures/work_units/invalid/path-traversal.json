@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "id": "P1-03",
+  "title": "Bounded atomic downloader",
+  "depends_on": [],
+  "scope": {
+    "files": [
+      "../outside/secrets.py"
+    ]
+  },
+  "acceptance": {
+    "commands": [
+      "pytest -q tests/test_security_foundation.py"
+    ]
+  },
+  "risk": "high",
+  "capabilities": {
+    "network": false,
+    "secrets": []
+  },
+  "routing": {
+    "initial_tier": 2,
+    "maximum_tier": 2,
+    "reviewer_must_differ_from_author": true
+  },
+  "budget": {
+    "attempts": 2,
+    "minutes": 45,
+    "maximum_cost_usd": 3.0
+  },
+  "rollback": "Remove the additive module and tests."
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/verification_result.schema.json",
+  "title": "Verification result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "unit_id",
+    "passed",
+    "checks",
+    "verified_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "unit_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "command",
+          "exit_code",
+          "passed"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "output_excerpt": {
+      "type": "string"
+    }
+  },
+  "description": "passed true requires every check passed; each check's passed must equal exit_code == 0."
+}

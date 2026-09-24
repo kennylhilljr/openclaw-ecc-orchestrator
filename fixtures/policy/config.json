@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0",
+  "high_risk_paths": [
+    "**/security*.py",
+    "**/auth/**",
+    "migrations/**",
+    ".orchestration/**"
+  ],
+  "required_checks": [
+    "unit-tests",
+    "handoff-validation"
+  ],
+  "protected_commands": [
+    "git push*",
+    "git reset --hard*",
+    "rm -rf*",
+    "git clean -fdx*"
+  ],
+  "allowed_providers": [
+    "claude",
+    "codex",
+    "gemini",
+    "groq",
+    "openrouter",
+    "kimi"
+  ],
+  "budget": {
+    "max_cost_usd_per_unit": 5.0,
+    "max_cost_usd_total": 50.0,
+    "max_minutes_per_unit": 120
+  },
+  "model_preferences": {
+    "gemini": {
+      "economical": [
+        "example-flash-*"
+      ],
+      "standard": [
+        "example-flash-plus-*"
+      ],
+      "advanced": [
+        "example-pro-*"
+      ]
+    },
+    "groq": {
+      "economical": [
+        "example-open-small-*"
+      ]
+    },
+    "openrouter": {
+      "standard": [
+        "example-vendor/reviewer-*"
+      ],
+      "advanced": [
+        "example-vendor/reviewer-*"
+      ]
+    },
+    "kimi": {
+      "standard": [
+        "example-long-context-*"
+      ]
+    }
+  },
+  "retired_model_ids": [
+    "example-open-small-legacy"
+  ],
+  "cli_models": {
+    "claude": {
+      "economical": "haiku",
+      "standard": "sonnet",
+      "advanced": "opus"
+    },
+    "codex": {
+      "economical": "REPLACE_WITH_ECONOMICAL_ALIAS",
+      "standard": "REPLACE_WITH_STANDARD_ALIAS",
+      "advanced": "REPLACE_WITH_ADVANCED_ALIAS"
+    }
+  },
+  "runner_costs": {
+    "claude": {
+      "economical": 0.02,
+      "standard": 0.5,
+      "advanced": 2.0
+    },
+    "codex": {
+      "economical": 0.05,
+      "standard": 0.4,
+      "advanced": 1.5
+    },
+    "gemini": {
+      "economical": 0.004,
+      "standard": 0.02,
+      "advanced": 0.08
+    },
+    "groq": {
+      "economical": 0.002
+    },
+    "kimi": {
+      "standard": 0.03
+    }
+  },
+  "cost_estimation": {
+    "input_tokens": 20000,
+    "output_tokens": 4000
+  },
+  "circuit_breaker": {
+    "failure_threshold": 3,
+    "cooldown_seconds": 900
+  },
+  "openrouter": {
+    "approved_models": [
+      "example-vendor/reviewer-2"
+    ],
+    "data_policy": "provider must not train on or retain prompts"
+  },
+  "catalog_max_age_seconds": 86400
+}

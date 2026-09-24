@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "name": "models/example-flash-2",
+      "supportedGenerationMethods": [
+        "generateContent"
+      ],
+      "inputTokenLimit": 1048576
+    },
+    {
+      "name": "models/example-pro-2",
+      "supportedGenerationMethods": [
+        "generateContent"
+      ]
+    },
+    {
+      "name": "models/example-embedding-1",
+      "supportedGenerationMethods": [
+        "embedContent"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# Extends the default gitleaks rules. Fake secrets used by redaction tests are
+# marked inline with "gitleaks:allow" instead of allowlisting whole folders.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Compiled bytecode and vendored ECC documentation examples"
+paths = [
+  '''(^|/)__pycache__/''',
+  '''\.pyc$''',
+  '''^\.kimi-code/skills/api-design/SKILL\.md$''',
+]

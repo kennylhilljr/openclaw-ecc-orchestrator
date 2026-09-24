@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/work_unit.schema.json",
+  "title": "Work unit",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "title",
+    "depends_on",
+    "scope",
+    "acceptance",
+    "risk",
+    "capabilities",
+    "routing",
+    "budget",
+    "rollback"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+      }
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "files"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths."
+          }
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "required": [
+        "commands"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "network",
+        "secrets"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "boolean"
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+          },
+          "description": "Environment variable NAMES only."
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "required": [
+        "initial_tier",
+        "maximum_tier",
+        "reviewer_must_differ_from_author"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "initial_tier": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "maximum_tier": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "reviewer_must_differ_from_author": {
+          "type": "boolean"
+        }
+      },
+      "description": "initial_tier must not exceed maximum_tier (enforced by the Python validator)."
+    },
+    "budget": {
+      "type": "object",
+      "required": [
+        "attempts",
+        "minutes",
+        "maximum_cost_usd"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minutes": {
+          "type": "number",
+          "minimum": 0
+        },
+        "maximum_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "rollback": {
+      "type": "string",
+      "minLength": 1
+    },
+    "traits": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "mechanical",
+          "fixture_generation",
+          "database",
+          "security",
+          "concurrency",
+          "architecture",
+          "previous_attempt_failed"
+        ]
+      }
+    }
+  }
+}

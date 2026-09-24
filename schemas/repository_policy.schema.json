@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/repository_policy.schema.json",
+  "title": "Repository orchestration policy (.orchestration/config.yaml, JSON compatible)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "high_risk_paths",
+    "required_checks",
+    "protected_commands",
+    "allowed_providers",
+    "budget"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "high_risk_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths."
+      }
+    },
+    "required_checks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "protected_commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "allowed_providers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      }
+    },
+    "budget": {
+      "type": "object",
+      "required": [
+        "max_cost_usd_per_unit",
+        "max_cost_usd_total",
+        "max_minutes_per_unit"
+      ],
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0
+      },
+      "properties": {
+        "max_cost_usd_per_unit": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_cost_usd_total": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_minutes_per_unit": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "model_preferences": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Ordered glob patterns per provider and capability class; never fixed ids."
+    },
+    "cli_models": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "additionalProperties": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "retired_model_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runner_costs": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "additionalProperties": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "cost_estimation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "circuit_breaker": {
+      "type": "object",
+      "required": [
+        "failure_threshold",
+        "cooldown_seconds"
+      ],
+      "properties": {
+        "failure_threshold": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cooldown_seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "openrouter": {
+      "type": "object",
+      "required": [
+        "approved_models",
+        "data_policy"
+      ],
+      "properties": {
+        "approved_models": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[^*?\\[]+$"
+          }
+        },
+        "data_policy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "catalog_max_age_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    }
+  },
+  "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block."
+}

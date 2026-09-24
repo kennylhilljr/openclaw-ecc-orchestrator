@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.invalid/schemas/runner_certification.schema.json",
+  "title": "Runner certification record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "runner",
+    "provider",
+    "status",
+    "checks",
+    "certified_at",
+    "version",
+    "models"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "runner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "family": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "coding_cli",
+        "api"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "certified",
+        "failed",
+        "not_configured",
+        "retired"
+      ]
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "status",
+          "reason"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "installed",
+              "authentication",
+              "live_inference",
+              "repo_exercise",
+              "cancellation_timeout",
+              "log_inspection",
+              "metadata_capture"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "skip"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "certified_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "usage": {
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  },
+  "description": "status certified requires every check present and none failing."
+}
