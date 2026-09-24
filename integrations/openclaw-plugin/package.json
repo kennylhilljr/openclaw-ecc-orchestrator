@@ -1,0 +1,46 @@
+{
+  "name": "openclaw-ecc-orchestrator-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw plugin for the openclaw-ecc-orchestrator runtime: event log tailing, approval decisions, Control UI tab.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "src/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "peerDependencies": {
+    "openclaw": "2026.9.6"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.6",
+      "minGatewayVersion": "2026.9.6"
+    },
+    "build": {
+      "openclawVersion": "2026.9.6",
+      "pluginSdkVersion": "2026.9.6"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:contract": "node --test tests/contract/*.test.js",
+    "test:integration": "bash tests/integration/isolated-gateway.sh"
+  }
+}

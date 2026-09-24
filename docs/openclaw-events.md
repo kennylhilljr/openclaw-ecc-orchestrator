@@ -11,6 +11,11 @@ The boundary is deliberately narrow:
 A thin OpenClaw plugin (for example in TypeScript) only needs to tail one
 file, render events, and write decision files. It never imports Python.
 
+The OpenClaw 2026.9.6 plugin that implements this contract lives in
+[integrations/openclaw-plugin](../integrations/openclaw-plugin/README.md),
+with its install steps (an operator approved change), rollback, tests and
+known gaps.
+
 ## Transport
 
 | Item | Value |

@@ -1,0 +1,60 @@
+{
+  "id": "ecc-orchestrator",
+  "name": "ECC Orchestrator",
+  "description": "Surfaces openclaw-ecc-orchestrator runtime events (runs, attention, approvals, merges) and records approval decisions made in OpenClaw.",
+  "categories": [
+    "developer-tools"
+  ],
+  "activation": {
+    "onStartup": true,
+    "onCommands": [
+      "ecc",
+      "ecc-decide"
+    ]
+  },
+  "commandAliases": [
+    {
+      "name": "ecc"
+    },
+    {
+      "name": "ecc-decide"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "eventLog": {
+        "type": "string",
+        "description": "Absolute path of the runtime's openclaw-events.jsonl (read only)."
+      },
+      "inbox": {
+        "type": "string",
+        "description": "Absolute path of the runtime's decision inbox directory."
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Absolute directory for the plugin's read position and view state (outside ~/.openclaw)."
+      },
+      "runtimeCli": {
+        "type": "string",
+        "description": "Optional absolute path of the runtime CLI executable, used only for read only 'status' calls."
+      },
+      "runtimeCliArgs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 16,
+        "description": "Optional arguments placed before 'status --json', for example ['-m', 'openclaw_ecc_orchestrator', '--config', '/abs/config.json']."
+      },
+      "pollIntervalMs": {
+        "type": "integer",
+        "minimum": 250,
+        "maximum": 60000,
+        "description": "Event log poll interval in milliseconds (default 1000)."
+      }
+    },
+    "description": "eventLog, inbox and stateDir are required for the plugin to run; without them it registers only a /ecc command that explains the missing configuration."
+  }
+}
