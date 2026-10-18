@@ -8,7 +8,7 @@ import unittest
 
 from openclaw_ecc_orchestrator import schemas
 from openclaw_ecc_orchestrator.runners import probes
-from openclaw_ecc_orchestrator.runners.base import CommandResult, ProbeContext
+from openclaw_ecc_orchestrator.runners.base import CancelResult, CommandResult, ProbeContext
 from openclaw_ecc_orchestrator.runners.discovery import HttpResponse
 from openclaw_ecc_orchestrator.runners.registry import RetiredRunnerError
 
@@ -21,13 +21,36 @@ def ok(stdout="", stderr=""):
     return CommandResult(0, stdout, stderr)
 
 
-class FakeCommands:
-    """Rules are (substring of the joined argv, result | callable | HANG)."""
+# What the event triggered cancel runner reports for a CLI that streamed its
+# first event and was cancelled with its whole group.
+STREAMED = CancelResult(True, False, -15, True, 2, 0.4, '{"type":"system","subtype":"init"}\n', "",
+                        True, "system/init", 0.3)
 
-    def __init__(self, rules):
+
+class FakeCommands:
+    """Rules are (substring of the joined argv, result | callable | HANG).
+
+    ``cancel`` is what the fake cancel runner returns: a CancelResult, HANG,
+    a callable, or a list consumed one per attempt (default: STREAMED)."""
+
+    def __init__(self, rules, cancel=None):
         self.rules = rules
         self.calls = []
+        self.cancel_calls = []
+        self.cancel_result = STREAMED if cancel is None else cancel
         self.release = threading.Event()
+
+    def cancel(self, argv, max_wait, cwd=None):
+        if not isinstance(argv, list):
+            raise TypeError("argv must be a list")
+        self.cancel_calls.append((list(argv), max_wait))
+        result = self.cancel_result
+        if isinstance(result, list):
+            result = result.pop(0) if len(result) > 1 else result[0]
+        if result is HANG:
+            self.release.wait(30)
+            return CancelResult(False, False, None, True, 0, 0.0)
+        return result(argv) if callable(result) else result
 
     def __call__(self, argv, timeout, cwd=None):
         if not isinstance(argv, list):
@@ -83,7 +106,6 @@ def claude_rules(**overrides):
         "failing unit test": ok(CLAUDE_JSON),
         "claude --version": ok("2.1.0 (Claude Code)\n"),
         "claude auth status": ok(CLAUDE_AUTH),
-        "Cancellation probe": CommandResult(-9, "", "", timed_out=True),
         "claude -p": ok(CLAUDE_JSON),
     })
     rules.update(overrides)
@@ -103,7 +125,6 @@ def codex_rules(**overrides):
         "failing unit test": ok(CODEX_JSONL),
         "codex --version": ok("codex-cli 1.2.3\n"),
         "codex login status": ok("Logged in using ChatGPT\n"),
-        "Cancellation probe": CommandResult(-9, "", "", timed_out=True),
         "codex exec": ok(CODEX_JSONL),
     })
     rules.update(overrides)
@@ -119,7 +140,7 @@ def ctx(commands=None, http_get=None, http_post=None, env=None, model="sonnet",
         env=env if env is not None else {},
         clock=lambda: NOW,
         step_timeout=step_timeout,
-        cancel_timeout=0.1,
+        cancel_command=getattr(commands, "cancel", None),
         make_workdir=lambda: "probe-workdir",
         cleanup_workdir=lambda path: None,
         write_file=lambda path, content: None,
@@ -147,8 +168,7 @@ class ClaudeProbeTests(unittest.TestCase):
         self.assertTrue(all(s == "pass" for s in statuses(record).values()))
 
     def test_hung_cli_yields_timeout_not_hang(self):
-        commands = FakeCommands(claude_rules(**{"claude -p": HANG, "failing unit test": HANG,
-                                                "Cancellation probe": HANG}))
+        commands = FakeCommands(claude_rules(**{"claude -p": HANG, "failing unit test": HANG}), cancel=HANG)
         start = time.monotonic()
         try:
             record = probes.probe_runner("claude", ctx(commands, step_timeout=0.2))

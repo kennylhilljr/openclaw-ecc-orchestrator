@@ -23,8 +23,11 @@ EXERCISE_PROMPT = (
     "Run: python3 -m unittest -q   Read calc.py and fix the bug in calc.py only; do not "
     "modify test_calc.py. Run the tests again to confirm they pass, then commit your fix "
     "with: git commit -am \"probe: fix add\"   Do not touch anything else.")
-CANCEL_PROMPT = ("Cancellation probe: run the shell command `sleep 120` and wait for it to "
-                 "finish, then reply done.")
+# The cancellation check starts the ordinary probe prompt in streaming output
+# mode and cancels on the first stream event: it never asks the model to run
+# anything. An exit before any event is inconclusive and retried; after
+# CANCEL_ATTEMPTS inconclusive runs the check fails with ``no_stream_event``.
+CANCEL_ATTEMPTS = 3
 
 # The disposable project for ``repo_exercise``: one failing unittest.
 EXERCISE_FILES = {
@@ -39,6 +42,7 @@ EXERCISE_TEST_ARGV = ["python3", "-B", "-m", "unittest", "-q"]  # -B: no stale b
 
 _GIT_IDENTITY = ["-c", "user.name=runner-probe", "-c", "user.email=runner-probe@example.invalid"]
 _ERROR_LIMIT = 160
+_DETAIL_LIMIT = 480
 
 
 def _first_line(text: str) -> str:
@@ -93,8 +97,8 @@ class CliAdapter:
 
     def build_cancel_invocation(self, model: str | None = None,
                                 cwd: str | None = None) -> list[str]:
-        """A long running task that starts a child process (``sleep``)."""
-        return self.build_invocation(CANCEL_PROMPT, model, cwd=cwd)
+        """The short probe prompt in the CLI's streaming (JSON lines) output mode."""
+        return self.build_invocation(PROBE_PROMPT, model, cwd=cwd)
 
     def parse_output(self, stdout: str) -> dict[str, Any]:
         """``{"text", "model", "cost_usd", "input_tokens", "output_tokens", "error"}``;
@@ -232,35 +236,45 @@ class CliAdapter:
             ctx.cleanup_workdir(workdir)
 
     def cancellation(self, ctx: ProbeContext) -> StepOutcome:
-        workdir = ctx.make_workdir()
-        try:
-            argv = self.build_cancel_invocation(ctx.model, cwd=workdir)
-            if ctx.cancel_command is not None:
-                return self._cancel_with_group_check(ctx, argv, workdir)
-            result = ctx.run_command(argv, ctx.cancel_timeout, workdir)
-        finally:
-            ctx.cleanup_workdir(workdir)
-        if result.timed_out:
-            return StepOutcome("pass", "terminated after cancel timeout")
-        return StepOutcome("fail", "exited before the cancel point (exit %d)" % result.returncode,
-                           _first_line(result.stderr))
-
-    def _cancel_with_group_check(self, ctx: ProbeContext, argv: list[str],
-                                 workdir: str) -> StepOutcome:
-        res: CancelResult = ctx.cancel_command(argv, ctx.cancel_timeout, workdir)
-        meta = {"members_before": res.members_before, "elapsed_seconds": res.elapsed_seconds}
-        if not res.started:
-            return StepOutcome("fail", "could not start the cancellation task", "", meta)
-        if res.exited_early:
+        """Event triggered cancellation: start the probe prompt in streaming
+        mode, cancel the process group as soon as the first stream event
+        arrives on stdout, and prove the whole group is gone. Independent of
+        the model agreeing to do anything: the event precedes the answer."""
+        if ctx.cancel_command is None:
+            return StepOutcome("fail", "no event aware cancel runner",
+                               "a finished command cannot be cancelled; inject ctx.cancel_command")
+        inconclusive: list[str] = []
+        for attempt in range(1, CANCEL_ATTEMPTS + 1):
+            workdir = ctx.make_workdir()
+            try:
+                argv = self.build_cancel_invocation(ctx.model, cwd=workdir)
+                res: CancelResult = ctx.cancel_command(argv, ctx.step_timeout, workdir)
+            finally:
+                ctx.cleanup_workdir(workdir)
+            meta = {"attempts": attempt, "members_before": res.members_before,
+                    "elapsed_seconds": res.elapsed_seconds, "first_event": res.first_event or None,
+                    "event_seconds": res.event_seconds}
+            if not res.started:
+                return StepOutcome("fail", "could not start the cancellation task", "", meta)
+            if res.event_seen and not res.exited_early:
+                if not res.group_gone:
+                    return StepOutcome("fail", "process group survived cancellation",
+                                       "%d process(es) in the group at cancel" % res.members_before, meta)
+                return StepOutcome("pass", "cancelled on the first stream event; whole process group gone",
+                                   "first event %s after %ss; %d process(es) in the group at cancel, "
+                                   "0 after; attempt %d" % (res.first_event, res.event_seconds,
+                                                            res.members_before, attempt), meta)
+            if not res.exited_early:
+                return StepOutcome("fail", "no_stream_event",
+                                   "no stream event within %ss; group killed (%s)"
+                                   % (int(ctx.step_timeout), "gone" if res.group_gone else "survivors"),
+                                   meta)
             parsed = self.parse_output(res.stdout)
-            why = parsed.get("error") or _first_line(res.stderr)
-            return StepOutcome("fail", "exited before the cancel point (exit %s)"
-                               % res.returncode, (why or "")[:_ERROR_LIMIT], meta)
-        if not res.group_gone:
-            return StepOutcome("fail", "process group survived cancellation", "", meta)
-        return StepOutcome("pass", "cancelled; whole process group gone",
-                           "%d process(es) in the group at cancel, 0 after"
-                           % res.members_before, meta)
+            why = parsed.get("error") or _first_line(res.stderr) or ("exit %s" % res.returncode)
+            inconclusive.append("attempt %d: exited before %s (%s)" % (
+                attempt, "the cancel" if res.event_seen else "any stream event", why[:_ERROR_LIMIT]))
+        return StepOutcome("fail", "no_stream_event", "; ".join(inconclusive)[:_DETAIL_LIMIT],
+                           {"attempts": CANCEL_ATTEMPTS})
 
 
 class ClaudeAdapter(CliAdapter):
@@ -276,11 +290,13 @@ class ClaudeAdapter(CliAdapter):
     auth_argv = ["claude", "auth", "status", "--json"]
     credential_env = ("HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
     edit_tools = "Read,Edit,Write,Bash(git *),Bash(python3 *)"
-    cancel_tools = "Bash(sleep *)"
 
-    def _base(self, model):
-        argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence",
+    def _base(self, model, output_format="json"):
+        argv = ["claude", "-p", "--output-format", output_format, "--no-session-persistence",
                 "--permission-prompts", "none"]
+        if output_format == "stream-json":
+            # Claude Code 2.1.281: print mode refuses stream-json without --verbose.
+            argv.append("--verbose")
         if model:
             argv += ["--model", model]
         if self.effort:
@@ -294,7 +310,7 @@ class ClaudeAdapter(CliAdapter):
         return argv + ["--", prompt]
 
     def build_cancel_invocation(self, model=None, cwd=None):
-        return self._base(model) + ["--allowedTools", self.cancel_tools, "--", CANCEL_PROMPT]
+        return self._base(model, "stream-json") + ["--", PROBE_PROMPT]
 
     def parse_auth(self, result):
         try:

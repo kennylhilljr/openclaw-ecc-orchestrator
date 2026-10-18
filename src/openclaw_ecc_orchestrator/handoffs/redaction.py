@@ -42,6 +42,10 @@ _PREFIX_PATTERNS = [
     r"xox[a-z]-[A-Za-z0-9\-]{10,}",
     r"(?:AKIA|ASIA)[A-Z0-9]{16}",
     r"hf_[A-Za-z0-9]{20,}",
+    # Provider account and key identifiers echoed in error bodies (Moonshot,
+    # observed 2026-10-18). Not secrets on their own, but they identify the account.
+    r"\bak-[a-z0-9]{16,}",
+    r"\borg-[0-9a-f]{24,}",
     r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
     r"(?i:bearer)\s+[A-Za-z0-9._~+/\-]{16,}=*",
 ]
@@ -108,12 +112,50 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+# Absolute filesystem paths under these roots are judged one path segment at a
+# time by the high entropy rule. Otherwise a whole macOS temp path such as
+# /private/var/folders/6j/8_5x46rs.../T/tmpabc (mixed case, digits, slashes)
+# reads as one random token and gets masked. A segment that is itself long
+# and random is still masked, and the credential prefix rules apply anywhere.
+_PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
+               "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
+
+
+def _path_start(token: str) -> int:
+    """Index where an absolute path begins in ``token`` (at its start or right
+    after ``=`` / ``:`` as in ``cwd=/private/...``), or -1."""
+    best = -1
+    for root in _PATH_ROOTS:
+        idx = token.find(root)
+        while idx > 0 and token[idx - 1] not in "=:":
+            idx = token.find(root, idx + 1)
+        if idx >= 0 and (best < 0 or idx < best):
+            best = idx
+    return best
+
+
+def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
+    token = m.group(0)
+    start = _path_start(token)
+    if start < 0:
+        return [m.span()] if _is_high_entropy(token) else []
+    spans = []
+    head = token[:start]
+    if len(head) >= 32 and _is_high_entropy(head):
+        spans.append((m.start(), m.start() + start))
+    offset = m.start() + start
+    for segment in token[start:].split("/"):
+        if len(segment) >= 32 and _is_high_entropy(segment):
+            spans.append((offset, offset + len(segment)))
+        offset += len(segment) + 1
+    return spans
+
+
 def _detect_spans(text: str) -> list[tuple[int, int]]:
     spans = [m.span() for m in _PREFIX_RE.finditer(text)]
     spans += [m.span() for m in _PEM_BLOCK_RE.finditer(text)]
     for m in _TOKEN_RE.finditer(text):
-        if _is_high_entropy(m.group(0)):
-            spans.append(m.span())
+        spans.extend(_entropy_spans(m))
     return spans
 
 
@@ -128,9 +170,26 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
             if index == 0 and _AUTH_HEADER_RE.match(m.group(0)):
                 continue  # the header rule keeps the scheme and masks the credential
             value = m.group(1)
+            if index == 0 and _benign_named_value(text[m.start(0):m.start(1)], value):
+                continue
             if value and value != REDACTED and value.strip("\"'") != REDACTED:
                 spans.append(m.span(1))
     return _merge(spans)
+
+
+# Usage counters such as "promptTokenCount": 12 or "max_tokens": 64 match the
+# secret name rule ("token") but hold plain numbers, never credentials.
+_COUNTER_NAME_RE = re.compile(r"(?i)(?:count|limit|tokens)[\"']?\s*[:=]\s*$")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_STRUCTURAL_VALUES = frozenset({"[", "{", "[]", "{}"})
+
+
+def _benign_named_value(prefix: str, value: str) -> bool:
+    """True for values the name rule must leave visible (unquoted numbers of
+    counter or limit fields, and bare JSON structure tokens)."""
+    if value in _STRUCTURAL_VALUES:
+        return True
+    return bool(_NUMBER_RE.fullmatch(value) and _COUNTER_NAME_RE.search(prefix))
 
 
 def _apply(text: str, spans: list[tuple[int, int]]) -> str:
@@ -154,6 +213,44 @@ def contains_secret(text: object) -> bool:
     if not isinstance(text, str) or not text:
         return False
     return bool(_spans(text))
+
+
+# JSON fields that carry provider generated opaque values (reasoning
+# signatures, pagination cursors, response ids). A high entropy value inside
+# one of these is not treated as a leaked credential during log inspection.
+# Credential prefixes and registered secret values still count everywhere.
+OPAQUE_FIELDS = ("thoughtSignature", "thought_signature", "nextPageToken", "next_page_token",
+                 "responseId", "response_id")
+_OPAQUE_VALUE_RE = re.compile(
+    r"\"(?:%s)\"\s*:\s*\"([^\"]*)\"" % "|".join(re.escape(f) for f in OPAQUE_FIELDS))
+
+
+def inspection_findings(texts: Iterable[object], secrets: Iterable[str] = ()) -> list[dict]:
+    """Credential findings in runner output, for the certification log check.
+
+    Each finding is ``{"text": index, "kind": ...}`` and never contains the
+    value. Kinds: ``registered_secret`` (a literal secret such as the
+    provider key), ``credential_pattern`` (known key prefixes, JWTs, private
+    key blocks) and ``high_entropy`` (a long random looking token outside the
+    opaque provider fields in :data:`OPAQUE_FIELDS`).
+    """
+    literal = [s for s in secrets if s]
+    findings: list[dict] = []
+    for index, text in enumerate(texts):
+        if not isinstance(text, str) or not text:
+            continue
+        if any(value in text for value in literal):
+            findings.append({"text": index, "kind": "registered_secret"})
+        if _PREFIX_RE.search(text) or _PEM_BLOCK_RE.search(text):
+            findings.append({"text": index, "kind": "credential_pattern"})
+        opaque = [m.span(1) for m in _OPAQUE_VALUE_RE.finditer(text)]
+        for m in _TOKEN_RE.finditer(text):
+            hits = [span for span in _entropy_spans(m)
+                    if not any(start <= span[0] and span[1] <= end for start, end in opaque)]
+            if hits:
+                findings.append({"text": index, "kind": "high_entropy"})
+                break
+    return findings
 
 
 def _replace_literals(text: str, values: Iterable[str]) -> str:

@@ -12,6 +12,31 @@ function t(v, max = 200) {
   return maskText(v ?? "", max);
 }
 
+export function formatDuration(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "unknown";
+  const s = Math.round(seconds);
+  if (s < 120) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+/** One line describing a completion: exit, duration, attempts, tier, runner. */
+export function describeCompletion(c) {
+  const outcome = c.hung ? "cancelled as hung" : c.cancelled ? "cancelled" : c.exit_code === 0 ? "exited 0" : `exited ${c.exit_code ?? "?"}`;
+  return `${outcome} after ${formatDuration(c.duration_seconds)}, attempt ${c.attempts ?? "?"}, tier ${c.tier ?? "-"}, runner ${t(c.runner ?? "-", 64)}`;
+}
+
+/** Extra words for the health and budget attention reasons. */
+export function describeAttention(a) {
+  const d = a.detail && typeof a.detail === "object" ? a.detail : {};
+  const ev = d.evidence && typeof d.evidence === "object" ? d.evidence : {};
+  const where = d.gate ? `, gate ${t(d.gate, 100)}` : "";
+  if (a.reason === "suspected_hang") return ` (no progress for ${ev.flat_checks ?? "?"} of ${ev.flat_checks_for_hang ?? "?"} checks${where})`;
+  if (a.reason === "hung_cancelled") return ` (cancelled after ${ev.flat_checks ?? "?"} checks without progress${where})`;
+  if (a.reason === "long_running") return ` (running ${d.elapsed_minutes ?? "?"} min, budget ${d.budget_minutes ?? "?"} min; not stopped)`;
+  return "";
+}
+
 function remaining(expiresAt, nowSeconds) {
   if (typeof expiresAt !== "number") return "unknown";
   const s = Math.floor(expiresAt - nowSeconds);
@@ -47,6 +72,8 @@ export function snapshot(state, nowSeconds, { attentionLimit = 20, mergeLimit = 
           owner: u.owner,
           updated_at: u.updated_at,
           last_progress: u.progress.length ? u.progress[u.progress.length - 1] : null,
+          health: u.health ?? null,
+          completed: u.completed ?? null,
         })),
     }));
   const approvals = Object.values(state.approvals)
@@ -73,6 +100,7 @@ export function snapshot(state, nowSeconds, { attentionLimit = 20, mergeLimit = 
       approvals: approvals.slice(0, 50),
       attention: state.attention.slice(-attentionLimit).reverse(),
       merges: state.merges.slice(-mergeLimit).reverse(),
+      completions: (state.completions || []).slice(-mergeLimit).reverse(),
       counters: state.counters,
     },
     { maxDepth: 8, maxItems: 200, maxLength: 1000 },
@@ -121,17 +149,23 @@ export function renderSummaryText(state, nowSeconds) {
       if (!ACTIVE_STATES.has(u.state) && !PROBLEM_STATES.has(u.state)) continue;
       const last = u.progress.length ? ` | ${t(u.progress[u.progress.length - 1].message, 120)}` : "";
       const reason = u.reason ? ` (${t(u.reason, 80)})` : "";
-      lines.push(`  ${t(u.unit_id)}: ${t(u.state, 40)}${reason}${last}`);
+      const health = u.health && u.health.state && u.health.state !== "healthy" && u.state === "running" ? ` [health ${t(u.health.state, 40)}]` : "";
+      lines.push(`  ${t(u.unit_id)}: ${t(u.state, 40)}${reason}${health}${last}`);
     }
   }
   const pending = pendingApprovals(state, nowSeconds);
   lines.push("");
   lines.push(`Pending approvals: ${pending.length}${pending.length ? " (see /ecc pending)" : ""}`);
+  const completions = (state.completions || []).slice(-5).reverse();
+  if (completions.length) {
+    lines.push("Recent completions:");
+    for (const c of completions) lines.push(`  ${t(c.run_id)}/${t(c.unit_id)}: ${describeCompletion(c)}`);
+  }
   const attention = state.attention.slice(-5).reverse();
   if (attention.length) {
     lines.push("Recent attention:");
     for (const a of attention) {
-      lines.push(`  ${t(a.run_id)}/${t(a.unit_id ?? "-")}: ${t(a.reason, 80)}${a.state ? ` [${t(a.state, 40)}]` : ""}`);
+      lines.push(`  ${t(a.run_id)}/${t(a.unit_id ?? "-")}: ${t(a.reason, 80)}${a.state ? ` [${t(a.state, 40)}]` : ""}${describeAttention(a)}`);
     }
   }
   const merges = state.merges.slice(-5).reverse();
@@ -156,7 +190,7 @@ export function renderAttentionText(state, limit = 20) {
   return items
     .map((a) => {
       const files = a.files && a.files.length ? ` files: ${a.files.slice(0, 5).map((f) => t(f, 100)).join(", ")}` : "";
-      return `${t(a.at ?? "", 40)} ${t(a.run_id)}/${t(a.unit_id ?? "-")}: ${t(a.reason, 80)}${a.state ? ` [${t(a.state, 40)}]` : ""}${files}`;
+      return `${t(a.at ?? "", 40)} ${t(a.run_id)}/${t(a.unit_id ?? "-")}: ${t(a.reason, 80)}${a.state ? ` [${t(a.state, 40)}]` : ""}${describeAttention(a)}${files}`;
     })
     .join("\n");
 }
@@ -207,12 +241,13 @@ code{font:12px ui-monospace,monospace;word-break:break-all}.muted{color:var(--mu
   parts.push(`<h2>Runs</h2>`);
   if (!runs.length) parts.push(`<p class="muted">No runs seen yet.</p>`);
   for (const run of runs.slice(0, 20)) {
-    parts.push(`<h3>${h(run.run_id)}</h3><table><tr><th>Unit</th><th>State</th><th>Reason</th><th>Owner</th><th>Last progress</th></tr>`);
+    parts.push(`<h3>${h(run.run_id)}</h3><table><tr><th>Unit</th><th>State</th><th>Reason</th><th>Health</th><th>Owner</th><th>Last progress</th></tr>`);
     for (const u of Object.values(run.units).sort((a, b) => a.unit_id.localeCompare(b.unit_id))) {
       const cls = PROBLEM_STATES.has(u.state) ? "bad" : ACTIVE_STATES.has(u.state) ? "warn" : "";
       const last = u.progress.length ? u.progress[u.progress.length - 1].message : "";
       parts.push(
         `<tr><td>${h(u.unit_id)}</td><td class="${cls}">${h(u.state ?? "-", 40)}</td><td>${h(u.reason ?? "", 120)}</td>` +
+          `<td>${h(u.health && u.health.state ? u.health.state : "", 40)}</td>` +
           `<td>${h(u.owner ?? "", 128)}</td><td>${h(last, 200)}</td></tr>`,
       );
     }
@@ -225,9 +260,19 @@ code{font:12px ui-monospace,monospace;word-break:break-all}.muted{color:var(--mu
     parts.push(`<table><tr><th>When</th><th>Run / unit</th><th>Reason</th><th>State</th><th>Files</th></tr>`);
     for (const a of attention) {
       parts.push(
-        `<tr><td>${h(a.at ?? "", 40)}</td><td>${h(a.run_id)} / ${h(a.unit_id ?? "-")}</td><td class="warn">${h(a.reason, 100)}</td>` +
+        `<tr><td>${h(a.at ?? "", 40)}</td><td>${h(a.run_id)} / ${h(a.unit_id ?? "-")}</td><td class="warn">${h(a.reason, 100)}${h(describeAttention(a), 200)}</td>` +
           `<td>${h(a.state ?? "", 40)}</td><td>${h((a.files || []).slice(0, 5).join(", "), 300)}</td></tr>`,
       );
+    }
+    parts.push(`</table>`);
+  }
+  const completions = (state.completions || []).slice(-20).reverse();
+  parts.push(`<h2>Completions (${completions.length})</h2>`);
+  if (!completions.length) parts.push(`<p class="muted">None.</p>`);
+  else {
+    parts.push(`<table><tr><th>When</th><th>Run / unit</th><th>Outcome</th></tr>`);
+    for (const c of completions) {
+      parts.push(`<tr><td>${h(c.at ?? "", 40)}</td><td>${h(c.run_id)} / ${h(c.unit_id)}</td><td>${h(describeCompletion(c), 300)}</td></tr>`);
     }
     parts.push(`</table>`);
   }

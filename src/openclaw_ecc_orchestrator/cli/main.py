@@ -432,10 +432,19 @@ def _unit_view(run, uid):
                    "maximum_cost_usd": budget.get("maximum_cost_usd")},
         "used": {"minutes": round(float(unit.get("minutes_used") or 0.0), 4),
                  "cost_usd": round(float(unit.get("cost_usd") or 0.0), 6)},
+        "health": _health_view(annotations.get("health")),
         "verified_head": (annotations.get("verification") or {}).get("head"),
         "approval_request_id": (annotations.get("review") or {}).get("approval_request_id"),
         "depends_on": unit.get("depends_on") or [],
     }
+
+
+def _health_view(health):
+    """Last recorded runner health state (changes only; see process.health)."""
+    if not isinstance(health, dict):
+        return None
+    return {k: health.get(k) for k in ("state", "attempt", "flat_checks", "flat_checks_for_hang",
+                                       "interval_seconds", "checked_at")}
 
 
 def _approval_view(req):
@@ -480,8 +489,9 @@ def cmd_status(ctx):
     for u in units:
         cost = f"{u['used']['cost_usd']:.2f}/{u['budget']['maximum_cost_usd']}"
         minutes = f"{u['used']['minutes']:.1f}/{u['budget']['minutes']}"
+        health = f" health {u['health']['state']}" if u["health"] and u["state"] == "running" else ""
         lines.append(f"{u['unit_id']:<16} {u['state']:<17} tier {u['tier'] if u['tier'] is not None else '-'} "
-                     f"runner {u['runner'] or '-'} attempts {u['attempts']} cost {cost} minutes {minutes}")
+                     f"runner {u['runner'] or '-'} attempts {u['attempts']} cost {cost} minutes {minutes}{health}")
     for p in data["pending_approvals"]:
         lines.append(f"pending approval {p['request_id']} {p['action']} {p['unit_id']}")
     env["_summary"] = lines

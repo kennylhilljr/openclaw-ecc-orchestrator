@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .handoffs.redaction import contains_secret, redact_text, scan_strings
+from .process.health import health_block_errors
 from .tasks.scope import path_in_scope, unsafe_path_reason
 
 SCHEMA_VERSION = "1.0"
@@ -109,7 +110,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
         "file": "work_unit.schema.json",
         "required": ["schema_version", "id", "title", "depends_on", "scope", "acceptance",
                      "risk", "capabilities", "routing", "budget", "rollback"],
-        "optional": ["traits", "description"],
+        "optional": ["traits", "description", "health"],
         "nested_required": {
             "scope": ["files"],
             "acceptance": ["commands"],
@@ -136,7 +137,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
                      "protected_commands", "allowed_providers", "budget"],
         "optional": ["model_preferences", "retired_model_ids", "cli_models", "runner_costs",
                      "cost_estimation", "circuit_breaker", "openrouter",
-                     "catalog_max_age_seconds"],
+                     "catalog_max_age_seconds", "health"],
         "nested_required": {"budget": ["max_cost_usd_per_unit", "max_cost_usd_total",
                                        "max_minutes_per_unit"]},
         "enums": {"allowed_providers[]": list(KNOWN_PROVIDERS)},
@@ -350,6 +351,9 @@ def validate_work_unit(doc: Any) -> ValidationReport:
                     report.error("unknown trait: %s" % _show(trait))
     if "description" in doc and not isinstance(doc.get("description"), str):
         report.error("description must be a string")
+    if "health" in doc:
+        for message in health_block_errors(doc["health"]):
+            report.error(message)
     for hit in scan_strings({k: v for k, v in doc.items() if k not in ("schema_version", "id")}):
         report.violation("secret_detected", field=hit)
     return report
@@ -550,6 +554,10 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
             cool = breaker.get("cooldown_seconds")
             if not (_is_num(cool) and cool >= 0):
                 report.error("circuit_breaker.cooldown_seconds must be a non-negative number")
+
+    if "health" in doc:
+        for message in health_block_errors(doc["health"]):
+            report.error(message)
 
     age = doc.get("catalog_max_age_seconds")
     if "catalog_max_age_seconds" in doc and not (_is_num(age) and age > 0):

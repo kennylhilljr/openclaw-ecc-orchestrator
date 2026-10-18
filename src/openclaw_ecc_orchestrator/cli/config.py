@@ -231,8 +231,11 @@ def load_config(args, env, cwd, validate_locations=True):
     values.setdefault("repo_checks", None)
     values.setdefault("tier_costs", None)
     values["conductor_id"] = values.get("conductor_id") or "ecc-cli"
-    defaults = {"lease_ttl": 300.0, "runner_timeout": 3600.0, "gate_timeout": 600.0, "approval_ttl": 3600.0,
-                "review_ttl": 3600.0}
+    # runner_timeout and gate_timeout are optional hard wall clock ceilings,
+    # off (None) unless configured; health monitoring stops hung processes.
+    values.setdefault("runner_timeout", None)
+    values.setdefault("gate_timeout", None)
+    defaults = {"lease_ttl": 300.0, "approval_ttl": 3600.0, "review_ttl": 3600.0}
     for key, value in defaults.items():
         if values.get(key) is None:
             values[key] = value

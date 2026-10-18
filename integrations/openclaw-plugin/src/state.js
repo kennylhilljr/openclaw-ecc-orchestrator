@@ -1,5 +1,6 @@
 // Folds runtime events into a bounded view model: runs and unit states,
-// recent progress, attention items, approval requests and merges.
+// recent progress, runner health, completions, attention items, approval
+// requests and merges.
 //
 // Binding fields of approval requests (request_id, run_id, unit_id, action,
 // plan_sha256, requesting_session, head_sha, expires_at) are validated and
@@ -17,6 +18,7 @@ export const LIMITS = Object.freeze({
   progressPerUnit: 20,
   attention: 200,
   merges: 100,
+  completions: 100,
   approvals: 500,
   runs: 200,
 });
@@ -25,6 +27,8 @@ export const KNOWN_TYPES = new Set([
   "run.created",
   "unit.state_changed",
   "unit.progress",
+  "unit.health",
+  "unit.completed",
   "attention.required",
   "approval.requested",
   "approval.resolved",
@@ -36,7 +40,7 @@ export function validId(v) {
 }
 
 export function emptyState() {
-  return { version: 1, runs: {}, approvals: {}, attention: [], merges: [], counters: { applied: 0, ignored: 0 } };
+  return { version: 1, runs: {}, approvals: {}, attention: [], merges: [], completions: [], counters: { applied: 0, ignored: 0 } };
 }
 
 function ensureRun(state, runId, at) {
@@ -52,11 +56,15 @@ function ensureRun(state, runId, at) {
 function ensureUnit(run, unitId, at) {
   let unit = run.units[unitId];
   if (!unit) {
-    unit = { unit_id: unitId, state: null, from: null, reason: null, owner: null, updated_at: at, progress: [] };
+    unit = { unit_id: unitId, state: null, from: null, reason: null, owner: null, updated_at: at, progress: [], health: null, completed: null };
     run.units[unitId] = unit;
   }
   unit.updated_at = at;
   return unit;
+}
+
+function num(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 function text(v, max = 500) {
@@ -155,6 +163,44 @@ export function applyEvent(state, ev) {
       const unit = ensureUnit(ensureRun(state, ev.run_id, at), ev.unit_id, at);
       unit.progress.push({ seq: ev.seq, at, stream: text(d.stream, 10), message: text(d.message, 300) });
       if (unit.progress.length > LIMITS.progressPerUnit) unit.progress.splice(0, unit.progress.length - LIMITS.progressPerUnit);
+      break;
+    }
+    case "unit.health": {
+      if (!unitOk) return ignore(state);
+      const unit = ensureUnit(ensureRun(state, ev.run_id, at), ev.unit_id, at);
+      unit.health = {
+        seq: ev.seq,
+        at,
+        state: text(d.state, 40),
+        previous: text(d.previous, 40),
+        process: text(d.process, 20),
+        gate: text(d.gate, 100),
+        flat_checks: num(d.flat_checks),
+        flat_checks_for_hang: num(d.flat_checks_for_hang),
+        interval_seconds: num(d.interval_seconds),
+      };
+      break;
+    }
+    case "unit.completed": {
+      if (!unitOk) return ignore(state);
+      const unit = ensureUnit(ensureRun(state, ev.run_id, at), ev.unit_id, at);
+      const done = {
+        seq: ev.seq,
+        at,
+        run_id: ev.run_id,
+        unit_id: ev.unit_id,
+        exit_code: num(d.exit_code),
+        duration_seconds: num(d.duration_seconds),
+        attempts: num(d.attempts),
+        tier: num(d.tier),
+        runner: text(d.runner, 64),
+        hung: d.hung === true,
+        cancelled: d.cancelled === true,
+      };
+      unit.completed = done;
+      if (!state.completions) state.completions = [];
+      state.completions.push(done);
+      if (state.completions.length > LIMITS.completions) state.completions.splice(0, state.completions.length - LIMITS.completions);
       break;
     }
     case "attention.required": {

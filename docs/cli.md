@@ -25,7 +25,7 @@ option of any subcommand lists them in full.
 | Subcommand | Kind | What it does |
 | :- | :- | :- |
 | `create-run` | gated | validate a plan (`plan`, `run-id`) and create a run pinned to the target branch tip |
-| `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, pending approvals and `required_user_actions` |
+| `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, last runner health, pending approvals and `required_user_actions` |
 | `dispatch` | gated | route, assign, create the worktree, run the runner, validate the handoff and verify; the unit ends in `reviewing` on success |
 | `verify` | gated | re-run the gates in the unit worktree and check head, cleanliness and scope; changes no run state |
 | `review` | gated | record an independent review; an approving review requests a merge approval bound to the verified head |
@@ -102,7 +102,8 @@ file's directory; paths given as options relative to the working directory.
 | `catalog` | | none (API runners then cannot resolve a model) |
 | `repo_checks` | | none: `{"required": [...], "commands": {"name": "command"}}` |
 | `conductor_id` | | `ecc-cli` |
-| `lease_ttl`, `runner_timeout`, `gate_timeout` | | 300, 3600, 600 seconds |
+| `lease_ttl` | | 300 seconds |
+| `runner_timeout`, `gate_timeout` | | none: no wall clock limit. Optional hard ceilings in seconds; discouraged, because health monitoring (`health` in the repository policy) already stops hung processes and a ceiling kills work that is still progressing |
 | `approval_ttl`, `review_ttl` | | 3600 seconds each (merge or cleanup approvals; review records) |
 | `tier_costs` | | none: `{"0": 0.05, "1": 0.5, "2": 2.0}` for the escalation controller |
 
@@ -288,7 +289,11 @@ the same pass and reported as a warning. `approval.resolved` is emitted with
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.
-* `status` without `run-id` lists runs with unit state counts.
+* `status` without `run-id` lists runs with unit state counts. With
+  `run-id`, each unit carries `health`: the runner's last recorded health
+  state (`healthy`, `suspected_hang` or `hung`, with the attempt, flat check
+  streak, threshold, interval and check time), or null before any change was
+  recorded. The human summary adds `health <state>` to running units.
 * `doctor` checks the Python version (at least 3.11), git (at least 2.38,
   needed for merge-tree in write-tree mode), the repository, the state dir
   location and writability (without creating it), the worktree root, the
@@ -340,7 +345,10 @@ holding an unexpired lease blocks the CLI (exit 1, `lease_held`).
 * No `resume`, `retry` or `reassign` subcommand yet: a unit left `running`
   by a crashed `dispatch`, or a `failed` unit, needs the Python API
   (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
-* `dispatch` blocks until the runner exits and verification finishes.
+* `dispatch` blocks until the runner exits and verification finishes. There
+  is no wall clock limit; a runner is cancelled only when health checks find
+  it hung (see [runtime.md](runtime.md#health-monitoring-instead-of-wall-clock-kills)).
+  `unit.completed` in the event log marks the runner's exit.
 * Review records are files in the state dir; anyone who can write there can
   forge one. They guard against accidental execution of an unreviewed plan,
   not against a local attacker, and they never admit destructive plans.

@@ -14,9 +14,20 @@ Lifecycle of one unit:
    the runner with `ECC_HANDOFF_PATH` (where the runner writes its handoff)
    and `ECC_UNIT_ID` in its environment.
 3. `wait_unit` renews the lease while the runner works, then: marks the
-   process finished, compares shared git state, records usage, validates
-   the handoff (`schemas.validate_handoff`), verifies (gates, actual diff
-   against scope, re-classification) and records the escalation outcome.
+   process finished (and emits `unit.completed`), compares shared git state,
+   records usage, validates the handoff (`schemas.validate_handoff`),
+   verifies (gates, actual diff against scope, re-classification) and
+   records the escalation outcome.
+
+Runners and gates have no wall clock limit. While they run, the supervisor
+checks their health every `health.interval_seconds` (`process.health`); only
+`health.flat_checks_for_hang` consecutive checks without any progress signal
+cancel the process group (reason `hung`). The first flat check emits
+`attention.required` (`suspected_hang`), a confirmed hang emits
+`attention.required` (`hung_cancelled`), and `unit.health` is emitted on each
+health state change. `budget.minutes` is advisory: a runner that passes it
+gets `attention.required` (`long_running`) once per multiple of the budget
+and is never cancelled for it.
 4. `record_review` accepts only a review that names the verified head and
    meets the review tier and independence for the actual diff, then
    requests a merge approval bound to that head.
@@ -35,6 +46,7 @@ from ..merge_queue.conflicts import diff_stats, out_of_scope_changes
 from ..merge_queue.dispatch import Dispatcher
 from ..merge_queue.queue import approval_request_id
 from ..plugin.summary import summarize_required_user_actions
+from ..process import health as H
 from ..routing.classify import classify
 from ..routing.escalation import AttemptOutcome, EscalationController
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
@@ -61,10 +73,15 @@ TRANSIENT_ERRORS = (OSError, StoreError, TimeoutError)
 
 class Conductor:
     def __init__(self, conductor_id, *, manager, worktrees, supervisor, queue, broker=None, emitter=None,
-                 repo_checks=None, target_branch="main", log_root, runner_timeout=3600.0, gate_timeout=600.0,
+                 repo_checks=None, target_branch="main", log_root, runner_timeout=None, gate_timeout=None,
                  runner_env_allow=(), protected_globs=(), clock=time.time, policy=None, certified_runners=None,
                  catalog=None, breaker=None, tier_costs=None, lease_renew_interval=10.0,
-                 git_state_guard=_UNSET):
+                 git_state_guard=_UNSET, health_override=None):
+        """`runner_timeout` and `gate_timeout` are optional hard wall clock
+        ceilings in seconds, None (off) by default; setting them is
+        discouraged because health monitoring already stops hung processes.
+        `health_override` (a `process.health.HealthSettings`) replaces the
+        policy and unit health settings; tests use it for short intervals."""
         self.id = conductor_id
         self.manager = manager
         self.worktrees = worktrees
@@ -88,6 +105,7 @@ class Conductor:
         self.lease_renew_interval = float(lease_renew_interval)
         # (snapshot(repo) -> dict, diff(before, after, allow_refs=()) -> list[str]) or None
         self.git_state_guard = DEFAULT_GIT_STATE_GUARD if git_state_guard is _UNSET else git_state_guard
+        self.health_override = health_override
         self.dispatcher = Dispatcher(manager)
         self._handles = {}
         self._cancel_terminal = {}
@@ -128,19 +146,97 @@ class Conductor:
         return summarize_required_user_actions(run, pending, queue_state=self.queue.state(), now=self.clock())
 
     def _attention(self, run_id, unit_id, reason, **data):
+        return self._emit("attention.required", run_id, unit_id, dict(data, reason=reason))
+
+    def _emit(self, event_type, run_id, unit_id, data):
         if self.emitter is None:
             return []
         try:
-            self.emitter.emit("attention.required", run_id, unit_id=unit_id, data=dict(data, reason=reason))
+            self.emitter.emit(event_type, run_id, unit_id=unit_id, data=data)
         except Exception as exc:  # emission must never break the lifecycle
             return [f"event emission failed: {exc}"]
         return []
 
+    # == health ==
+    def health_settings(self, unit=None, policy=_UNSET):
+        """Health settings for a unit: repository policy, then the unit's own
+        `health` block, then the conductor's `health_override`."""
+        policy = self.policy if policy is _UNSET else policy
+        try:
+            return H.resolve_health_settings(policy, unit, self.health_override)
+        except H.HealthSettingsError:  # validated at create_run; never fail open or closed here
+            return H.HealthSettings()
+
+    def _health_listener(self, run_id, unit_id, attempt, settings, process="runner", gate=None, budget=None):
+        """Callback for every health check of one process: emits
+        `unit.health` on state changes, `attention.required` for
+        `suspected_hang`, `hung_cancelled` and (runners) `long_running`."""
+        notified = {"long_running": 0}
+
+        def on_check(result):
+            base = {"process": process, "attempt": attempt}
+            if gate is not None:
+                base["gate"] = gate
+            if result.changed:
+                self._emit("unit.health", run_id, unit_id, dict(
+                    base, state=result.state, previous=result.previous_state, flat_checks=result.flat_checks,
+                    flat_checks_for_hang=settings.flat_checks_for_hang,
+                    interval_seconds=settings.interval_seconds, evidence=result.evidence))
+                if process == "runner":
+                    try:
+                        self.manager.annotate_unit(run_id, self.id, unit_id, "health", {
+                            "state": result.state, "attempt": attempt, "flat_checks": result.flat_checks,
+                            "interval_seconds": settings.interval_seconds,
+                            "flat_checks_for_hang": settings.flat_checks_for_hang,
+                            "checked_at": result.evidence.get("checked_at")})
+                    except Exception:  # noqa: BLE001 - status only; the lease may be elsewhere
+                        pass
+                if result.state == H.SUSPECTED_HANG:
+                    self._attention(run_id, unit_id, "suspected_hang", detail=dict(base, evidence=result.evidence))
+                elif result.state == H.HUNG:
+                    self._attention(run_id, unit_id, "hung_cancelled", detail=dict(base, evidence=result.evidence))
+            if budget and budget.get("seconds"):
+                total = budget["used_seconds"] + float(result.elapsed_seconds or 0.0)
+                multiple = int(total // budget["seconds"])
+                if multiple >= 1 and multiple > notified["long_running"]:
+                    notified["long_running"] = multiple
+                    self._attention(run_id, unit_id, "long_running", detail=dict(
+                        base, elapsed_minutes=round(total / 60.0, 2), budget_minutes=budget["minutes"],
+                        multiple=multiple, note="budget.minutes is advisory; the runner keeps running"))
+        return on_check
+
+    def _minutes_budget(self, unit, plan_unit):
+        """Advisory minutes budget of a unit (per unit, all attempts), tightened
+        by the policy's `max_minutes_per_unit` when present."""
+        budget = (plan_unit or {}).get("budget") or unit.get("budget") or {}
+        minutes = budget.get("minutes", budget.get("max_minutes"))
+        ceiling = ((self.policy or {}).get("budget") or {}).get("max_minutes_per_unit")
+        values = [float(v) for v in (minutes, ceiling)
+                  if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+        if not values:
+            return None
+        limit = min(values)
+        return {"minutes": limit, "seconds": limit * 60.0,
+                "used_seconds": float(unit.get("minutes_used") or 0.0) * 60.0}
+
     # == gates ==
-    def gate(self, unit, worktree):
+    def gate(self, unit, worktree, run_id=None):
+        """Run the unit's gates in `worktree`, health monitored. With
+        `run_id`, health changes of a gate command are emitted as events."""
+        settings = self.health_settings(unit)
+        on_health = None
+        if run_id is not None and unit.get("id"):
+            listeners = {}
+
+            def on_health(name, result):
+                if name not in listeners:
+                    listeners[name] = self._health_listener(run_id, unit["id"], None, settings, process="gate",
+                                                            gate=name)
+                listeners[name](result)
         return run_gates(unit, worktree, repo_checks=self.repo_checks, supervisor=self.supervisor,
                          protected_globs=self.protected_globs, timeout=self.gate_timeout,
-                         log_dir=os.path.join(self.log_root, "gates"), clock=self.clock)
+                         log_dir=os.path.join(self.log_root, "gates"), clock=self.clock,
+                         health=settings, on_health=on_health)
 
     # == routing ==
     def _classify(self, run, unit_id, stats=None, previous_attempt_failed=False):
@@ -278,9 +374,13 @@ class Conductor:
             os.unlink(handoff_path)
         env = dict(extra_env or {})
         env.update({HANDOFF_ENV: handoff_path, UNIT_ENV: unit_id})
+        plan_unit = self.manager.plan_unit(run, unit_id)
+        settings = self.health_settings(plan_unit, run.get("policy") or self.policy)
+        health = H.HealthConfig(settings=settings, worktree=paths["path"], on_check=self._health_listener(
+            run_id, unit_id, unit["attempts"], settings, budget=self._minutes_budget(unit, plan_unit)))
         handle = self.supervisor.start(list(runner_argv), cwd=paths["path"], env_allow=self.runner_env_allow,
                                        extra_env=env, on_line=progress, log_path=log_path,
-                                       status_path=status_path, timeout=self.runner_timeout)
+                                       status_path=status_path, timeout=self.runner_timeout, health=health)
         if handle.pid is None:
             result = handle.wait()
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="spawn_failed")
@@ -295,7 +395,7 @@ class Conductor:
             self._stages[key] = {}
         return envelope(op, changed=True, checks=[check("runner_started", True)] + rec["checks"],
                         data={"pid": handle.pid, "log_path": log_path, "worktree": paths["path"],
-                              "handoff_path": handoff_path})
+                              "handoff_path": handoff_path, "health": settings.to_dict()})
 
     def cancel_unit(self, run_id, unit_id, reason="operator", terminal=True):
         """Cooperative cancel of the unit's runner; the unit ends cancelled
@@ -443,6 +543,16 @@ class Conductor:
             if not res["ok"]:
                 return envelope(op, ok=False, checks=res["checks"], data=data), False
             stage["exit"] = True
+        if not stage.get("completed_event"):
+            routing = unit.get("routing") or {}
+            self._emit("unit.completed", run_id, unit_id, {
+                "exit_code": result.get("exit_code"), "signal": result.get("signal"),
+                "duration_seconds": result.get("duration_s"), "attempts": unit.get("attempts"),
+                "tier": routing.get("tier"), "runner": routing.get("runner"), "model": routing.get("model"),
+                "cancelled": bool(result.get("cancelled")), "cancel_reason": result.get("cancel_reason"),
+                "hung": bool(result.get("hung")), "timed_out": bool(result.get("timed_out")),
+                "error": bool(result.get("error"))})
+            stage["completed_event"] = True
         if not stage.get("guard"):
             before = self._git_before.get(key)
             if self.git_state_guard is not None and before is not None:
@@ -487,8 +597,13 @@ class Conductor:
             if not usage["ok"]:
                 return envelope(op, ok=False, changed=True, checks=usage["checks"],
                                 required_user_actions=usage["required_user_actions"], data=data), True
-        if result["error"] or result["timed_out"] or result["exit_code"] != 0:
-            reason = "runner_timeout" if result["timed_out"] else f"runner_exit_{result['exit_code']}"
+        if result["error"] or result["timed_out"] or result.get("hung") or result["exit_code"] != 0:
+            if result.get("hung"):
+                reason = "hung"
+            elif result["timed_out"]:
+                reason = "runner_timeout"
+            else:
+                reason = f"runner_exit_{result['exit_code']}"
             res = self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=result["error"] or reason)
             if not res["ok"]:
                 return envelope(op, ok=False, checks=res["checks"], data=data), False
@@ -535,7 +650,7 @@ class Conductor:
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="uncommitted_changes")
             self._record_outcome(run_id, unit_id, False, False, "uncommitted_changes", cost)
             return envelope(op, ok=False, checks=[check("work_committed", False, dirty.splitlines()[0])], data=data)
-        verification = self.gate(plan_unit, workspace["path"])
+        verification = self.gate(plan_unit, workspace["path"], run_id=run_id)
         gates_passed = bool(verification["passed"])
         stats = diff_stats(self.worktrees.repo, workspace["branch"], workspace["base_commit"])
         verification["head"] = git_out(["rev-parse", "HEAD"], workspace["path"])

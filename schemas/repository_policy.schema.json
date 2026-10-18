@@ -225,6 +225,25 @@
     "catalog_max_age_seconds": {
       "type": "number",
       "exclusiveMinimum": 0
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+      "properties": {
+        "interval_seconds": {
+          "type": "number",
+          "minimum": 30,
+          "maximum": 1800,
+          "default": 120
+        },
+        "flat_checks_for_hang": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20,
+          "default": 5
+        }
+      }
     }
   },
   "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block."

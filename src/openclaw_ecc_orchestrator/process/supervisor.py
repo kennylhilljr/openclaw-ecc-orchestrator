@@ -6,7 +6,12 @@
   masked across lines) before reaching the callback or log file
 - every ``extra_env`` value is a literal secret for that process's redactor;
   argv is redacted before it is written to status.json or returned
-- hard timeout and cooperative cancel: SIGTERM to the group, SIGKILL after grace
+- no wall clock limit by default: with ``health`` set, a monitor thread checks
+  the process every ``interval_seconds`` (``process.health``) and cancels the
+  group only after ``flat_checks_for_hang`` consecutive checks without any
+  progress signal (reason ``hung``); an optional hard ``timeout`` exists but
+  is off unless a caller sets it explicitly (discouraged)
+- cooperative cancel: SIGTERM to the group, SIGKILL after grace
 - leftover group members are killed when the main child exits, so a
   lingering grandchild can neither leak nor hold the pipes open
 - exit detection: ``os.waitid(WNOWAIT)`` where available, else kqueue
@@ -18,6 +23,7 @@
 import datetime
 import os
 import queue
+from dataclasses import replace as dataclasses_replace
 import select
 import signal
 import subprocess
@@ -27,10 +33,12 @@ import time
 from ..runs.envelope import SCHEMA_VERSION
 from ..runs.fsutil import atomic_write_json
 from ..runs.liveness import is_process_alive
+from . import health as H
 from .redact import Redactor, StreamRedactor, looks_secret_name, redact_argv
 
 DEFAULT_ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 MAX_LINE = 65536
+READ_CHUNK = 65536
 
 
 def pid_gone(pid):
@@ -147,7 +155,8 @@ class ExitWatcher:
 
 
 class ProcessHandle:
-    def __init__(self, argv, cwd, env, redactor, on_line, log_path, status_path, timeout, grace, clock, on_start):
+    def __init__(self, argv, cwd, env, redactor, on_line, log_path, status_path, timeout, grace, clock, on_start,
+                 health=None):
         self.argv = list(argv)
         self.cwd = cwd
         self._env = env
@@ -168,6 +177,13 @@ class ProcessHandle:
         self._thread = None
         self._watcher = None
         self._fail_lock = threading.Lock()
+        self.health = health
+        self._bytes = {"stdout": 0, "stderr": 0}
+        self._events = 0
+        self._health_monitor = None
+        self._health_thread = None
+        self._health_errors = 0
+        self._hung = None
 
     # == lifecycle ==
     def _start(self):
@@ -189,6 +205,10 @@ class ProcessHandle:
                 pass
         self._thread = threading.Thread(target=self._monitor, name=f"supervise-{self.pid}", daemon=True)
         self._thread.start()
+        if self.health is not None:
+            self._health_thread = threading.Thread(target=self._health_loop, name=f"health-{self.pid}",
+                                                   daemon=True)
+            self._health_thread.start()
         return self
 
     def cancel(self, reason="cancelled"):
@@ -218,6 +238,64 @@ class ProcessHandle:
     def result(self):
         return self._result
 
+    def activity(self):
+        """Output counters so far: bytes on both streams and parsed events."""
+        return {"bytes": self._bytes["stdout"] + self._bytes["stderr"], "stdout_bytes": self._bytes["stdout"],
+                "stderr_bytes": self._bytes["stderr"], "events": self._events}
+
+    def elapsed(self):
+        return time.monotonic() - self._started_mono
+
+    @property
+    def health_state(self):
+        monitor = self._health_monitor
+        return monitor.state if monitor is not None else None
+
+    # == health ==
+    def _health_loop(self):
+        cfg = self.health
+        try:
+            sampler = H.process_sampler(self.pid, self.activity, cfg, clock=self.clock)
+            monitor = H.HealthMonitor(cfg.settings, sampler, clock=self.clock)
+            monitor.start()
+            self._health_monitor = monitor
+        except Exception:  # noqa: BLE001 - monitoring must never harm the process
+            self._health_errors += 1
+            return
+        interval = float(cfg.settings.interval_seconds)
+        while not self._done.wait(interval):
+            if self._cancel.is_set():
+                return
+            try:
+                result = monitor.check()
+            except Exception:  # noqa: BLE001 - an unreadable check is indeterminate
+                self._health_errors += 1
+                continue
+            result = dataclasses_replace(result, elapsed_seconds=round(self.elapsed(), 3))
+            if result.hung and not self._done.is_set():
+                self._hung = result.evidence
+                self.cancel("hung")
+            if cfg.on_check is not None:
+                try:
+                    cfg.on_check(result)
+                except Exception:  # noqa: BLE001
+                    pass
+            if result.hung:
+                return
+
+    def _health_summary(self):
+        if self.health is None:
+            return None
+        monitor = self._health_monitor
+        last = monitor.last if monitor is not None else None
+        return {"state": monitor.state if monitor is not None else None,
+                "checks": monitor.checks if monitor is not None else 0,
+                "flat_checks": monitor.flat_checks if monitor is not None else 0,
+                "interval_seconds": self.health.settings.interval_seconds,
+                "flat_checks_for_hang": self.health.settings.flat_checks_for_hang,
+                "errors": self._health_errors,
+                "last_check": dict(last.evidence) if last is not None else None}
+
     # == internals ==
     def _exit_probe(self):
         return self._watcher.exited()
@@ -229,12 +307,30 @@ class ProcessHandle:
             pass
 
     def _reader(self, stream, name, q):
+        """Read in chunks so bytes are counted as they arrive, even without a
+        newline (progress bars); split into lines of at most MAX_LINE bytes."""
+        buf = b""
+        read = getattr(stream, "read1", stream.read)
         try:
             while True:
-                raw = stream.readline(MAX_LINE)
-                if not raw:
+                chunk = read(READ_CHUNK)
+                if not chunk:
                     break
-                q.put((name, raw.decode("utf-8", errors="replace").rstrip("\r\n")))
+                self._bytes[name] += len(chunk)
+                buf += chunk
+                while True:
+                    cut = buf.find(b"\n")
+                    if cut < 0 or cut >= MAX_LINE:
+                        if len(buf) >= MAX_LINE:
+                            cut = MAX_LINE
+                            piece, buf = buf[:cut], buf[cut:]
+                        else:
+                            break
+                    else:
+                        piece, buf = buf[:cut + 1], buf[cut + 1:]
+                    self._emit_line(q, name, piece)
+            if buf:
+                self._emit_line(q, name, buf)
         except (OSError, ValueError):
             pass
         finally:
@@ -243,6 +339,13 @@ class ProcessHandle:
             except (OSError, ValueError):
                 pass
             q.put((name, None))
+
+    def _emit_line(self, q, name, raw):
+        text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            self._events += 1
+        q.put((name, text))
 
     def _monitor(self):
         try:
@@ -378,6 +481,7 @@ class ProcessHandle:
         if self._done.is_set():
             return
         ended = self.clock()
+        hung = self._hung is not None and cancelled
         result = {
             "schema_version": SCHEMA_VERSION,
             "argv": redact_argv(self.argv, self.redactor),
@@ -395,6 +499,9 @@ class ProcessHandle:
             "error": self.redactor.redact(error) if error else error,
             "log_path": self.log_path,
             "lines": counts or {"stdout": 0, "stderr": 0},
+            "bytes": dict(self._bytes),
+            "hung": hung,
+            "health": self._health_summary(),
         }
         if timed_out:
             result["exit_code"] = None
@@ -417,12 +524,14 @@ class Supervisor:
         self.grace = float(grace)
 
     def start(self, argv, cwd, *, env_allow=(), extra_env=None, public_env=None, on_line=None, log_path=None,
-              status_path=None, timeout=None, grace=None, on_start=None):
+              status_path=None, timeout=None, grace=None, on_start=None, health=None):
         """Start ``argv`` in ``cwd``.
 
         ``extra_env`` values are secrets: every value is registered with this
         process's redactor whatever the variable name. ``public_env`` values
         (for example a per unit TMPDIR) are set without being treated as secrets.
+        ``health`` (a ``process.health.HealthConfig``) enables hang detection;
+        ``timeout`` is an optional hard wall clock ceiling, off by default.
         """
         if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)) or not argv:
             raise TypeError("argv must be a non-empty list of strings (no shell strings)")
@@ -440,7 +549,7 @@ class Supervisor:
         for value in (extra_env or {}).values():
             redactor.add_secret(str(value))
         handle = ProcessHandle(argv, cwd, env, redactor, on_line, log_path, status_path, timeout,
-                               self.grace if grace is None else float(grace), self.clock, on_start)
+                               self.grace if grace is None else float(grace), self.clock, on_start, health=health)
         return handle._start()
 
     def run(self, argv, cwd, **kwargs):

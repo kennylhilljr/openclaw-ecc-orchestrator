@@ -235,7 +235,7 @@ class HandoffTests(unittest.TestCase):
 
     def test_secret_nested_in_commands(self):
         doc = handoff(commands=[{"command": "curl -H 'Authorization: Bearer "
-                                            "ghp_abcdefghijklmnopqrstuvwxyz0123456789'",
+                                            "ghp_abcdefghijklmnopqrstuvwxyz0123456789'",  # gitleaks:allow
                                  "exit_code": 0, "result": "ok"}])
         report = schemas.validate_handoff(doc, unit=work_unit())
         self.assertFalse(report.ok)

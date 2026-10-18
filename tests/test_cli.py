@@ -254,8 +254,17 @@ class StatusAndEventsTest(S.CliTestBase):
         units = {u["unit_id"]: u for u in self.ok(self.cli("status", "--run-id", self.RUN_ID))["data"]["units"]}
         self.assertEqual(units["alpha"]["state"], "ready")
         self.assertEqual(units["beta"]["state"], "pending")
-        for key in ("tier", "runner", "attempts", "budget", "used"):
+        for key in ("tier", "runner", "attempts", "budget", "used", "health"):
             self.assertIn(key, units["alpha"])
+        self.assertIsNone(units["alpha"]["health"])
+
+    def test_config_has_no_wall_clock_limits_by_default(self):
+        from openclaw_ecc_orchestrator.cli.config import load_config
+        import types
+        cfg = load_config(types.SimpleNamespace(config=self.config_path), {"HOME": self.tmp}, self.tmp,
+                          validate_locations=False)
+        self.assertIsNone(cfg.runner_timeout)
+        self.assertIsNone(cfg.gate_timeout)
 
     def test_status_shows_pending_approvals_and_actions(self):
         head, request_id = self.to_review()

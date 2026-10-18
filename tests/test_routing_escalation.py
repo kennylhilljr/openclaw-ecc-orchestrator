@@ -127,14 +127,14 @@ class EscalationTests(unittest.TestCase):
         action = ctl.record(AttemptOutcome(passed=False, objective_failure=True, cost_usd=0.1))
         self.assertEqual(action["action"], "stop")
 
-    def test_time_budget_stops(self):
+    def test_time_budget_is_advisory(self):
         clock = FakeClock()
         ctl = controller(unit(minutes=10), clock=clock)
         ctl.next_action()
         clock.t = 11 * 60
         action = ctl.record(FAIL)
-        self.assertEqual(action["action"], "stop")
-        self.assertIn("time budget", action["reason"])
+        self.assertNotEqual(action["action"], "stop")
+        self.assertTrue(ctl.history[-1]["over_time_budget"])
 
     def test_elapsed_measured_by_clock(self):
         clock = FakeClock(100.0)

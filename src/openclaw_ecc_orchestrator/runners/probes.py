@@ -22,13 +22,13 @@ import functools
 import time
 from typing import Callable
 
-from ..handoffs.redaction import contains_secret, redact_text
+from ..handoffs.redaction import contains_secret, inspection_findings, redact_text
 from ..schemas import CERTIFICATION_CHECKS, SCHEMA_VERSION
 from .api_adapters import GeminiAdapter, GroqAdapter, KimiAdapter, OpenRouterAdapter
 from .base import (CancelResult, CommandResult, ProbeContext, StepOutcome,
                    default_cancel_runner, default_command_runner, default_http_post,
                    minimal_env, run_with_timeout)
-from .cli_adapters import ClaudeAdapter, CodexAdapter
+from .cli_adapters import CANCEL_ATTEMPTS, ClaudeAdapter, CodexAdapter
 from .discovery import HttpResponse
 from .registry import get_profile, model_family
 
@@ -57,6 +57,9 @@ _DETAIL_LIMIT = 500
 # A step wraps several bounded commands (the agent run is one of them), so the
 # step's own watchdog allows a margin over ``ctx.step_timeout``.
 STEP_WATCHDOG_FACTOR = 1.5
+# The cancellation step may retry an inconclusive run, each bounded by the
+# step timeout while waiting for the first stream event.
+STEP_WATCHDOG_FACTORS = {"cancellation_timeout": CANCEL_ATTEMPTS + 0.5}
 
 
 def get_adapter(name: str):
@@ -94,8 +97,8 @@ def _recording_context(ctx: ProbeContext, sink: list[str]) -> ProbeContext:
         sink.append(str(response.body or ""))
         return response
 
-    def rec_cancel(argv, cancel_after, cwd=None) -> CancelResult:
-        result = cancel_command(list(argv), cancel_after, cwd)
+    def rec_cancel(argv, max_wait, cwd=None) -> CancelResult:
+        result = cancel_command(list(argv), max_wait, cwd)
         sink.append(str(result.stdout or ""))
         sink.append(str(result.stderr or ""))
         return result
@@ -156,7 +159,8 @@ def probe(adapter, ctx: ProbeContext) -> dict:
             else:
                 _notify(ctx, check_name, "start")
                 fn: Callable[[], StepOutcome] = (lambda m=getattr(adapter, method): m(rctx))
-                outcome = run_with_timeout(fn, ctx.step_timeout * STEP_WATCHDOG_FACTOR)
+                factor = STEP_WATCHDOG_FACTORS.get(check_name, STEP_WATCHDOG_FACTOR)
+                outcome = run_with_timeout(fn, ctx.step_timeout * factor)
             _notify(ctx, check_name, outcome.status)
             outcomes[check_name] = outcome
             checks.append({"name": check_name, "status": outcome.status,
@@ -166,10 +170,12 @@ def probe(adapter, ctx: ProbeContext) -> dict:
 
         if isinstance(ctx.transcript, list):
             ctx.transcript.extend(redact_text(t, extra_values=secrets) for t in sink if t)
-        leaked = any(contains_secret(t) or any(s and s in t for s in secrets)
-                     for t in list(sink) + [o.detail for o in outcomes.values()])
+        findings = inspection_findings(list(sink) + [o.detail for o in outcomes.values()],
+                                       secrets)
+        leaked = bool(findings)
+        kinds = ", ".join(sorted({f["kind"] for f in findings}))
         checks.append({"name": "log_inspection", "status": "fail" if leaked else "pass",
-                       "reason": "secret-like content found in runner output (redacted)"
+                       "reason": "secret-like content found in runner output (redacted): %s" % kinds
                        if leaked else "no secret-like content in runner output",
                        "duration_seconds": 0.0})
 

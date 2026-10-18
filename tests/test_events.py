@@ -16,7 +16,19 @@ from openclaw_ecc_orchestrator.plugin.events import (
 class EventTests(unittest.TestCase):
     def test_contract_types(self):
         self.assertEqual(set(EVENT_TYPES), {"run.created", "unit.state_changed", "unit.progress", "attention.required",
-                                            "approval.requested", "approval.resolved", "merge.completed"})
+                                            "approval.requested", "approval.resolved", "merge.completed",
+                                            "unit.health", "unit.completed"})
+
+    def test_health_and_completion_types(self):
+        ev = make_event("unit.completed", "r1", unit_id="u1",
+                        data={"exit_code": 0, "duration_seconds": 5400.0, "attempts": 1, "tier": 1,
+                              "runner": "codex"})
+        self.assertEqual(ev["data"]["duration_seconds"], 5400.0)
+        with self.assertRaises(EventError):
+            make_event("unit.completed", "r1", unit_id="u1", data={"exit_code": 0})
+        with self.assertRaises(EventError):
+            make_event("unit.health", "r1", data={"state": "hung"})
+        make_event("unit.health", "r1", unit_id="u1", data={"state": "suspected_hang", "previous": "healthy"})
 
     def test_make_event_shape(self):
         ev = make_event("unit.progress", "r1", unit_id="u1", data={"message": "halfway"}, seq=7,

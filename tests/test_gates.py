@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from openclaw_ecc_orchestrator.gates.runner import is_protected, parse_command, run_gates
+from openclaw_ecc_orchestrator.process.health import HealthSettings
 from openclaw_ecc_orchestrator.process.supervisor import Supervisor
 
 PY = shlex.quote(sys.executable)
@@ -103,6 +104,30 @@ class GateTests(unittest.TestCase):
         self.assertFalse(res["passed"])
         self.assertTrue(res["gates"][0]["timed_out"])
         self.assertEqual(res["gates"][0]["status"], "timeout")
+
+    def test_hung_gate_is_cancelled_by_health_checks(self):
+        seen = []
+        res = self.gates([f"{PY} -c 'import time; time.sleep(60)'"],
+                         health=HealthSettings.for_tests(0.2, 2), on_health=lambda name, r: seen.append((name, r)))
+        gate = res["gates"][0]
+        self.assertFalse(res["passed"])
+        self.assertEqual(gate["status"], "hung")
+        self.assertTrue(gate["hung"])
+        self.assertFalse(gate["timed_out"])
+        self.assertIn("2 consecutive checks", gate["detail"])
+        self.assertEqual(seen[-1][0], "acceptance[0]")
+        self.assertTrue(seen[-1][1].hung)
+
+    def test_slow_but_active_gate_passes_without_time_limit(self):
+        code = "import time\nfor i in range(12):\n    print(i, flush=True)\n    time.sleep(0.1)\n"
+        res = self.gates([f"{PY} -c {shlex.quote(code)}"], health=HealthSettings.for_tests(0.2, 2))
+        self.assertTrue(res["passed"], res)
+        self.assertFalse(res["gates"][0]["hung"])
+
+    def test_default_has_no_wall_clock_timeout(self):
+        import inspect
+        params = inspect.signature(run_gates).parameters
+        self.assertIsNone(params["timeout"].default)
 
     def test_log_dir(self):
         logs = os.path.join(self.wt, "..", os.path.basename(self.wt) + "-logs")

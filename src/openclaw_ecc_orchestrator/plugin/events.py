@@ -23,6 +23,8 @@ EVENT_TYPES = {
     "run.created": (("plan_sha256", "unit_ids"), False),
     "unit.state_changed": (("from", "to"), True),
     "unit.progress": (("message",), True),
+    "unit.health": (("state",), True),
+    "unit.completed": (("exit_code", "duration_seconds", "attempts"), True),
     "attention.required": (("reason",), False),
     "approval.requested": (("request_id", "action", "plan_sha256", "expires_at"), True),
     "approval.resolved": (("request_id", "decision"), True),

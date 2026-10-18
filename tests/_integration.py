@@ -30,6 +30,7 @@ PY = sys.executable
 #   forged SPEC...         commit files, handoff claims success with a failing command
 #   nohandoff SPEC...      commit files, write no handoff
 #   claim=PATHS SPEC...    commit files, handoff lists PATHS (comma separated) as changed
+#   slow:N SPEC...        print progress for N seconds, then behave like write
 #   fail | block | sleep:N
 RUNNER = r'''
 import json, os, signal, subprocess, sys, time
@@ -46,6 +47,13 @@ if mode == "block":
 if mode.startswith("sleep:"):
     time.sleep(float(mode.split(":", 1)[1]))
     sys.exit(0)
+if mode.startswith("slow:"):
+    # Long but active: prints progress for N seconds, then does the "write" work.
+    end = time.time() + float(mode.split(":", 1)[1])
+    while time.time() < end:
+        print("working", flush=True)
+        time.sleep(0.1)
+    mode = "write"
 specs = sys.argv[2:]
 names = []
 for spec in specs:

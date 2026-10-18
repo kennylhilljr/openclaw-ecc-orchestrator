@@ -31,7 +31,7 @@ class LeaseError(RunError):
 ATTENTION_STATES = {S.NEEDS_USER, S.INTERRUPTED, S.BLOCKED}
 # "handoff" is deliberately absent: only record_handoff may write it, after
 # validating the document, because the verifying transition trusts it.
-ANNOTATION_KEYS = {"verification", "review", "merge", "conflicts", "notes", "escalation"}
+ANNOTATION_KEYS = {"verification", "review", "merge", "conflicts", "notes", "escalation", "health"}
 
 
 class _Tx:
@@ -276,14 +276,14 @@ class RunManager:
         return per_tier, total, minutes, cost
 
     def _budget_exhausted(self, unit, tier=None):
-        per_tier, total, minutes, cost = self._budget_limits(unit)
+        """Attempts and cost are hard limits. `minutes` is advisory: a long
+        running unit gets `long_running` attention events, never a stop."""
+        per_tier, total, _minutes, cost = self._budget_limits(unit)
         used = int((unit.get("attempts_by_tier") or {}).get(str(tier), 0)) if tier is not None else unit["attempts"]
         if per_tier is not None and used >= int(per_tier):
             return f"attempts {used}/{per_tier} at tier {tier}"
         if total is not None and unit["attempts"] >= int(total):
             return f"attempts {unit['attempts']}/{total}"
-        if minutes is not None and float(unit.get("minutes_used", 0.0)) > float(minutes):
-            return f"minutes {unit['minutes_used']}/{minutes}"
         if cost is not None and float(unit.get("cost_usd", 0.0)) >= float(cost):
             return f"cost {unit.get('cost_usd', 0.0)}/{cost} USD"
         return None
@@ -617,16 +617,18 @@ class RunManager:
             self._touch(run, tx, unit_id)
             _, _, limit, cost_limit = self._budget_limits(unit)
             detail = None
-            if limit is not None and unit["minutes_used"] > float(limit):
-                detail = f"minutes {unit['minutes_used']}/{limit}"
-            elif cost_limit is not None and unit["cost_usd"] > float(cost_limit):
+            # Minutes are advisory (long_running attention while it runs); only
+            # the cost budget is a hard limit here.
+            over_minutes = limit is not None and unit["minutes_used"] > float(limit)
+            if cost_limit is not None and unit["cost_usd"] > float(cost_limit):
                 detail = f"cost {unit['cost_usd']}/{cost_limit} USD"
             if detail:
                 if S.NEEDS_USER in S.TRANSITIONS[unit["state"]]:
                     self._set_state(run, tx, unit_id, S.NEEDS_USER, conductor_id, reason="budget_exhausted")
                 return {"ok": False, "checks": [check("budget_available", False, detail)],
                         "required_user_actions": [_action("budget_exhausted", run_id, unit_id, detail)]}
-            return {"data": {"minutes_used": unit["minutes_used"], "cost_usd": unit["cost_usd"]}}
+            return {"data": {"minutes_used": unit["minutes_used"], "cost_usd": unit["cost_usd"],
+                             "over_minutes_budget": over_minutes}}
         return self._mutate(run_id, "unit.record_usage", conductor_id, fn)
 
     def resume(self, run_id, conductor_id, dry_run=False, ttl=None):

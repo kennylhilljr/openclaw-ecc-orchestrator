@@ -127,7 +127,7 @@ class ProbeEnvTests(unittest.TestCase):
                 "GROQ_API_KEY": "gsk_" + "g" * 30, "ORCH_ONLY_SECRET": "zzzzzzzzzzzz", "CODEX_HOME": "/home/op/.codex"}
 
     def probe(self, adapter):
-        ctx = ProbeContext(env=self.env(), step_timeout=20, cancel_timeout=1, clock=lambda: 1_790_000_000.0)
+        ctx = ProbeContext(env=self.env(), step_timeout=20, clock=lambda: 1_790_000_000.0)
         record = probes.probe(adapter, ctx)
         with open(self.dump) as fh:
             return record, json.load(fh)
@@ -161,7 +161,7 @@ class ProbeEnvTests(unittest.TestCase):
         def runner(argv, timeout, cwd=None):
             calls.append(argv)
             return base.CommandResult(1, "", "no")
-        ctx = ProbeContext(run_command=runner, env=self.env(), step_timeout=5, cancel_timeout=1)
+        ctx = ProbeContext(run_command=runner, env=self.env(), step_timeout=5)
         probes.probe(ClaudeAdapter(), ctx)
         self.assertTrue(calls)
 

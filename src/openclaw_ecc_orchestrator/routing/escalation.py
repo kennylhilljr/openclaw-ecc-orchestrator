@@ -11,8 +11,10 @@ Rules:
 * Projected cost rule: when another attempt at the current tier would bring
   that tier's spend above the cost of one attempt at the next tier, and the
   last failure was objective, escalate instead of retrying cheaply.
-* Stop at ``maximum_tier``, when the cost or time budget is exhausted, or
-  when the next attempt's projected cost does not fit the remaining budget.
+* Stop at ``maximum_tier``, when the cost budget is exhausted, or when the
+  next attempt's projected cost does not fit the remaining budget. The time
+  budget (``budget.minutes``) is advisory: an attempt past it is marked
+  ``over_time_budget`` in the history, never stopped.
 * Every attempt and escalation is recorded with reason, attempts, elapsed
   time, spend, usage and the target runner/model.
 """
@@ -144,8 +146,10 @@ class EscalationController:
     def _decide(self, outcome: AttemptOutcome) -> dict:
         if outcome.passed:
             return self._action("done", "attempt passed verification")
+        # The time budget (budget.minutes) is advisory: exceeding it is noted
+        # in the history and reported as long_running, never a stop.
         if self._elapsed() >= self.max_seconds:
-            return self._action("stop", "time budget exhausted after %.0fs" % self._elapsed())
+            self.history[-1]["over_time_budget"] = True
         if self.spent >= self.max_cost - 1e-12:
             return self._action("stop", "cost budget exhausted (spent %.4f of %.4f USD)"
                                 % (self.spent, self.max_cost))

@@ -24,6 +24,12 @@ Command policy is allowlist first (:func:`check_command_policy`):
   ``-exec`` are refused; the protected globs remain as a final guard rail.
 
 Gates get ``HOME`` and a per unit ``TMPDIR`` (created fresh, removed after).
+
+Gate commands have no wall clock limit by default. Each one is health
+monitored like a runner (``process.health``): it is cancelled, with status
+``hung``, only after ``flat_checks_for_hang`` consecutive checks in which
+its CPU time, output, worktree and process set all stayed still. A hard
+``timeout`` remains available when a caller sets one explicitly.
 """
 
 import collections
@@ -35,6 +41,7 @@ import shutil
 import tempfile
 import time
 
+from ..process.health import HealthConfig, HealthSettings
 from ..process.redact import Redactor, redact_argv
 from ..process.supervisor import Supervisor
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
@@ -338,10 +345,18 @@ def _safe_name(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:80]
 
 
-def run_gates(unit, worktree, *, repo_checks=None, supervisor=None, protected_globs=(), timeout=600.0,
+_DEFAULT_HEALTH = object()
+
+
+def run_gates(unit, worktree, *, repo_checks=None, supervisor=None, protected_globs=(), timeout=None,
               tail_chars=4000, log_dir=None, env_allow=(), clock=time.time, redactor=None, allow_wrappers=(),
-              tmp_root=None):
+              tmp_root=None, health=_DEFAULT_HEALTH, on_health=None):
     """Run every gate for `unit` in `worktree` and return a verification record.
+
+    ``health`` (``HealthSettings``; default settings when omitted, None to
+    disable) monitors each gate command for hangs; ``on_health(gate_name,
+    check_result)`` sees every health check. ``timeout`` is an optional hard
+    ceiling per command, off by default and discouraged.
 
     Gates inherit ``HOME`` (plus ``env_allow``) and get ``TMPDIR`` set to a
     fresh per unit directory under ``tmp_root`` (default: the system temp
@@ -350,6 +365,8 @@ def run_gates(unit, worktree, *, repo_checks=None, supervisor=None, protected_gl
     """
     supervisor = supervisor or Supervisor()
     redactor = redactor or supervisor.redactor or Redactor()
+    if health is _DEFAULT_HEALTH:
+        health = HealthSettings()
     wrappers = tuple(allow_wrappers or ()) + tuple((repo_checks or {}).get("allow_wrappers") or ())
     gate_env_allow = tuple(dict.fromkeys(("HOME",) + tuple(env_allow or ())))
     started = clock()
@@ -359,7 +376,7 @@ def run_gates(unit, worktree, *, repo_checks=None, supervisor=None, protected_gl
     try:
         tmpdir = tempfile.mkdtemp(prefix=f"gate-{_safe_name(str(unit.get('id')))}-", dir=tmp_root)
         _run_specs(unit, worktree, repo_checks, supervisor, redactor, protected_globs, wrappers, timeout,
-                   tail_chars, log_dir, gate_env_allow, tmpdir, gates, missing, refused)
+                   tail_chars, log_dir, gate_env_allow, tmpdir, gates, missing, refused, health, on_health)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -379,12 +396,22 @@ def run_gates(unit, worktree, *, repo_checks=None, supervisor=None, protected_gl
     }
 
 
+def _health_config(settings, worktree, name, on_health):
+    if settings is None:
+        return None
+
+    def on_check(result, name=name):
+        if on_health is not None:
+            on_health(name, result)
+    return HealthConfig(settings=settings, worktree=worktree, on_check=on_check)
+
+
 def _run_specs(unit, worktree, repo_checks, supervisor, redactor, protected_globs, wrappers, timeout, tail_chars,
-               log_dir, env_allow, tmpdir, gates, missing, refused):
+               log_dir, env_allow, tmpdir, gates, missing, refused, health=None, on_health=None):
     for spec in _gate_specs(unit, repo_checks):
         gate = {"name": spec["name"], "source": spec["source"], "required": True, "argv": None,
                 "command": None, "status": None, "exit_code": None, "duration_s": 0.0, "timed_out": False,
-                "output_tail": "", "log_path": None, "detail": ""}
+                "hung": False, "output_tail": "", "log_path": None, "detail": ""}
         gates.append(gate)
         if spec["command"] is None:
             gate["status"] = "missing"
@@ -418,16 +445,22 @@ def _run_specs(unit, worktree, repo_checks, supervisor, redactor, protected_glob
         if log_dir:
             log_path = os.path.join(log_dir, f"{_safe_name(str(unit.get('id')))}-{len(gates):02d}-{_safe_name(spec['name'])}.log")
         result = supervisor.run(argv, cwd=worktree, env_allow=env_allow, public_env={"TMPDIR": tmpdir},
-                                on_line=on_line, log_path=log_path, timeout=timeout)
+                                on_line=on_line, log_path=log_path, timeout=timeout,
+                                health=_health_config(health, worktree, spec["name"], on_health))
         text = "\n".join(tail)
         gate["output_tail"] = text[-tail_chars:] if tail_chars > 0 else ""
         gate["exit_code"] = result["exit_code"]
         gate["duration_s"] = result["duration_s"]
         gate["timed_out"] = result["timed_out"]
+        gate["hung"] = bool(result.get("hung"))
         gate["log_path"] = log_path
         if result["error"]:
             gate["status"] = "error"
             gate["detail"] = result["error"]
+        elif gate["hung"]:
+            gate["status"] = "hung"
+            flat = ((result.get("health") or {}).get("flat_checks"))
+            gate["detail"] = f"cancelled as hung after {flat} consecutive checks without progress"
         elif result["timed_out"]:
             gate["status"] = "timeout"
         elif result["exit_code"] == 0:

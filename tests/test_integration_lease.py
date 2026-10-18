@@ -59,17 +59,25 @@ class LeaseDuringWaitTests(IntegrationBase):
     def test_lost_lease_surrenders_unit_with_pid(self):
         c, m, _ = self.conductor("c1", lease_ttl=60)
         started = self.start(c, self.argv("write", "a.txt=x"))
-        self.clock.t += 61
-        other = self.conductor("c2")[1]
-        self.ok(other.acquire_lease("r1", "c2"))
-        res = c.wait_unit("r1", "u1")
-        self.assertFalse(res["ok"])
-        self.assertIn("lease_held", self.failed_checks(res))
-        u = m.load("r1")["units"]["u1"]
-        self.assertEqual((u["state"], u["last_reason"]), ("needs_user", "lease_lost"))
-        self.assertEqual(u["process"]["pid"], started["data"]["pid"])
-        kinds = [a["kind"] for a in res["required_user_actions"]]
-        self.assertIn("verify_worker_process", kinds)
+        # Surrender leaves the worker running for an operator to check. Stop it
+        # before tearDown, as an operator would, so it cannot still be writing
+        # into the temp dir while tearDown removes it (the source of a flake).
+        handle = c._handles[("r1", "u1")]
+        try:
+            self.clock.t += 61
+            other = self.conductor("c2")[1]
+            self.ok(other.acquire_lease("r1", "c2"))
+            res = c.wait_unit("r1", "u1")
+            self.assertFalse(res["ok"])
+            self.assertIn("lease_held", self.failed_checks(res))
+            u = m.load("r1")["units"]["u1"]
+            self.assertEqual((u["state"], u["last_reason"]), ("needs_user", "lease_lost"))
+            self.assertEqual(u["process"]["pid"], started["data"]["pid"])
+            kinds = [a["kind"] for a in res["required_user_actions"]]
+            self.assertIn("verify_worker_process", kinds)
+        finally:
+            handle.cancel("test cleanup")
+            handle.wait(timeout=30)
 
     def test_wait_retryable_after_transient_failure(self):
         c, m, _ = self.conductor("c1")

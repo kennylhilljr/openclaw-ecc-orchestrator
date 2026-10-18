@@ -288,15 +288,19 @@ class BudgetTests(ManagerBase):
         self.assertEqual(self.mgr.load(run_id)["units"]["a"]["state"], "needs_user")
         self.assertEqual(res["required_user_actions"][0]["kind"], "budget_exhausted")
 
-    def test_minutes_budget(self):
+    def test_minutes_budget_is_advisory(self):
         run_id = self.create([unit("a", budget={"minutes": 10})])
         self.drive(run_id, "a", ["assigned", "running"])
-        self.assertTrue(self.mgr.record_usage(run_id, "c1", "a", minutes=6)["ok"])
+        self.assertFalse(self.mgr.record_usage(run_id, "c1", "a", minutes=6)["data"]["over_minutes_budget"])
         res = self.mgr.record_usage(run_id, "c1", "a", minutes=6)
-        self.assertFalse(res["ok"])
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["data"]["over_minutes_budget"])
         u = self.mgr.load(run_id)["units"]["a"]
-        self.assertEqual(u["state"], "needs_user")
+        self.assertEqual(u["state"], "running")
         self.assertEqual(u["minutes_used"], 12)
+        # Nor does it block the next assignment.
+        self.drive(run_id, "a", ["failed", "ready"])
+        self.assertTrue(self.mgr.assign_unit(run_id, "c1", "a", "w1")["ok"])
 
 
 class ResumeScopeTests(ManagerBase):

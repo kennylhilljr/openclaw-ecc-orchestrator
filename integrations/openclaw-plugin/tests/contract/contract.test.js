@@ -54,6 +54,9 @@ test("plugin decisions round trip through the Python ApprovalBroker and Decision
     assert.equal(approval.requesting_session, SESSION);
     assert.equal(engine.state.runs.run1.units.alpha.state, "reviewing");
     assert.equal(engine.state.attention[0].reason, "out_of_scope_changes");
+    assert.equal(engine.state.runs.run1.units.alpha.health.state, "healthy", "unit.health folded");
+    assert.equal(engine.state.runs.run1.units.alpha.completed.exit_code, 0, "unit.completed folded");
+    assert.equal(engine.state.completions.length, 1);
     const progress = engine.state.runs.run1.units.alpha.progress[0].message;
     assert.ok(!progress.includes(gen.fake_token), "runtime and plugin redaction hide the token");
     assert.ok(!renderPendingText(engine.state, Date.now() / 1000).includes(gen.fake_token));
