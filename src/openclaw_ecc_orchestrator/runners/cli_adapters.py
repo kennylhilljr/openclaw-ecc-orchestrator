@@ -10,6 +10,7 @@ certification; they are constructor overridable.
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any
 
@@ -43,6 +44,14 @@ EXERCISE_TEST_ARGV = ["python3", "-B", "-m", "unittest", "-q"]  # -B: no stale b
 _GIT_IDENTITY = ["-c", "user.name=runner-probe", "-c", "user.email=runner-probe@example.invalid"]
 _ERROR_LIMIT = 160
 _DETAIL_LIMIT = 480
+
+
+def _parse_version(text: str | None) -> tuple[int, ...] | None:
+    """The first dotted version number in ``text`` (e.g. "2.1.281 (Claude Code)")."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def _first_line(text: str) -> str:
@@ -134,12 +143,23 @@ class CliAdapter:
                                "exit %d" % result.returncode)
         return self._failed(result, what)
 
+    # Oldest CLI version whose flags this adapter uses; None means no floor.
+    min_version: tuple[int, ...] | None = None
+
     def installed(self, ctx: ProbeContext) -> StepOutcome:
         result = ctx.run_command(list(self.version_argv), ctx.step_timeout)
         failed = self._failed(result, "version check")
         if failed:
             return failed
         version = _first_line(result.stdout)
+        found = _parse_version(version)
+        if self.min_version and found and found < self.min_version:
+            want = ".".join(str(n) for n in self.min_version)
+            have = ".".join(str(n) for n in found)
+            return StepOutcome(
+                "fail", "%s %s is older than the minimum %s; check which %s is first on PATH"
+                % (self.name, have, want, self.version_argv[0]), version,
+                {"version": version or None})
         return StepOutcome("pass", "installed", version, {"version": version or None})
 
     def authentication(self, ctx: ProbeContext) -> StepOutcome:
@@ -286,6 +306,8 @@ class ClaudeAdapter(CliAdapter):
     ``--json`` pins that.
     """
     name = "claude"
+    # 2.1.112 lacks --permission-prompts (seen 2026-10-18); 2.1.281 is verified.
+    min_version = (2, 1, 281)
     version_argv = ["claude", "--version"]
     auth_argv = ["claude", "auth", "status", "--json"]
     credential_env = ("HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")

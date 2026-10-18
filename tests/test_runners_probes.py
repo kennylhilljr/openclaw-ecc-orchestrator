@@ -104,7 +104,7 @@ def claude_rules(**overrides):
     rules = repo_rules()
     rules.update({
         "failing unit test": ok(CLAUDE_JSON),
-        "claude --version": ok("2.1.0 (Claude Code)\n"),
+        "claude --version": ok("2.1.281 (Claude Code)\n"),
         "claude auth status": ok(CLAUDE_AUTH),
         "claude -p": ok(CLAUDE_JSON),
     })
@@ -162,7 +162,7 @@ class ClaudeProbeTests(unittest.TestCase):
         record = probes.probe_runner("claude", ctx(FakeCommands(claude_rules())))
         self.assertEqual(record["status"], "certified", record)
         self.assertTrue(schemas.validate_certification_record(record).ok)
-        self.assertEqual(record["version"], "2.1.0 (Claude Code)")
+        self.assertEqual(record["version"], "2.1.281 (Claude Code)")
         self.assertIn("claude-sonnet-x", record["models"])
         self.assertAlmostEqual(record["usage"]["cost_usd"], 0.0012)
         self.assertTrue(all(s == "pass" for s in statuses(record).values()))

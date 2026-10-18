@@ -262,5 +262,30 @@ class KimiProbeTests(unittest.TestCase):
         self.assertEqual(ranked[0], "kimi-k2.7-code")
 
 
+class ClaudeMinimumVersionTests(unittest.TestCase):
+    """A stale Claude Code (2.1.112) first on PATH failed with an unknown option
+    error on 2026-10-18; it should fail the installed check with a clear reason."""
+
+    def _installed(self, version_line):
+        from openclaw_ecc_orchestrator.runners.base import CommandResult
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        ctx = ProbeContext(run_command=lambda argv, timeout, cwd=None: CommandResult(0, version_line + "\n", ""),
+                           step_timeout=2.0)
+        return ClaudeAdapter().installed(ctx)
+
+    def test_old_version_fails_with_clear_reason(self):
+        out = self._installed("2.1.112 (Claude Code)")
+        self.assertEqual(out.status, "fail")
+        self.assertIn("older than the minimum 2.1.281", out.reason)
+        self.assertIn("PATH", out.reason)
+
+    def test_minimum_and_newer_pass(self):
+        for line in ("2.1.281 (Claude Code)", "2.1.300 (Claude Code)", "2.2.0 (Claude Code)"):
+            self.assertEqual(self._installed(line).status, "pass", line)
+
+    def test_unparseable_version_is_not_blocked(self):
+        self.assertEqual(self._installed("Claude Code dev build").status, "pass")
+
+
 if __name__ == "__main__":
     unittest.main()
