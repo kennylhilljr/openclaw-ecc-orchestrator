@@ -170,8 +170,10 @@ A decision is accepted only if all of the following hold:
 2. The request is still `pending` (not already approved, rejected, or expired).
 3. The request has not expired according to the runtime clock.
 4. `run_id`, `unit_id`, `action`, `plan_sha256` and `session_id` all equal the
-   values recorded when the request was created.
-5. `decision` is `approved` or `rejected`, and `decided_by` is present.
+   values recorded when the request was created. A decision need not carry
+   `head_sha`; when it does, it must equal the head bound to the request.
+5. `decision` is `approved` or `rejected`, and `decided_by` is a non blank
+   string.
 
 Consequences:
 
@@ -195,7 +197,23 @@ Write each decision to a temporary name, then rename it into the inbox as
 `<anything>.json` (renames are atomic on the same filesystem). The runtime
 processes files in name order, then moves each file and a
 `<name>.result.json` envelope into `processed/`. Files over 64 KiB, invalid
-JSON, non objects, symlinks and hidden files are rejected or ignored.
+JSON, non objects and symlinks are refused into `processed/` with a reason;
+hidden files (such as the plugin's temporary names) are ignored.
+
+**Who consumes it.** The standing consumer is the runtime's
+`ecc-orchestrator approvals process-inbox` in watch mode, typically run by a
+launchd agent (its plist lives in `integrations/launchd/`). It polls the
+inbox every 2 seconds by default, so a decision made in OpenClaw is applied
+without anyone running a CLI command. It validates each file through the
+same `DecisionInbox` and `ApprovalBroker` path as `approvals approve`, never
+decides on its own, and takes the identity from `decided_by`. Only one
+processor runs per inbox (an advisory lock in the runtime's state dir, not
+in the inbox); `doctor` shows whether it is running. `approvals approve` and
+`approvals reject` still process the inbox too; each file is claimed while
+it is processed, so exactly one consumer handles it. The result file is
+written before the decision moves into `processed/`, and a decision replayed
+after a crash is refused as already resolved, so it is never applied twice.
+See [cli.md](cli.md#standing-inbox-processor).
 
 ## Result envelope
 

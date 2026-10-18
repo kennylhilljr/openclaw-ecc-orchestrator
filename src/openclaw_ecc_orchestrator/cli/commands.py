@@ -34,6 +34,7 @@ from .config import UsageError, checked_path
 from .runtime import CommandFailed, fail, read_document
 
 _HEX = set("0123456789abcdef")
+DECISION_WAIT_SECONDS = 30.0
 
 
 class Plan:
@@ -397,12 +398,23 @@ def execute_decision(ctx, plan):
     inbox_dir = ctx.cfg.decision_inbox
     name = f"{int(ctx.clock() * 1000):013d}-{doc['request_id']}-{uuid.uuid4().hex[:8]}.json"
     atomic_write_json(os.path.join(inbox_dir, name), decision)
-    results = DecisionInbox(inbox_dir, ctx.rt.broker).process()
+    inbox = DecisionInbox(inbox_dir, ctx.rt.broker)
+    results = inbox.process()
     mine = next((r for r in results if r.get("source_file") == name), None)
+    by_processor = False
+    if mine is None:
+        # The standing processor (`approvals process-inbox`) may hold or have
+        # taken this file: wait for its claim, then read the recorded result.
+        mine = inbox.process_one(name, wait=DECISION_WAIT_SECONDS)
+        if mine is None:
+            mine = inbox.read_result(name)
+            by_processor = mine is not None
     if mine is None:
         return envelope(op, ok=False, changed=True, checks=[check("decision_processed", False, name)])
-    others = [r.get("source_file") for r in results if r is not mine]
+    others = [r.get("source_file") for r in results if r.get("source_file") != name]
     warnings = list(mine.get("warnings") or [])
+    if by_processor:
+        warnings.append("the decision was processed by the standing inbox processor")
     if others:
         warnings.append(f"also processed {len(others)} other decision file(s) waiting in the inbox")
     data = {"decision": {"request_id": doc["request_id"], "decision": doc["decision"],

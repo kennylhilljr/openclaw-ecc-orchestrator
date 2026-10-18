@@ -23,7 +23,8 @@ from ..runs.fsutil import atomic_write_json, read_jsonl
 from ..runs.store import iso
 from ..worktrees.git import git_out, toplevel
 from ..worktrees.manager import validate_root
-from . import output
+from ..plugin.inbox import probe_processor_lock, processor_lock_path
+from . import inbox_processor, output
 from .commands import GATED, load_run
 from .config import UsageError, checked_path, forbidden_location, load_config, valid_handle, valid_id
 from .reviews import ReviewStore
@@ -75,6 +76,21 @@ def _nonneg_float(value):
         raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
     if number < 0:
         raise argparse.ArgumentTypeError("must be zero or more")
+    return number
+
+
+def _positive_int(value):
+    number = _nonneg_int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be one or more")
+    return number
+
+
+def _interval(value):
+    number = _nonneg_float(value)
+    if not inbox_processor.MIN_INTERVAL <= number <= inbox_processor.MAX_INTERVAL:
+        raise argparse.ArgumentTypeError(
+            f"must be between {inbox_processor.MIN_INTERVAL:g} and {inbox_processor.MAX_INTERVAL:g} seconds")
     return number
 
 
@@ -170,6 +186,14 @@ def build_parser():
         q.add_argument("--operator", type=_handle, required=True, help="your operator handle (never inferred)")
         q.add_argument("--session", type=_handle, required=True, help="your session id (must match the request)")
         _common(q), _mutating(q)
+    q = asub.add_parser("process-inbox", help="validate and apply the decision files waiting in the inbox")
+    q.add_argument("--watch", action="store_true", help="keep processing until SIGTERM or SIGINT")
+    q.add_argument("--interval", type=_interval,
+                   help="with --watch: poll interval in seconds, 0.5 to 60 (default 2)")
+    q.add_argument("--max-passes", dest="max_passes", type=_positive_int,
+                   help="with --watch: stop after N passes over the inbox")
+    q.add_argument("--dry-run", action="store_true", help="list pending files and what would happen; change nothing")
+    _common(q)
 
     p = sub.add_parser("events", help="read the OpenClaw event log")
     esub = p.add_subparsers(dest="events_command", required=True, metavar="<action>")
@@ -630,8 +654,16 @@ def cmd_doctor(ctx):
         except CommandFailed as exc:
             checks.append(check("certifications_loaded", False,
                                 "; ".join(c["detail"] for c in exc.envelope["checks"] if not c["ok"])))
+    lock = probe_processor_lock(processor_lock_path(cfg.state_dir, cfg.decision_inbox))
+    if lock["held"]:
+        lock_detail = f"running: pid {lock['pid']} holds {lock['path']}"
+    elif lock["held"] is None:
+        lock_detail = f"unknown: cannot probe {lock['path']} ({lock.get('error')})"
+    else:
+        lock_detail = f"not running: no processor holds {lock['path']}"
+    checks.append(check("inbox_processor", True, lock_detail))  # informational
     data = {"config": dict(cfg.public(), policy_file=ctx.rt.policy_path()), "python": ".".join(map(str, py)),
-            "git": text}
+            "git": text, "inbox_processor": lock}
     env = envelope("doctor", ok=all(c["ok"] for c in checks), checks=checks, data=data)
     env["_summary"] = [f"[{'pass' if c['ok'] else 'FAIL'}] {c['name']}: {c['detail']}" for c in checks]
     return env
@@ -752,6 +784,9 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
                 result = cmd_status(ctx)
             elif op == "approvals.list":
                 result = cmd_approvals_list(ctx)
+            elif op == "approvals.process-inbox":
+                inbox_processor.validate_args(args)
+                result = inbox_processor.cmd_process_inbox(ctx)
             elif op == "events.tail":
                 result = cmd_events_tail(ctx)
             else:  # pragma: no cover - argparse restricts the choices

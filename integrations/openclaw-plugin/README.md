@@ -227,11 +227,15 @@ All paths are inside the installed package
   items in the tab (refreshes every 10 seconds), `/ecc` or the snapshot.
 * **Tab is read only.** Gateway protected tab frames accept only GET and
   HEAD, so approve buttons cannot live in the tab.
-* **Runtime inbox consumer.** The runtime processes inbox files only inside
-  `approvals approve` or `approvals reject` or through
-  `DecisionInbox.process`. A decision written by the plugin waits until one of
-  those runs; the runtime needs a standing inbox consumer or a CLI subcommand
-  that only processes the inbox.
+* **Runtime inbox consumer (closed).** The runtime now has a standing
+  consumer: `ecc-orchestrator approvals process-inbox` in watch mode
+  (options `watch` and `interval`, typed with the usual two leading hyphens)
+  polls the inbox and applies each decision through the same `DecisionInbox`
+  and `ApprovalBroker` validation as `approvals approve`, so a decision made
+  in OpenClaw no longer waits for a CLI command. It is typically run by a
+  launchd agent whose plist lives in `integrations/launchd/`. Point its
+  state dir and decision inbox at the directory this plugin's `inbox`
+  names. See the runtime's `docs/cli.md` (Standing inbox processor).
 * **Plugin state location.** The plugin keeps its position in its own
   `stateDir` instead of OpenClaw's keyed store, to keep it outside
   `~/.openclaw`.

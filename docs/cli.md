@@ -34,6 +34,7 @@ option of any subcommand lists them in full.
 | `approvals list` | read only | pending approval requests |
 | `approvals approve` | gated | approve a request through the decision inbox |
 | `approvals reject` | gated | reject a request through the decision inbox |
+| `approvals process-inbox` | consumer | validate and apply the decision files OpenClaw wrote into the inbox, once or as a standing processor (`watch`); `dry-run` changes nothing |
 | `events tail` | read only | print the event log; `since-seq`, `run-id`, `limit`, `follow` with `interval` and `max-polls` |
 | `doctor` | read only | local self checks |
 | `review-plan` | writes review records only | print a plan and its hash; with `approve` write a review record |
@@ -62,14 +63,15 @@ Without `json` a concise human summary is printed: a status line,
 operation specific lines, failed checks, warnings, required user actions and
 the rollback checkpoint. `verbose` adds every check and the data, and streams
 runner output lines to stderr during `dispatch`. `events tail` with `follow`
-and `json` prints one event per line instead of an envelope.
+and `json` prints one event per line instead of an envelope, and so does
+`approvals process-inbox` with `watch` (one envelope per line, see below).
 
 | Exit code | Meaning |
 | :- | :- |
 | 0 | ok |
 | 1 | the operation failed (a check failed, a plan changed, the operator declined) |
 | 2 | usage error: bad options, invalid identifiers, path traversal, a bad config file, `yes` without `review-id` |
-| 3 | an approval or another user action is required; `required_user_actions` says which |
+| 3 | an approval or another user action is required; `required_user_actions` says which. `approvals process-inbox` also exits 3 when another processor already holds the inbox lock |
 
 A read only command that succeeds exits 0 even when it reports required user
 actions (for example `status` listing a pending approval).
@@ -247,9 +249,85 @@ with `request_pending`), not expired, and run, unit, action, plan hash and
 session equal to the request (a different session fails with
 `binding_matches`, is audited and does not consume the request). The head
 sha is bound by the runtime when the request is created and checked when the
-approval is used. Other decision files waiting in the inbox are processed in
+approval is used; a decision that names a different `head_sha` is refused
+(`head_sha_matches`). Other decision files waiting in the inbox are processed in
 the same pass and reported as a warning. `approval.resolved` is emitted with
 `decided_by`.
+
+## Standing inbox processor
+
+`approvals process-inbox` is the runtime's consumer of the decision inbox.
+The OpenClaw plugin writes one decision file per approval into the inbox
+(`decision_inbox`); this subcommand validates and applies them. It decides
+nothing and never approves on its own: every file goes through
+`DecisionInbox` and `ApprovalBroker.resolve`, the same path as `approvals
+approve` and `approvals reject`. All broker checks apply: known request,
+still pending (single use), not expired, run, unit, action, plan hash and
+session equal to the request, a `head_sha` (when the decision names one)
+equal to the head bound to the request, a valid `decision` and a non blank
+`decided_by`. There is no `operator` option: the identity is the decision
+file's `decided_by`, written by OpenClaw, and a file without it is refused.
+A refused decision is audited and does not consume the request. Each
+applied decision emits `approval.resolved`, emitted by the broker exactly as
+for `approvals approve`.
+
+| Mode | Options | Behavior |
+| :- | :- | :- |
+| once | (none) | process every pending file once, print one envelope, exit |
+| watch | `watch`, `interval <seconds>` (0.5 to 60, default 2), `max-passes <n>` | poll the inbox every interval until SIGTERM or SIGINT (or after `max-passes` passes); the file in progress is finished before exiting 0 |
+| dry run | `dry-run` | list the pending files and what would happen to each (`would`: `apply` or `refuse`, with the failed checks); takes no lock and changes nothing |
+
+`interval` and `max-passes` without `watch`, and `dry-run` together with
+`watch`, are usage errors (exit 2).
+
+**Output.** Once and dry run print the standard envelope; `data` holds
+`files` (one summary per file: `file`, `ok`, `outcome` or `would`,
+`request_id`, `decision`, `decided_by`, `failed`), the counts `applied`,
+`refused` and `errors`, the `inbox` and the lock. With `watch` and `json`
+the processor prints one envelope per line: `data.event` is `started`,
+`file` (one per processed file), `error` or `stopped` (with the reason, for
+example `SIGTERM`, and the totals). Without `json` it prints one concise
+line per event. Everything printed passes through the redaction engine, so
+a secret planted in a decision file is never echoed.
+
+**Exit codes.** 0 when the pass completed (refused decisions are reported,
+they are not a processor failure) and after a clean stop in watch mode; 1
+when processing a file raised an error in once mode; 2 for usage errors; 3
+when another processor holds the lock.
+
+**One processor per inbox.** The processor holds an advisory `flock` on
+`<state_dir>/inbox-processor-<digest>.lock` (the digest is derived from the
+inbox's real path; the lock is never inside the inbox) for as long as it
+runs. A second processor for the same inbox exits 3 at once with
+`processor_lock_acquired` failed and an `inbox_processor_running` action
+naming the holder's pid; in watch mode it exits immediately too. `doctor`
+reports whether the lock is held (`inbox_processor`), without creating
+anything. `approvals approve` and `approvals reject` may run while the
+processor does: each file is claimed with its own `flock` while it is
+processed, so exactly one consumer handles it, and the command reads the
+recorded result when the processor took its file first.
+
+**Crash safety and robustness.** A file moves into `processed/` only after
+the broker has persisted its state and the `<name>.result.json` envelope is
+written. After a crash between the broker resolve and the move, the next
+pass resolves the file again; the broker refuses it as already resolved
+(`request_pending`), that refusal is recorded and the file moves, so a
+decision is never applied twice. Malformed JSON, files over 64 KiB, non
+objects and symlinks are refused into `processed/` with a reason; files that
+vanish or appear mid scan are skipped or picked up by the next pass. An
+exception while processing one file is reported (redacted) and the loop
+continues; in watch mode a file that fails 3 times is set aside into
+`processed/` with `processing_error`, without being resolved.
+
+**Running it as a standing service.** The standing processor is
+`approvals process-inbox` with `watch`, `interval 2` and `json`, plus
+`state-dir` and `decision-inbox` (or a `config` file) naming the same
+directories the plugin uses. With the defaults these are
+`$HOME/.local/state/openclaw-ecc-orchestrator` (or the XDG state home) and
+its `decisions` subdirectory; the options may be omitted when the defaults
+apply, but the processor must consume the directory the plugin's `inbox`
+names. On macOS it typically runs as a launchd agent; the agent's plist
+lives in `integrations/launchd/`.
 
 ## Subcommand notes
 
@@ -298,7 +376,10 @@ the same pass and reported as a warning. `approval.resolved` is emitted with
   needed for merge-tree in write-tree mode), the repository, the state dir
   location and writability (without creating it), the worktree root, the
   policy file and the certification records. Bad locations are reported as
-  failed checks (exit 1) instead of usage errors.
+  failed checks (exit 1) instead of usage errors. The informational
+  `inbox_processor` check (always passing) says whether a standing
+  `approvals process-inbox` holds the inbox lock, with its pid; `data`
+  carries the same as `inbox_processor`. The probe creates no file.
 
 ## Backups
 

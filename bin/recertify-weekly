@@ -1,0 +1,127 @@
+#!/bin/sh
+# Weekly runner recertification for openclaw-ecc-orchestrator (macOS).
+#
+# Usage:
+#   bin/recertify-weekly          certify claude, codex, gemini, groq and kimi
+#   bin/recertify-weekly check    check the setup only: no model calls, no keys read
+#
+# Meant for a launchd user agent (see integrations/launchd/README.md), so it
+# builds its own PATH instead of trusting the login shell's:
+#   * Node CLIs (claude, codex) come from nvm's default Node first, so a stale
+#     Claude Code elsewhere on PATH cannot shadow the certified one.
+#   * Python is the first python3 that is 3.11 or newer (ECC_PYTHON overrides).
+# Provider keys are read from the macOS Keychain by bin/with-keychain-secrets,
+# only for the certification command. Results go to
+# .orchestration/runtime/cert-weekly-<UTC stamp>/ (gitignored), the summary is
+# copied to .orchestration/runtime/cert-latest.json, and a macOS notification
+# reports the outcome. Exit code: 0 gate met, 1 gate not met or error, 2 usage.
+set -u
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+RUNNERS=${ECC_RECERT_RUNNERS:-claude,codex,gemini,groq,kimi}
+MODE=${1:-run}
+
+notify() {
+  # $1 title, $2 message. Never include secrets: callers pass fixed text only.
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+  fi
+  echo "[recertify] $1: $2"
+}
+
+fail() {
+  notify "ECC recertification failed" "$1"
+  exit 1
+}
+
+# PATH: nvm default Node first, then standard locations. No login shell files.
+NVM_DIR=${NVM_DIR:-"$HOME/.nvm"}
+NODE_BIN=""
+if [ -r "$NVM_DIR/alias/default" ]; then
+  want=$(cat "$NVM_DIR/alias/default")
+  for dir in "$NVM_DIR"/versions/node/v"${want#v}"* ; do
+    [ -x "$dir/bin/node" ] && NODE_BIN="$dir/bin"
+  done
+fi
+PATH="${NODE_BIN:+$NODE_BIN:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+# Python 3.11 or newer.
+PY=""
+for cand in ${ECC_PYTHON:-} /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+            /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PY=$(command -v "$cand"); break
+  fi
+done
+
+check() {
+  ok=0
+  echo "repo:    $REPO"
+  echo "node:    ${NODE_BIN:-not found (nvm default)}"
+  if [ -n "$PY" ]; then echo "python:  $PY ($("$PY" -c 'import sys; print(sys.version.split()[0])'))"
+  else echo "python:  no python3 >= 3.11 found (set ECC_PYTHON)"; ok=1; fi
+  for tool in claude codex; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "$tool:  $(command -v "$tool") -> $("$tool" --version 2>&1 | head -1)"
+    else
+      echo "$tool:  not found"; ok=1
+    fi
+  done
+  for name in GEMINI_API_KEY GROQ_API_KEY MOONSHOT_API_KEY; do
+    if security find-generic-password -a "$USER" -s "$name" >/dev/null 2>&1; then
+      echo "keychain: $name present"
+    else
+      echo "keychain: $name missing"; ok=1
+    fi
+  done
+  [ -x "$REPO/bin/with-keychain-secrets" ] || { echo "launcher: bin/with-keychain-secrets not executable"; ok=1; }
+  return $ok
+}
+
+case "$MODE" in
+  check)
+    check; status=$?
+    [ $status -eq 0 ] && echo "check: ok" || echo "check: problems found"
+    exit $status ;;
+  run) ;;
+  *) echo "usage: bin/recertify-weekly [check]" >&2; exit 2 ;;
+esac
+
+[ -n "$PY" ] || fail "no python3 3.11 or newer found"
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="$REPO/.orchestration/runtime/cert-weekly-$STAMP"
+mkdir -p "$OUT" || fail "cannot create $OUT"
+
+cd "$REPO" || fail "cannot enter the repository"
+PYTHONPATH=src "$REPO/bin/with-keychain-secrets" "$PY" -m openclaw_ecc_orchestrator.runners.certify \
+  --runners "$RUNNERS" --out "$OUT" > "$OUT/run.log" 2>&1
+code=$?
+
+if [ ! -s "$OUT/summary.json" ]; then
+  fail "certification did not finish (exit $code); see $OUT/run.log"
+fi
+cp "$OUT/summary.json" "$REPO/.orchestration/runtime/cert-latest.json"
+
+result=$("$PY" - "$OUT/summary.json" <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1]))
+recs = [r.get("record", r) for r in s.get("results", [])]
+failed = [x.get("runner", "?") for x in recs if x.get("status") != "certified"]
+gate = bool(s.get("gate", {}).get("gate_met"))
+print("met" if gate else "not-met", ",".join(failed) or "-")
+PYEOF
+)
+gate=${result%% *}
+failed=${result#* }
+
+if [ "$gate" = "met" ] && [ "$failed" = "-" ]; then
+  notify "ECC recertification passed" "All runners certified; gate met."
+  exit 0
+elif [ "$gate" = "met" ]; then
+  notify "ECC recertification: gate met" "Not certified: $failed. See $OUT"
+  exit 0
+fi
+fail "Gate not met. Not certified: $failed. See $OUT"
