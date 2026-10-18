@@ -20,7 +20,8 @@ from .registry import get_profile
 
 # Output budget for the one line probe. Reasoning models (Groq's gpt-oss-20b,
 # observed 2026-10-18) spend tokens thinking before they answer; 8 tokens left
-# them with an empty reply. 512 is still a fraction of a cent.
+# them with an empty reply. 512 is still a fraction of a cent. No temperature is
+# sent: kimi-k3 accepts only 1 (HTTP 400 otherwise) and a one word reply needs none.
 PROBE_MAX_TOKENS = 512
 
 class ApiAdapter:
@@ -63,7 +64,7 @@ class ApiAdapter:
 
     def inference_request(self, ctx: ProbeContext) -> tuple[str, dict]:
         return (self.base_url + "/chat/completions",
-                {"model": ctx.model, "max_tokens": PROBE_MAX_TOKENS, "temperature": 0,
+                {"model": ctx.model, "max_tokens": PROBE_MAX_TOKENS,
                  "messages": [{"role": "user", "content": PROBE_PROMPT}]})
 
     def parse_inference(self, data: dict, ctx: ProbeContext) -> dict[str, Any]:

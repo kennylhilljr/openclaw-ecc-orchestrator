@@ -65,7 +65,9 @@ DEFAULT_API_PREFERENCES = {
     # Groq's 2026-10 catalog has no "instant" or 8b model; its small general
     # model is openai/gpt-oss-20b. Guard, speech and safeguard models never match.
     "groq": ["*instant*", "*-8b*", "*/gpt-oss-20b", "gpt-oss-20b", "*small*", "*mini*"],
-    "kimi": ["kimi-*", "moonshot-v1-8k*"],
+    # Prefer the k2 coding models; kimi-k3 (reasoning only, max effort by
+    # default) is the flagship, kept for long context work, not cheap probes.
+    "kimi": ["kimi-k2*-code", "kimi-k2*", "kimi-*", "moonshot-v1-8k*"],
     "openrouter": [],
 }
 ECONOMICAL_WORKERS = ("gemini", "groq", "kimi", "openrouter")

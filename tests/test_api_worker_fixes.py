@@ -243,5 +243,24 @@ class ProviderAccountIdTests(unittest.TestCase):
             self.assertEqual(redaction.redact_text(text), text)
 
 
+class KimiProbeTests(unittest.TestCase):
+    """kimi-k3 rejects any temperature but 1 (HTTP 400), and the economical
+    patterns picked that flagship model over the k2 coding model."""
+
+    CATALOG = ["kimi-k2.7-code-highspeed", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6"]
+
+    def test_chat_probe_sends_no_temperature(self):
+        from openclaw_ecc_orchestrator.runners.api_adapters import GroqAdapter, KimiAdapter
+        for adapter in (GroqAdapter(), KimiAdapter()):
+            _, body = adapter.inference_request(ProbeContext(model="m"))
+            self.assertNotIn("temperature", body)
+
+    def test_default_patterns_prefer_the_k2_coding_model(self):
+        from openclaw_ecc_orchestrator.runners.certify import DEFAULT_API_PREFERENCES
+        ranked = discovery.rank_models([{"id": i} for i in self.CATALOG],
+                                       DEFAULT_API_PREFERENCES["kimi"])
+        self.assertEqual(ranked[0], "kimi-k2.7-code")
+
+
 if __name__ == "__main__":
     unittest.main()
