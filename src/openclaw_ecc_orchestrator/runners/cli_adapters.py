@@ -387,6 +387,34 @@ class ClaudeAdapter(CliAdapter):
                 "error": error}
 
 
+def git_write_dir(cwd):
+    """The directory git writes when committing from ``cwd``.
+
+    A normal checkout writes ``<cwd>/.git``. In a linked worktree ``.git`` is a
+    file ("gitdir: <common>/worktrees/<name>"); a commit there writes that
+    worktree's index under the common directory plus the shared objects and
+    refs, so the common git directory is what must be writable."""
+    dotgit = os.path.join(cwd, ".git")
+    if not os.path.isfile(dotgit):
+        return dotgit
+    try:
+        with open(dotgit, encoding="utf-8") as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return dotgit
+    if not first.startswith("gitdir:"):
+        return dotgit
+    gitdir = first[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.normpath(os.path.join(cwd, gitdir))
+    try:
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as fh:
+            common = fh.readline().strip()
+    except OSError:
+        return gitdir
+    return os.path.normpath(common if os.path.isabs(common) else os.path.join(gitdir, common))
+
+
 class CodexAdapter(CliAdapter):
     """Codex exec mode (flags confirmed against codex-cli 0.158.0-alpha.7).
 
@@ -409,8 +437,10 @@ class CodexAdapter(CliAdapter):
             if writable:
                 # workspace-write keeps <root>/.git read only, so the agent
                 # cannot commit (live finding: ".git/index.lock" denied).
-                # Grant exactly this repository's git directory.
-                argv += ["--add-dir", os.path.join(cwd, ".git")]
+                # Grant exactly this repository's git directory; for a linked
+                # worktree that is the common .git, not the ".git" pointer
+                # file (live finding, preflight 2026-10-19).
+                argv += ["--add-dir", git_write_dir(cwd)]
         if model:
             argv += ["-m", model]
         if self.effort:

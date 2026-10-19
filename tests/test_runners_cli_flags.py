@@ -158,6 +158,22 @@ class CodexFlagTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--add-dir") + 1], os.path.join("/w/repo", ".git"))
         self.assertNotIn("--add-dir", CodexAdapter().build_invocation("x", writable=True))
 
+    def test_writable_worktree_grants_the_common_git_dir(self):
+        """In a linked worktree .git is a pointer file; the grant must be the common .git."""
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = os.path.join(tmp, "repo"), os.path.join(tmp, "wt")
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                       GIT_COMMITTER_EMAIL="t@t")
+            for args in (["init", "-q", repo], ["-C", repo, "commit", "-q", "--allow-empty", "-m", "c"],
+                         ["-C", repo, "worktree", "add", "-q", "-b", "w", wt]):
+                subprocess.run(["git"] + args, check=True, env=env)
+            self.assertTrue(os.path.isfile(os.path.join(wt, ".git")))
+            argv = CodexAdapter().build_invocation("x", cwd=wt, writable=True)
+            granted = argv[argv.index("--add-dir") + 1]
+            self.assertEqual(os.path.realpath(granted), os.path.realpath(os.path.join(repo, ".git")))
+
     def test_auth_parse(self):
         adapter = CodexAdapter()
         self.assertTrue(adapter.parse_auth(CommandResult(0, "", "Logged in using ChatGPT\n"))[0])
