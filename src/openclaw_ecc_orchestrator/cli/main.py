@@ -168,6 +168,17 @@ def build_parser():
     _unit(p)
     _common(p), _mutating(p)
 
+    p = sub.add_parser("drive", help="deliver a milestone with the agent team: plan check, dispatch, repair, "
+                                     "review, verify and merge every unit, then the milestone review")
+    p.add_argument("--run-id", dest="run_id", type=_id, required=True)
+    p.add_argument("--max-cost-usd", dest="max_cost_usd", type=_nonneg_float,
+                   help="stop when the drive has spent this much (default: the policy's max_cost_usd_total)")
+    p.add_argument("--max-hours", dest="max_hours", type=_nonneg_float, help="stop after this many hours")
+    p.add_argument("--runner-command-json", dest="runner_command_json",
+                   help="TEST ONLY: JSON argv replacing every coder command; needs --allow-test-runner")
+    p.add_argument("--allow-test-runner", dest="allow_test_runner", action="store_true")
+    _common(p), _mutating(p)
+
     p = sub.add_parser("merge", help="enqueue and merge a reviewed unit (destructive)")
     _unit(p)
     _common(p), _mutating(p)

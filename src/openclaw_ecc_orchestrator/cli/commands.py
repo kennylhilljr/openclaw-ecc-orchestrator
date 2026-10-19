@@ -660,6 +660,59 @@ def execute_team_review(ctx, plan):
     return res
 
 
+# == drive ==
+def plan_drive(ctx):
+    op = "drive"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    from ..team import config as TC
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        fail(op, "team_config_valid", str(exc))
+    budget = ((run.get("policy") or {}).get("budget") or {})
+    max_cost = a.max_cost_usd if a.max_cost_usd is not None else budget.get("max_cost_usd_total")
+    states = {}
+    for u in run["units"].values():
+        states[u["state"]] = states.get(u["state"], 0) + 1
+    doc = base_doc(op, run_id=a.run_id, unit_states=states, merge_approval=team["merge_approval"],
+                   milestone=(team.get("milestone") or {}).get("name"), max_cost_usd=max_cost,
+                   max_hours=a.max_hours, run_plan_sha256=run["plan_sha256"], push=False,
+                   test_runner=bool(a.runner_command_argv))
+    return Plan(doc, extra={"policy": run.get("policy"), "team": team})
+
+
+def execute_drive(ctx, plan):
+    import argparse
+    from ..process.supervisor import Supervisor
+    from ..team.drive import Drive, shell_gate_runner
+    from ..team.review import TeamStep
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "drive")
+    supervisor = Supervisor(clock=ctx.clock)
+    step = TeamStep(c, plan.extra["team"], state_dir=ctx.cfg.state_dir, worktree_root=ctx.cfg.worktree_root,
+                    logs_dir=ctx.cfg.logs_dir, supervisor=supervisor, clock=ctx.clock)
+    saved = ctx.args
+
+    def dispatch(unit_id):
+        ns = argparse.Namespace(**vars(saved))
+        ns.unit, ns.worker = unit_id, None
+        ctx.args = ns
+        try:
+            return execute_dispatch(ctx, plan_dispatch(ctx))
+        except CommandFailed as exc:
+            return exc.envelope
+        finally:
+            ctx.args = saved
+
+    drive = Drive(c, step, plan.extra["team"], doc["run_id"], dispatch=dispatch, clock=ctx.clock,
+                  max_cost_usd=doc["max_cost_usd"], max_hours=doc["max_hours"], progress=ctx.progress,
+                  reports_dir=os.path.join(ctx.cfg.state_dir, "reports"), gate_runner=shell_gate_runner(supervisor))
+    res = drive.go()
+    res["operation"] = "drive"
+    return res
+
+
 class Spec:
     def __init__(self, plan, execute, authorize=None, lease=False):
         self.plan = plan
@@ -677,6 +730,7 @@ GATED = {
     "verify": Spec(plan_verify, execute_verify),
     "review": Spec(plan_review, execute_review, lease=True),
     "team-review": Spec(plan_team_review, execute_team_review, lease=True),
+    "drive": Spec(plan_drive, execute_drive, lease=True),
     "merge": Spec(plan_merge, execute_merge, authorize=authorize_merge, lease=True),
     "cleanup": Spec(plan_cleanup, execute_cleanup, authorize=authorize_cleanup),
     "approvals.approve": Spec(plan_decision, execute_decision),
