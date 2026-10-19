@@ -143,7 +143,8 @@ class IntegrationBase(unittest.TestCase):
                            os.path.join(self.tmp, "merge-scratch"),
                            gate_runner=lambda unit, path: holder["c"].gate(unit, path),
                            emitter=emitter, clock=self.clock, broker=broker, policy=self.policy,
-                           certified_runners=kw.get("certified_runners", self.CERTIFIED))
+                           certified_runners=kw.get("certified_runners", self.CERTIFIED),
+                           catalog=kw.get("catalog"))
         options = dict(policy=self.policy, certified_runners=self.CERTIFIED)
         options.update(kw)
         c = Conductor(cid, manager=manager, worktrees=worktrees, supervisor=supervisor, queue=queue, broker=broker,

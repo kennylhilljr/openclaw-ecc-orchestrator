@@ -360,6 +360,38 @@ class Conductor:
         return nxt
 
     # == repair support (TEAM-DELIVERY-v2 section 5) ==
+    def return_for_changes(self, run_id, unit_id, reason, evidence):
+        """A review, verification or merge found the work wanting (TEAM-DELIVERY-v2
+        4.1 and 5.1): the attempt that passed the gates is re-recorded as an
+        objective failure, so the escalation controller decides the next step
+        (repair, escalate or stop) within the unit's budget, and the unit goes
+        back to `ready` (reason `review:<reason>`) with the evidence for the
+        failure brief. The worktree and branch stay."""
+        op = "unit.return_for_changes"
+        run = self.manager.load(run_id)
+        unit = run["units"][unit_id]
+        record = copy.deepcopy((unit.get("annotations") or {}).get("escalation") or {})
+        attempts = record.get("attempts") or []
+        if attempts and attempts[-1].get("passed"):
+            attempts[-1].update(passed=False, objective_failure=True, reason=reason)
+            record["final"] = None
+            self.manager.annotate_unit(run_id, self.id, unit_id, "escalation", record)
+        with self._lock:
+            self._controllers.pop((run_id, unit_id), None)
+        self._note_failure(run_id, unit_id, reason, evidence)
+        ctrl = self._controller(self.manager.load(run_id), unit_id)
+        nxt = ctrl.next_action() if ctrl is not None else {"action": "stop", "reason": "no controller"}
+        if nxt["action"] in ("stop", "done"):
+            return self._needs_user(run_id, unit_id, "escalation_stopped",
+                                    f"{reason}; escalation: {nxt.get('reason')}", op)
+        res = self.manager.transition(run_id, self.id, unit_id, S.READY, reason=f"review:{reason}")
+        if not res["ok"]:
+            return res
+        self._emit("unit.returned_for_changes", run_id, unit_id,
+                   {"reason": reason, "next_action": nxt.get("action"), "tier": nxt.get("tier")})
+        return envelope(op, ok=True, changed=True, checks=[check("returned_to_coder", True, reason)],
+                        data={"next_action": nxt})
+
     def _note_failure(self, run_id, unit_id, reason, evidence, fix=None):
         """Record what the next attempt needs to know (`last_failure`)."""
         try:

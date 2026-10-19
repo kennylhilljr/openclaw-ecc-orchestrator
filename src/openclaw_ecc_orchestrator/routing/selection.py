@@ -187,7 +187,9 @@ def select_runner(tier: int, certified_runners: Any, catalog: Mapping | None,
         if risk == "high" and not profile.high_risk_ok:
             reject("not permitted for high-risk work")
             continue
-        if profile.conditional == "large_context" and not large_context:
+        # The large-context condition limits authoring; reviews read an evidence
+        # pack and may use the runner (TEAM-DELIVERY-v2 panels).
+        if profile.conditional == "large_context" and not large_context and role != "review":
             reject("conditional runner: requires large_context")
             continue
         model, why = resolve_model(profile, capability_class, catalog, policy, now)

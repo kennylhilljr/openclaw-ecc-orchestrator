@@ -625,6 +625,41 @@ def execute_cleanup(ctx, plan):
     return res
 
 
+# == team-review ==
+def plan_team_review(ctx):
+    op = "team-review"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    unit = load_unit(op, run, a.unit)
+    if unit["state"] != S.REVIEWING:
+        fail(op, "unit_reviewing", f"unit {a.unit} is {unit['state']}; team-review needs a unit in reviewing")
+    from ..team import config as TC
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        fail(op, "team_config_valid", str(exc))
+    head = ((unit.get("annotations") or {}).get("verification") or {}).get("head")
+    doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], verified_head=head,
+                   author=(unit.get("routing") or {}).get("runner"), merge_approval=team["merge_approval"],
+                   roles={r: {k: v for k, v in spec.items() if k in ("class", "panel", "panels", "when",
+                                                                      "contract_paths", "when_paths")}
+                          for r, spec in team["roles"].items()},
+                   run_plan_sha256=run["plan_sha256"], push=False)
+    return Plan(doc, extra={"policy": run.get("policy"), "team": team})
+
+
+def execute_team_review(ctx, plan):
+    from ..process.supervisor import Supervisor
+    from ..team.review import TeamStep
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "team-review")
+    step = TeamStep(c, plan.extra["team"], state_dir=ctx.cfg.state_dir, worktree_root=ctx.cfg.worktree_root,
+                    logs_dir=ctx.cfg.logs_dir, supervisor=Supervisor(clock=ctx.clock), clock=ctx.clock)
+    res = step.run(doc["run_id"], doc["unit_id"])
+    res["operation"] = "team-review"
+    return res
+
+
 class Spec:
     def __init__(self, plan, execute, authorize=None, lease=False):
         self.plan = plan
@@ -641,6 +676,7 @@ GATED = {
     "dispatch": Spec(plan_dispatch, execute_dispatch, lease=True),
     "verify": Spec(plan_verify, execute_verify),
     "review": Spec(plan_review, execute_review, lease=True),
+    "team-review": Spec(plan_team_review, execute_team_review, lease=True),
     "merge": Spec(plan_merge, execute_merge, authorize=authorize_merge, lease=True),
     "cleanup": Spec(plan_cleanup, execute_cleanup, authorize=authorize_cleanup),
     "approvals.approve": Spec(plan_decision, execute_decision),

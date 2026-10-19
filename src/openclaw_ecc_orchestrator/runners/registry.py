@@ -70,9 +70,10 @@ PROFILES: dict[str, RunnerProfile] = {
         notes="fallback and review only, pinned approved models and explicit data policy."),
     "kimi": RunnerProfile(
         name="kimi", provider="kimi", family="moonshot", kind="api",
-        classes=("standard",), review_classes=("standard",),
+        classes=("standard",), review_classes=("standard", "advanced"),
         roles=frozenset({"author", "review"}), conditional="large_context",
-        notes="optional; only when certified and the context size warrants it."),
+        notes="optional; only when certified and the context size warrants it. Reviews at advanced with "
+              "the K3 reasoning model (TEAM-DELIVERY-v2 panels)."),
 }
 
 _FAMILY_HINTS = (

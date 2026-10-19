@@ -163,6 +163,11 @@ def build_parser():
     p.add_argument("--notes", default="")
     _common(p), _mutating(p)
 
+    p = sub.add_parser("team-review", help="run the agent team on a unit in reviewing: reviewers, QA verifier, "
+                                           "then the merge (agents approve it when team.json says so)")
+    _unit(p)
+    _common(p), _mutating(p)
+
     p = sub.add_parser("merge", help="enqueue and merge a reviewed unit (destructive)")
     _unit(p)
     _common(p), _mutating(p)

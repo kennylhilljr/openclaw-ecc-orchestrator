@@ -29,6 +29,7 @@ option of any subcommand lists them in full.
 | `dispatch` | gated | route, assign, create the worktree, run the runner, validate the handoff and verify; the unit ends in `reviewing` on success |
 | `verify` | gated | re-run the gates in the unit worktree and check head, cleanliness and scope; changes no run state |
 | `review` | gated | record an independent review; an approving review requests a merge approval bound to the verified head |
+| `team-review` | gated | run the agent team on a unit in `reviewing` (TEAM-DELIVERY-v2): the PR reviewer, plus the security reviewer, architect or designer when the diff calls for them, then the QA verifier in a throwaway checkout; each role rotates across the certified providers. Changes requested or a failed verification return the unit to the coder (`ready`); with `merge_approval` `agents` in `.orchestration/team.json` the agents approve the merge and the queue merges it after re-running the gates; with `human` the approval waits for the owner as before |
 | `merge` | gated, destructive | enqueue the reviewed unit (consuming its merge approval) and process the queue until it is merged |
 | `cleanup` | gated, destructive when it archives unique work | remove a stopped unit's worktree and branch |
 | `approvals list` | read only | pending approval requests |
@@ -37,7 +38,7 @@ option of any subcommand lists them in full.
 | `approvals process-inbox` | consumer | validate and apply the decision files OpenClaw wrote into the inbox, once or as a standing processor (`watch`); `dry-run` changes nothing |
 | `events tail` | read only | print the event log; `since-seq`, `run-id`, `limit`, `follow` with `interval` and `max-polls` |
 | `doctor` | read only | local self checks |
-| `preflight` | throwaway worktrees only | round trip through every certified coding runner: the real unit prompt, command line, environment and permissions must write a file, commit, run `uv --version` and `git status --short`, and write a schema valid handoff to the real handoff path; the orchestrator then runs a gate command; worktrees and branches are removed (`keep` keeps them); `runner` checks one |
+| `preflight` | throwaway worktrees only | round trip through every certified coding runner: the real unit prompt, command line, environment and permissions must write a file, commit, run the gate commands (the uv version and a short git status), and write a schema valid handoff to the real handoff path; the orchestrator then runs a gate command; worktrees and branches are removed (`keep` keeps them); `runner` checks one |
 | `review-plan` | writes review records only | print a plan and its hash; with `approve` write a review record |
 
 Gated subcommands are the mutating ones. Each accepts `dry-run`, `json`,
@@ -349,6 +350,16 @@ lives in `integrations/launchd/`.
   missing or older than certified, or denied a tool goes to `needs_user`
   with the exact fix and does not charge the budget. `status` shows each
   unit's `last_failure`.
+* **Team roles on API providers.** Gemini, Kimi and Groq personas read
+  their keys from the environment (`GEMINI_API_KEY`, `MOONSHOT_API_KEY`,
+  `GROQ_API_KEY`); run `team-review` through `bin/with-keychain-secrets` so
+  the keys come from the Keychain. The repository policy needs
+  `model_preferences` for those providers and the catalog for model ids. The
+  per turn cost cap applies only to per token prices from the catalog;
+  configured `runner_costs` for the subscription CLIs are routing weights.
+  Rotation state and per role turn counts live in
+  `<state_dir>/team/<run_id>.json`; each unit's verdicts are in its `team`
+  annotation.
 * `create-run` requires `run-id` and `plan` (a JSON file holding
   `{"units": [...]}` or a list of work units; duplicate keys are refused).
   The plan pins the target tip as the base commit.
