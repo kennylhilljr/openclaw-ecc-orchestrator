@@ -91,6 +91,32 @@ Results are in the runtime copy under `.orchestration/runtime/` (latest
 summary: `cert-latest.json`). `doctor` also reports whether an inbox processor
 holds its lock.
 
+## Round-trip check
+
+`bin/roundtrip-smoke` proves the whole loop on this Mac: the operator CLI
+writes a run to the live event log, the ECC Orchestrator tab shows its merge
+approval pending, you decide with the `bin/ecc-decide` line the script prints
+(from a second terminal), the inbox processor applies it, and the script
+merges into a throwaway repository (or confirms the merge is refused after a reject). No
+model calls, no keys, nothing pushed; it removes its temporary directory, and
+the run stays visible in the tab as `smoke-<stamp>`. It waits for your
+decision until the approval request expires (one hour by default).
+
+```sh
+bin/roundtrip-smoke
+```
+
+`bin/ecc-decide list` shows pending approval requests at any time;
+`bin/ecc-decide approve [request_id]` and `reject` decide one after a
+confirmation (`--yes` skips it). It calls the plugin's
+`ecc-orchestrator.decide` gateway method as an operator UI client, so OpenClaw
+records who decided. Typing `/ecc-decide` in the Control UI chat is refused in
+OpenClaw 2026.9.6 because the chat gives plugin commands no sender identity.
+
+The automated versions run in the test suite: `tests/test_roundtrip_openclaw.py`
+(CLI, plugin engine and standing processor as separate processes) and
+`tests/test_roundtrip_smoke.py` (this script with a simulated operator).
+
 ## Uninstall
 
 ```sh

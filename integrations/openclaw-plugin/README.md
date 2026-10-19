@@ -206,8 +206,10 @@ All paths are inside the installed package
   clients (where it is the client program id, for example `cli`, which the
   plugin refuses). For Control UI and terminal UI connections it is absent,
   so `/ecc-decide` fails closed there and operators use
-  `ecc-orchestrator.decide`. A command context field with the authenticated
-  profile would let the command work everywhere.
+  `ecc-orchestrator.decide`, most simply through `bin/ecc-decide` (an operator
+  UI client; verified live on 2026-10-18 with `decided_by` `gateway-owner`).
+  A command context field with the authenticated profile would let the
+  command work everywhere.
 * **Session on the gateway method.** Plugin RPC handlers receive the
   authenticated profile but no host bound session. The caller names the
   session and the plugin requires it to equal the request's requesting

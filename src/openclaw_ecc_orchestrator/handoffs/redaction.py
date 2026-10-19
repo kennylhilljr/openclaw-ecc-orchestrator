@@ -134,8 +134,43 @@ def _path_start(token: str) -> int:
     return best
 
 
+# Orchestrator unit branches (``ecc/<run_id>/<unit_id>``, optionally under
+# ``refs/heads/``) are judged one segment at a time, like paths. Joined, a
+# time-stamped run id and a unit id often reach 32 characters with mixed
+# case and digits and would read as one random token (for example
+# ``ecc/smoke-20261019T005138Z/smoke``). A segment that is itself long and
+# random is still masked.
+_BRANCH_RE = re.compile(
+    r"(?:refs/heads/)?ecc/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _branch_spans(m: "re.Match[str]") -> list[tuple[int, int]] | None:
+    """Spans for a token holding an orchestrator branch, or None if it holds none."""
+    token = m.group(0)
+    for b in _BRANCH_RE.finditer(token):
+        if b.start() > 0 and token[b.start() - 1] != "=":
+            continue
+        if b.end() < len(token) and token[b.end()] not in "=":
+            continue
+        spans = []
+        for lo, hi in ((0, max(0, b.start() - 1)), (b.end(), len(token))):
+            part = token[lo:hi]
+            if len(part) >= 32 and _is_high_entropy(part):
+                spans.append((m.start() + lo, m.start() + hi))
+        offset = m.start() + b.start()
+        for segment in token[b.start():b.end()].split("/"):
+            if len(segment) >= 32 and _is_high_entropy(segment):
+                spans.append((offset, offset + len(segment)))
+            offset += len(segment) + 1
+        return spans
+    return None
+
+
 def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     token = m.group(0)
+    branch = _branch_spans(m)
+    if branch is not None:
+        return branch
     start = _path_start(token)
     if start < 0:
         return [m.span()] if _is_high_entropy(token) else []

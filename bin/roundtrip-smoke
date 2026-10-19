@@ -1,0 +1,18 @@
+#!/bin/sh
+# Live round-trip smoke test: operator CLI -> OpenClaw (you decide in the
+# ECC Orchestrator tab / Main Session) -> launchd inbox processor -> merge
+# into a throwaway repository. See integrations/smoke/roundtrip_smoke.py.
+# No model calls, no keys, nothing pushed. Exit 0 = round trip verified.
+set -u
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PY=""
+for cand in ${ECC_PYTHON:-} /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+            /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PY=$(command -v "$cand"); break
+  fi
+done
+[ -n "$PY" ] || { echo "roundtrip-smoke: no python3 3.11 or newer found (set ECC_PYTHON)" >&2; exit 1; }
+exec "$PY" "$REPO/integrations/smoke/roundtrip_smoke.py" "$@"

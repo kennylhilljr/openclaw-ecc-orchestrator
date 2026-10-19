@@ -180,5 +180,40 @@ class SupervisorRedactionTests(unittest.TestCase):
             self.assertNotIn(secret, json.dumps(res))
 
 
+class BranchNameTests(unittest.TestCase):
+    """Orchestrator unit branches are judged segment by segment (smoke run
+    smoke-20261019T005138Z failed handoff_valid with secret_detected on
+    commit.branch before this rule)."""
+
+    def test_timestamped_branches_are_not_secrets(self):
+        flagged = []
+        for hour in range(24):
+            for minute in range(60):
+                for second in range(0, 60, 7):
+                    branch = f"ecc/smoke-20261019T{hour:02d}{minute:02d}{second:02d}Z/smoke"
+                    if contains_secret(branch):
+                        flagged.append(branch)
+        self.assertEqual(flagged, [])
+        for form in ("refs/heads/ecc/smoke-20261019T005138Z/smoke", "branch=ecc/smoke-20261019T005138Z/smoke",
+                     "ecc/run-20261019-homesentinel-m0/settings-loader"):
+            self.assertFalse(contains_secret(form), form)
+        self.assertEqual(redaction.redact_text("pushed ecc/smoke-20261019T005138Z/smoke ok"),
+                         "pushed ecc/smoke-20261019T005138Z/smoke ok")
+
+    def test_random_segments_inside_a_branch_are_still_secrets(self):
+        key = SAMPLES["high_entropy"] + "Ab12"
+        for text in ("ecc/run1/" + key, "ecc/" + key + "/u1", "ecc/a/b" + key):
+            self.assertTrue(contains_secret(text), text)
+            self.assertIn(REDACTED, redaction.redact_text(text))
+        for name, value in SAMPLES.items():
+            self.assertTrue(contains_secret("ecc/run1/u1 " + value), name)
+
+    def test_handoff_with_timestamped_branch_validates(self):
+        from openclaw_ecc_orchestrator.handoffs.redaction import scan_strings
+        doc = {"commit": {"sha": "dba11d66970f4aed210c325c27a4116711c3a613",
+                          "branch": "ecc/smoke-20261019T005138Z/smoke", "worktree": "."}}
+        self.assertEqual(scan_strings(doc), [])
+
+
 if __name__ == "__main__":
     unittest.main()
