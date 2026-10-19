@@ -251,6 +251,21 @@ class RotationTests(unittest.TestCase):
             self.assertLessEqual(picks.count(provider) / len(picks), 0.4 + 1e-9, picks)
 
 
+class AuthorProvidersPolicyTests(unittest.TestCase):
+    def test_api_providers_review_but_do_not_author(self):
+        """author_providers keeps API providers out of authoring while they still review."""
+        from openclaw_ecc_orchestrator import schemas
+        from openclaw_ecc_orchestrator.routing.selection import select_runner
+        pol = make_policy(model_preferences=PREFS, author_providers=["claude", "codex"])
+        self.assertTrue(schemas.validate_repository_policy(pol).ok)
+        authors = select_runner(1, CERTIFIED, CATALOG, pol, role="author").candidates
+        self.assertEqual({c["runner"] for c in authors}, {"claude", "codex"})
+        reviewers = select_runner(1, CERTIFIED, CATALOG, pol, role="review").candidates
+        self.assertIn("kimi", {c["runner"] for c in reviewers})
+        bad = make_policy(allowed_providers=["claude"], author_providers=["codex"])
+        self.assertFalse(schemas.validate_repository_policy(bad).ok)
+
+
 class ApiPersonaTests(TeamBase):
     def test_at_td_19_api_personas_get_the_pack_and_return_verdicts(self):
         """AT-TD-19: an API provider plays a text-only role from the evidence pack."""

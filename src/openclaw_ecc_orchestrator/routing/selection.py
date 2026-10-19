@@ -163,6 +163,10 @@ def select_runner(tier: int, certified_runners: Any, catalog: Mapping | None,
             reject("circuit breaker open")
             continue
         is_fallback = False
+        if role == "author" and policy.get("author_providers") is not None \
+                and profile.provider not in {normalize_provider(p) for p in policy["author_providers"]}:
+            reject("provider not an author provider by policy")
+            continue
         if role == "author":
             if "author" in profile.roles:
                 classes = profile.classes

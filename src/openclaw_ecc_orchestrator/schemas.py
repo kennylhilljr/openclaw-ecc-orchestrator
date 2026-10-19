@@ -135,7 +135,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
         "file": "repository_policy.schema.json",
         "required": ["schema_version", "high_risk_paths", "required_checks",
                      "protected_commands", "allowed_providers", "budget"],
-        "optional": ["model_preferences", "retired_model_ids", "cli_models", "runner_costs",
+        "optional": ["author_providers", "model_preferences", "retired_model_ids", "cli_models", "runner_costs",
                      "cost_estimation", "circuit_breaker", "openrouter",
                      "catalog_max_age_seconds", "health"],
         "nested_required": {"budget": ["max_cost_usd_per_unit", "max_cost_usd_total",
@@ -484,6 +484,12 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
                 report.error("allowed_providers contains unknown provider %s" % _show(name))
             else:
                 allowed.append(norm)
+
+    authors = doc.get("author_providers")
+    if "author_providers" in doc and _check_str_list(authors, "author_providers", report, allow_empty=False):
+        for name in authors:
+            if name not in allowed:
+                report.error("author_providers contains %s, which allowed_providers does not allow" % _show(name))
 
     budget = _obj(doc, "budget", report)
     _require_keys(budget, "budget", DOCUMENT_SPECS["repository_policy"]["nested_required"]
