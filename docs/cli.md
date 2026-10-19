@@ -138,7 +138,10 @@ cannot drop a policy check; a required check without a configured command
 fails the gates.
 
 **Certifications.** `certifications` names a JSON list (or
-`{"records": [...]}`) of runner certification records. Only valid,
+`{"records": [...]}`) of runner certification records, or a certification
+run summary (`{"results": [{"record": ...}]}`, as written by
+`runners.certify` (its out option) and copied to `cert-latest.json` by
+`bin/recertify-weekly`). Only valid,
 unexpired, `certified` records for known runners survive
 (`runners.registry.certified_runners`).
 

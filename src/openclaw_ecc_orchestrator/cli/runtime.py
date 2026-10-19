@@ -109,6 +109,10 @@ class Runtime:
             return self._cache["certified"]
         _, doc = read_document(path, "certifications", operation)
         records = doc.get("records") if isinstance(doc, dict) else doc
+        if records is None and isinstance(doc, dict) and isinstance(doc.get("results"), list):
+            # A certification run summary (runners.certify --out .../summary.json,
+            # also bin/recertify-weekly's cert-latest.json): one record per result.
+            records = [r.get("record", r) if isinstance(r, dict) else r for r in doc["results"]]
         if not isinstance(records, list):
             fail(operation, "certifications_valid", "expected a list of certification records")
         from ..runners.registry import certified_runners

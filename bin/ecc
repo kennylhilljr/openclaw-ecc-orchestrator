@@ -1,0 +1,20 @@
+#!/bin/sh
+# The operator CLI (python -m openclaw_ecc_orchestrator) with a Python 3.11 or
+# newer interpreter and this checkout's src on PYTHONPATH, from any directory.
+#   bin/ecc status --config ~/Documents/GitHub/homesentinel-v2/.orchestration/ecc.json
+# ECC_PYTHON overrides the interpreter. Exit codes are the CLI's.
+set -u
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PY=""
+for cand in ${ECC_PYTHON:-} /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+            /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PY=$(command -v "$cand"); break
+  fi
+done
+[ -n "$PY" ] || { echo "ecc: no python3 3.11 or newer found (set ECC_PYTHON)" >&2; exit 1; }
+PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec "$PY" -m openclaw_ecc_orchestrator "$@"
