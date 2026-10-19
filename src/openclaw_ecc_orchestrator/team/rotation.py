@@ -66,10 +66,11 @@ class Rotation:
             counts = self.turns(role)
             total = sum(counts.values())
             under = [c for c in eligible if (counts.get(c["runner"], 0) + 1) / (total + 1) <= float(share_cap)]
-            for c in eligible:
-                if c not in under:
-                    skipped.append((c["runner"], "share cap reached for this milestone"))
-            eligible = under or eligible
+            if under:  # early in a milestone no one is under the cap yet; rotation order decides
+                for c in eligible:
+                    if c not in under:
+                        skipped.append((c["runner"], "share cap reached for this milestone"))
+                eligible = under
         if not eligible:
             return None, skipped
         choice = eligible[0]
