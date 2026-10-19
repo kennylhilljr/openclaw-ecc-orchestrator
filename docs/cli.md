@@ -38,6 +38,7 @@ option of any subcommand lists them in full.
 | `approvals process-inbox` | consumer | validate and apply the decision files OpenClaw wrote into the inbox, once or as a standing processor (`watch`); `dry-run` changes nothing |
 | `events tail` | read only | print the event log; `since-seq`, `run-id`, `limit`, `follow` with `interval` and `max-polls` |
 | `doctor` | read only | local self checks |
+| `catalog-refresh` | writes the catalog snapshot | fetch the live model catalogs of the API providers (`providers`, default Gemini, Groq and Kimi) into the configured `catalog` file (or `out`); run it through `bin/with-keychain-secrets` so the keys come from the Keychain |
 | `preflight` | throwaway worktrees only | round trip through every certified coding runner: the real unit prompt, command line, environment and permissions must write a file, commit, run the gate commands (the uv version and a short git status), and write a schema valid handoff to the real handoff path; the orchestrator then runs a gate command; worktrees and branches are removed (`keep` keeps them); `runner` checks one |
 | `review-plan` | writes review records only | print a plan and its hash; with `approve` write a review record |
 

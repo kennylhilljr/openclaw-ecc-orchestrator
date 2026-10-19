@@ -214,6 +214,12 @@ def build_parser():
     p = sub.add_parser("doctor", help="local self checks")
     _common(p)
 
+    p = sub.add_parser("catalog-refresh", help="fetch the live model catalogs of the API providers (Gemini, Groq, "
+                                               "Kimi) into a snapshot; run through bin/with-keychain-secrets")
+    p.add_argument("--out", help="snapshot path (default: the configured catalog, else <state_dir>/catalog-latest.json)")
+    p.add_argument("--providers", default="gemini,groq,kimi", help="comma separated providers")
+    _common(p)
+
     p = sub.add_parser("preflight", help="round trip through every certified coding runner (write, commit, "
                                          "handoff, gates) in a throwaway worktree")
     p.add_argument("--runner", type=_id, help="check only this runner")
@@ -595,6 +601,28 @@ def cmd_events_tail(ctx):
     return None
 
 
+def cmd_catalog_refresh(ctx):
+    """Write a live catalog snapshot the router and the team panels read
+    (API runners resolve models only from a snapshot). Keys come from the
+    environment and only travel in request headers."""
+    from ..runners import discovery
+    op = "catalog-refresh"
+    a = ctx.args
+    out = a.out or ctx.cfg.catalog or os.path.join(ctx.cfg.state_dir, "catalog-latest.json")
+    providers = [p.strip() for p in (a.providers or "").split(",") if p.strip()]
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    snapshot = discovery.fetch_catalog(providers, env=ctx.env)
+    discovery.save_snapshot(snapshot, out)
+    checks = []
+    for name in providers:
+        entry = snapshot["providers"].get(name) or {}
+        n = len(entry.get("models") or [])
+        checks.append(check(f"catalog_{name}", entry.get("status") == "ok", f"{entry.get('status')}: {n} models"))
+    return envelope(op, ok=all(c["ok"] for c in checks), changed=True, checks=checks,
+                    data={"path": out, "providers": {k: {"status": v.get("status"), "models": len(v.get("models") or [])}
+                                                      for k, v in snapshot["providers"].items()}})
+
+
 def _git_version():
     try:
         proc = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30,
@@ -806,6 +834,8 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
                 result = inbox_processor.cmd_process_inbox(ctx)
             elif op == "events.tail":
                 result = cmd_events_tail(ctx)
+            elif op == "catalog-refresh":
+                result = cmd_catalog_refresh(ctx)
             elif op == "preflight":
                 from .preflight import cmd_preflight
                 result = cmd_preflight(ctx)
