@@ -37,6 +37,7 @@ option of any subcommand lists them in full.
 | `approvals process-inbox` | consumer | validate and apply the decision files OpenClaw wrote into the inbox, once or as a standing processor (`watch`); `dry-run` changes nothing |
 | `events tail` | read only | print the event log; `since-seq`, `run-id`, `limit`, `follow` with `interval` and `max-polls` |
 | `doctor` | read only | local self checks |
+| `preflight` | throwaway worktrees only | round trip through every certified coding runner: the real unit prompt, command line, environment and permissions must write a file, commit, run `uv --version` and `git status --short`, and write a schema valid handoff to the real handoff path; the orchestrator then runs a gate command; worktrees and branches are removed (`keep` keeps them); `runner` checks one |
 | `review-plan` | writes review records only | print a plan and its hash; with `approve` write a review record |
 
 Gated subcommands are the mutating ones. Each accepts `dry-run`, `json`,
@@ -334,6 +335,20 @@ lives in `integrations/launchd/`.
 
 ## Subcommand notes
 
+* **Repair loop** (TEAM-DELIVERY-v2 section 5). A failed attempt records
+  `last_failure` (reason, evidence the orchestrator saw: gate output tails,
+  handoff errors, files, the runner's final message) and, when the unit's
+  escalation controller allows another attempt, returns the unit to `ready`
+  with reason `retry:<reason>`. The next `dispatch` reuses the worktree and
+  branch, so earlier commits stay, and appends a failure brief (at most 6,000
+  characters) to the prompt. A runner that exits cleanly with a missing or
+  malformed handoff first gets one handoff only repair turn (not an attempt;
+  `handoff_repair_turns` in `.orchestration/team.json`, default 1); a handoff
+  whose problem is the work itself (claimed success with a failing command,
+  files outside the scope) never gets one. A runner that is not signed in,
+  missing or older than certified, or denied a tool goes to `needs_user`
+  with the exact fix and does not charge the budget. `status` shows each
+  unit's `last_failure`.
 * `create-run` requires `run-id` and `plan` (a JSON file holding
   `{"units": [...]}` or a list of work units; duplicate keys are refused).
   The plan pins the target tip as the base commit.
@@ -426,9 +441,10 @@ holding an unexpired lease blocks the CLI (exit 1, `lease_held`).
 
 ## Limitations
 
-* No `resume`, `retry` or `reassign` subcommand yet: a unit left `running`
-  by a crashed `dispatch`, or a `failed` unit, needs the Python API
-  (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
+* No `resume` or `reassign` subcommand yet: a unit left `running` by a
+  crashed `dispatch`, or a unit in `needs_user` after its fix, needs the
+  Python API (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
+  Failed units within budget return to `ready` on their own (repair loop).
 * `dispatch` blocks until the runner exits and verification finishes. There
   is no wall clock limit; a runner is cancelled only when health checks find
   it hung (see [runtime.md](runtime.md#health-monitoring-instead-of-wall-clock-kills)).

@@ -209,6 +209,16 @@ def build_parser():
     p = sub.add_parser("doctor", help="local self checks")
     _common(p)
 
+    p = sub.add_parser("preflight", help="round trip through every certified coding runner (write, commit, "
+                                         "handoff, gates) in a throwaway worktree")
+    p.add_argument("--runner", type=_id, help="check only this runner")
+    p.add_argument("--keep", action="store_true", help="keep the throwaway worktree and branch for inspection")
+    p.add_argument("--timeout", type=_positive_int, default=600, help="seconds per runner (default 600)")
+    p.add_argument("--runner-command-json", dest="runner_command_json",
+                   help="TEST ONLY: JSON argv template ({ECC_PROMPT} is the prompt); needs --allow-test-runner")
+    p.add_argument("--allow-test-runner", dest="allow_test_runner", action="store_true")
+    _common(p)
+
     p = sub.add_parser("review-plan", help="print a plan and its hash; --approve writes a review record")
     p.add_argument("--approve", action="store_true")
     p.add_argument("--operator", type=_handle, help="approving operator handle (never inferred)")
@@ -460,6 +470,8 @@ def _unit_view(run, uid):
         "verified_head": (annotations.get("verification") or {}).get("head"),
         "approval_request_id": (annotations.get("review") or {}).get("approval_request_id"),
         "depends_on": unit.get("depends_on") or [],
+        "last_failure": ({k: (annotations.get("last_failure") or {}).get(k) for k in ("reason", "attempt", "fix")}
+                         if annotations.get("last_failure") else None),
     }
 
 
@@ -789,6 +801,9 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
                 result = inbox_processor.cmd_process_inbox(ctx)
             elif op == "events.tail":
                 result = cmd_events_tail(ctx)
+            elif op == "preflight":
+                from .preflight import cmd_preflight
+                result = cmd_preflight(ctx)
             else:  # pragma: no cover - argparse restricts the choices
                 raise UsageError(f"unknown subcommand {op}")
     except UsageError as exc:

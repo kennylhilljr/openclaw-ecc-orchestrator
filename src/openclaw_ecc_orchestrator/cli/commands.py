@@ -28,6 +28,7 @@ from ..runs import state as S
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.manager import RunError
+from ..runs.repair import HANDOFF_RULES, HANDOFF_TEMPLATE, REPAIR_PROMPT_TOKEN, failure_brief
 from ..runs.store import StoreError
 from ..worktrees.git import git_out, run_git
 from .config import UsageError, checked_path
@@ -162,18 +163,7 @@ def predict_routing(ctx, op, run, unit_id):
             "estimated_cost_usd": selection.estimated_cost_usd, "escalation": action["action"]}
 
 
-HANDOFF_TEMPLATE = (
-    '{"schema_version": "1.0", "unit_id": "<UNIT_ID>", "status": "succeeded", '
-    '"outcome": "<one paragraph>", "files_changed": ["<repo/relative/path>"], '
-    '"behavior": "<what now works, one string>", '
-    '"commands": [{"command": "<command>", "exit_code": 0, "result": "<short result>"}], '
-    '"unresolved_failures": [], "assumptions": ["<assumption>"], "risks": ["<risk>"], '
-    '"next_action": "<next step>", '
-    '"commit": {"sha": "<full sha>", "branch": "<branch>", "worktree": "<worktree path>"}, '
-    '"usage": null, "user_input_required": false, "notes": "<optional>"}')
-
-
-def runner_prompt(punit):
+def runner_prompt(punit, brief=None):
     """Deterministic instructions for a coding CLI runner."""
     lines = [f"You are implementing work unit {punit['id']}: {punit.get('title', '')}."]
     if punit.get("description"):
@@ -189,15 +179,13 @@ def runner_prompt(punit):
                  "It is outside the repository; do not commit it. It must match schemas/handoff.schema.json "
                  "exactly: no other keys, and these types. Template (replace every <...>):")
     lines.append(HANDOFF_TEMPLATE.replace("<UNIT_ID>", str(punit["id"])))
-    lines.append("Rules: status is one of succeeded, failed, partial, blocked; succeeded needs every "
-                 "command exit_code 0 and an empty unresolved_failures; behavior is one string, not a list; "
-                 "every command has command, exit_code (integer) and result; files_changed holds "
-                 "repository-relative paths inside the unit scope; commit.sha is the full hex SHA; "
-                 "usage is null when token counts are unknown; put anything else in notes (a string).")
+    lines.append(HANDOFF_RULES)
+    if brief:
+        lines.append(brief)
     return "\n".join(lines)
 
 
-def runner_command(ctx, op, punit, routing, worktree_path):
+def runner_command(ctx, op, punit, routing, worktree_path, brief=None):
     a = ctx.args
     if a.runner_command_argv is not None:
         return {"source": "test_override", "argv": list(a.runner_command_argv), "env_allow": []}
@@ -212,16 +200,37 @@ def runner_command(ctx, op, punit, routing, worktree_path):
              f"runner {routing['runner']} is an API runner; CLI dispatch launches coding CLI runners only",
              actions=[{"kind": "resolve_needs_user", "run_id": ctx.args.run_id, "unit_id": punit["id"],
                        "detail": "certify a coding CLI runner for this tier or drive the unit from Python"}])
-    argv = adapter.build_invocation(runner_prompt(punit), model=routing.get("model"), cwd=worktree_path,
-                                    writable=True)
-    # Grant the handoff folder (filled in by Conductor.start_unit) before the
-    # "--" that ends the options; both coding CLIs accept --add-dir.
-    if "--" in argv:
-        from ..runs.conductor import HANDOFF_DIR_TOKEN
-        cut = argv.index("--")
-        argv = argv[:cut] + ["--add-dir", HANDOFF_DIR_TOKEN] + argv[cut:]
+    argv = _with_handoff_dir(adapter.build_invocation(runner_prompt(punit, brief), model=routing.get("model"),
+                                                      cwd=worktree_path, writable=True))
+    # Same runner and permissions, prompt filled in by the conductor: the
+    # handoff-only repair turn (TEAM-DELIVERY-v2 5.2).
+    repair = _with_handoff_dir(adapter.build_invocation(REPAIR_PROMPT_TOKEN, model=routing.get("model"),
+                                                        cwd=worktree_path, writable=True))
     env_allow = list(adapter.env_allow()) if hasattr(adapter, "env_allow") else []
-    return {"source": "registry", "argv": list(argv), "env_allow": env_allow}
+    return {"source": "registry", "argv": list(argv), "repair_argv": list(repair), "env_allow": env_allow}
+
+
+def _with_handoff_dir(argv):
+    """Grant the handoff folder (filled in by Conductor.start_unit) before the
+    "--" that ends the options; both coding CLIs accept --add-dir."""
+    if "--" not in argv:
+        return list(argv)
+    from ..runs.conductor import HANDOFF_DIR_TOKEN
+    cut = argv.index("--")
+    return argv[:cut] + ["--add-dir", HANDOFF_DIR_TOKEN] + argv[cut:]
+
+
+def retry_brief(run, unit_id, punit):
+    """The failure brief for a unit returning from a failed attempt, or None."""
+    unit = run["units"][unit_id]
+    last = (unit.get("annotations") or {}).get("last_failure")
+    if not last or not unit.get("attempts"):
+        return None
+    reason = str(unit.get("last_reason") or "")
+    if not reason.startswith("retry:") and not reason.startswith("review:"):
+        return None
+    budget = (punit.get("budget") or {}).get("attempts") or "?"
+    return failure_brief(unit_id, unit["attempts"] + 1, budget, last.get("evidence") or {"reason": last.get("reason")})
 
 
 def plan_dispatch(ctx):
@@ -240,7 +249,7 @@ def plan_dispatch(ctx):
         fail(op, "no_parallel_overlap", str(exc))
     routing = predict_routing(ctx, op, run, a.unit)
     paths = ctx.rt.worktrees(op).paths(a.run_id, a.unit)
-    command = runner_command(ctx, op, punit, routing, paths["path"])
+    command = runner_command(ctx, op, punit, routing, paths["path"], brief=retry_brief(run, a.unit, punit))
     worker = a.worker or unit.get("owner") or routing["runner"]
     doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], attempt=unit["attempts"] + 1,
                    owner=unit.get("owner"), worker=worker, routing=routing, runner_command=command,
@@ -284,6 +293,7 @@ def execute_dispatch(ctx, plan):
                                                 "detail": "routing changed after the plan was reviewed"}])
     checks.append(check("routing_matches_plan", True))
     started = c.start_unit(run_id, unit_id, doc["runner_command"]["argv"],
+                           repair_argv=doc["runner_command"].get("repair_argv"),
                            on_line=lambda stream, line: ctx.progress(f"[{unit_id} {stream}] {line}"))
     checks += started["checks"]
     if not started["ok"]:

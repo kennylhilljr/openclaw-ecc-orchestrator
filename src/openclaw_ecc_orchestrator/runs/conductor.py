@@ -41,6 +41,7 @@ import os
 import threading
 import time
 
+from .. import schemas
 from ..gates.runner import run_gates
 from ..merge_queue.conflicts import diff_stats, out_of_scope_changes
 from ..merge_queue.dispatch import Dispatcher
@@ -52,9 +53,10 @@ from ..routing.escalation import AttemptOutcome, EscalationController
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.registry import model_family
 from ..worktrees.git import git_out, rev_exists
+from . import repair as R
 from . import state as S
 from .envelope import SCHEMA_VERSION, check, envelope
-from .store import StoreError
+from .store import StoreError, iso
 
 try:  # provided by the worktrees package; optional until it lands
     from ..worktrees.guard import diff_shared_git_state, snapshot_shared_git_state
@@ -90,12 +92,17 @@ class Conductor:
                  repo_checks=None, target_branch="main", log_root, runner_timeout=None, gate_timeout=None,
                  runner_env_allow=(), protected_globs=(), clock=time.time, policy=None, certified_runners=None,
                  catalog=None, breaker=None, tier_costs=None, lease_renew_interval=10.0,
-                 git_state_guard=_UNSET, health_override=None):
+                 git_state_guard=_UNSET, health_override=None, auto_retry=False, handoff_repair_turns=0,
+                 repair_timeout=900.0):
         """`runner_timeout` and `gate_timeout` are optional hard wall clock
         ceilings in seconds, None (off) by default; setting them is
         discouraged because health monitoring already stops hung processes.
         `health_override` (a `process.health.HealthSettings`) replaces the
-        policy and unit health settings; tests use it for short intervals."""
+        policy and unit health settings; tests use it for short intervals.
+        `auto_retry` returns a failed unit to `ready` when its escalation
+        controller allows another attempt (TEAM-DELIVERY-v2 5.1);
+        `handoff_repair_turns` allows that many handoff-only repair turns per
+        attempt (5.2), each limited to `repair_timeout` seconds."""
         self.id = conductor_id
         self.manager = manager
         self.worktrees = worktrees
@@ -120,10 +127,16 @@ class Conductor:
         # (snapshot(repo) -> dict, diff(before, after, allow_refs=()) -> list[str]) or None
         self.git_state_guard = DEFAULT_GIT_STATE_GUARD if git_state_guard is _UNSET else git_state_guard
         self.health_override = health_override
+        self.auto_retry = bool(auto_retry)
+        self.handoff_repair_turns = int(handoff_repair_turns)
+        self.repair_timeout = float(repair_timeout)
         self.dispatcher = Dispatcher(manager)
         self._handles = {}
         self._cancel_terminal = {}
         self._handoff_paths = {}
+        self._log_paths = {}
+        self._repair_argv = {}
+        self._repairs_used = {}
         self._git_before = {}
         self._stages = {}
         self._controllers = {}
@@ -338,10 +351,98 @@ class Conductor:
             state = self.manager.load(run_id)["units"][unit_id]["state"]
             if S.NEEDS_USER in S.TRANSITIONS.get(state, ()):
                 self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="escalation_stopped")
+        elif not passed and self.auto_retry and nxt["action"] not in ("done",):
+            state = self.manager.load(run_id)["units"][unit_id]["state"]
+            if state == S.FAILED:
+                self.manager.transition(run_id, self.id, unit_id, S.READY, reason=f"retry:{reason}")
+                self._emit("unit.retry_scheduled", run_id, unit_id,
+                           {"previous_reason": reason, "next_action": nxt.get("action"), "tier": nxt.get("tier")})
         return nxt
 
+    # == repair support (TEAM-DELIVERY-v2 section 5) ==
+    def _note_failure(self, run_id, unit_id, reason, evidence, fix=None):
+        """Record what the next attempt needs to know (`last_failure`)."""
+        try:
+            unit = self.manager.load(run_id)["units"][unit_id]
+            self.manager.annotate_unit(run_id, self.id, unit_id, "last_failure", {
+                "reason": reason, "attempt": unit.get("attempts"), "evidence": evidence, "fix": fix,
+                "at": iso(self.clock())})
+        except TRANSIENT_ERRORS:
+            pass
+
+    def _stop_runner(self, run_id, unit_id, unit, stop, log_text, data):
+        """Section 5.3: a failure retrying cannot fix. The unit goes to
+        `needs_user` with the exact fix and the escalation record is not
+        charged."""
+        op = "unit.complete"
+        kind, detail = stop
+        runner = (unit.get("routing") or {}).get("runner")
+        fix = R.stop_fix(kind, runner)
+        self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason=kind)
+        self._note_failure(run_id, unit_id, kind, R.failure_evidence(kind, log_text=log_text), fix=fix)
+        warnings = self._attention(run_id, unit_id, kind, detail=detail, fix=fix)
+        return envelope(op, ok=False, changed=True, checks=[check("runner_ready", False, f"{kind}: {detail}")],
+                        warnings=warnings, data=data,
+                        required_user_actions=[{"kind": "resolve_needs_user", "run_id": run_id, "unit_id": unit_id,
+                                                "detail": fix}])
+
+    def _handoff_problems(self, run, unit_id, doc, missing):
+        """(problems, repairable). Only a missing, unreadable or malformed
+        handoff is repairable by a handoff-only turn. Semantic violations
+        (claimed success with failing commands, files outside the scope) are
+        about the work itself and never go to a repair turn, which could
+        otherwise paper over them; a valid handoff that honestly reports
+        failed, partial or blocked work is not a handoff problem at all."""
+        if missing:
+            return [missing], missing != "handoff_too_large"
+        report = schemas.validate_handoff(doc, self.manager.plan_unit(run, unit_id))
+        violations = [v.get("kind", "violation") for v in report.violations]
+        return list(report.errors) + violations, not violations
+
+    def _can_repair_handoff(self, key):
+        with self._lock:
+            return bool(self._repair_argv.get(key)) and self._repairs_used.get(key, 0) < self.handoff_repair_turns
+
+    def _repair_handoff(self, run_id, unit_id, workspace, problems, data):
+        """Section 5.2: one short turn that rewrites only the handoff. Not an
+        attempt: the escalation record is not charged. Returns the re-read
+        (doc, missing)."""
+        key = (run_id, unit_id)
+        with self._lock:
+            self._repairs_used[key] = self._repairs_used.get(key, 0) + 1
+            template = list(self._repair_argv.get(key) or [])
+            handoff_path = self._handoff_paths.get(key)
+            log_path = self._log_paths.get(key)
+        prompt = R.handoff_repair_prompt(unit_id, HANDOFF_PATH_TOKEN, problems, R.HANDOFF_TEMPLATE, R.HANDOFF_RULES)
+        argv = fill_handoff_tokens([prompt if a == R.REPAIR_PROMPT_TOKEN else a for a in template], handoff_path)
+        self._emit("unit.handoff_repair", run_id, unit_id, {"problems": problems[:10]})
+        record = {"problems": problems[:20], "at": iso(self.clock())}
+        try:
+            handle = self.supervisor.start(argv, cwd=workspace["path"], env_allow=self.runner_env_allow,
+                                           extra_env={HANDOFF_ENV: handoff_path, UNIT_ENV: unit_id},
+                                           log_path=(log_path[:-4] + "-handoff-repair.log") if log_path else None,
+                                           timeout=self.repair_timeout)
+            if handle.pid is None:
+                result = handle.wait()
+            else:
+                while True:
+                    try:
+                        result = handle.wait(self.lease_renew_interval)
+                        break
+                    except TimeoutError:
+                        self._keep_lease(run_id)
+            record.update(exit_code=result.get("exit_code"), duration_s=result.get("duration_s"),
+                          error=result.get("error"))
+        except (OSError, TypeError, ValueError) as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        doc, missing = self._read_handoff(key, None)
+        record["handoff_found"] = missing is None
+        data["handoff_repair"] = record
+        self.manager.annotate_unit(run_id, self.id, unit_id, "handoff_repair", record)
+        return doc, missing
+
     # == unit execution ==
-    def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None):
+    def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None, repair_argv=None):
         op = "unit.start"
         run = self.manager.load(run_id)
         unit = run["units"].get(unit_id)
@@ -406,6 +507,9 @@ class Conductor:
         with self._lock:
             self._handles[key] = handle
             self._handoff_paths[key] = handoff_path
+            self._log_paths[key] = log_path
+            self._repair_argv[key] = list(repair_argv) if repair_argv else None
+            self._repairs_used[key] = 0
             self._git_before[key] = before
             self._stages[key] = {}
         return envelope(op, changed=True, checks=[check("runner_started", True)] + rec["checks"],
@@ -619,9 +723,16 @@ class Conductor:
                 reason = "runner_timeout"
             else:
                 reason = f"runner_exit_{result['exit_code']}"
+            log_text = R.read_tail(self._log_paths.get(key))
+            stop = None
+            if not (result["timed_out"] or result.get("hung") or result["error"]):
+                stop = R.classify_runner_failure(log_text, result["exit_code"])
+            if stop:
+                return self._stop_runner(run_id, unit_id, unit, stop, log_text, data), True
             res = self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=result["error"] or reason)
             if not res["ok"]:
                 return envelope(op, ok=False, checks=res["checks"], data=data), False
+            self._note_failure(run_id, unit_id, reason, R.failure_evidence(reason, log_text=log_text))
             self._record_outcome(run_id, unit_id, False, False, reason, cost)
             return envelope(op, ok=False, changed=True, checks=[check("runner_succeeded", False, reason)],
                             data=data), True
@@ -629,9 +740,15 @@ class Conductor:
 
     def _accept_handoff(self, run_id, unit_id, doc, missing, cost, data):
         op = "unit.complete"
-        workspace = self.manager.load(run_id)["units"][unit_id]["workspace"]
+        run = self.manager.load(run_id)
+        workspace = run["units"][unit_id]["workspace"]
+        problems, repairable = self._handoff_problems(run, unit_id, doc, missing)
+        if problems and repairable and self._can_repair_handoff((run_id, unit_id)):
+            doc, missing = self._repair_handoff(run_id, unit_id, workspace, problems, data)
         head = git_out(["rev-parse", "HEAD"], workspace["path"])
         if missing:
+            self._note_failure(run_id, unit_id, missing, R.failure_evidence(
+                missing, handoff_problems=[missing], log_text=R.read_tail(self._log_paths.get((run_id, unit_id)))))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=missing)
             self._record_outcome(run_id, unit_id, False, False, missing, cost)
             return envelope(op, ok=False, changed=True, checks=[check("handoff_valid", False, missing)],
@@ -646,6 +763,10 @@ class Conductor:
             if wants_user and not summary.get("violations"):
                 self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="runner_needs_user")
             else:
+                reported = doc.get("unresolved_failures") if isinstance(doc, dict) else None
+                self._note_failure(run_id, unit_id, "handoff_invalid", R.failure_evidence(
+                    "handoff_invalid", handoff_problems=list(summary.get("problems") or [])
+                    + [f"unresolved: {f}" for f in (reported or []) if isinstance(f, str)][:10]))
                 self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="handoff_invalid")
                 self._record_outcome(run_id, unit_id, False, False, "handoff_invalid", cost)
             return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), True
@@ -662,6 +783,8 @@ class Conductor:
         plan_unit = self.manager.plan_unit(run, unit_id)
         dirty = git_out(["status", "--porcelain", "--untracked-files=all"], workspace["path"])
         if dirty:
+            self._note_failure(run_id, unit_id, "uncommitted_changes", R.failure_evidence(
+                "uncommitted_changes", files=dirty.splitlines()))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="uncommitted_changes")
             self._record_outcome(run_id, unit_id, False, False, "uncommitted_changes", cost)
             return envelope(op, ok=False, checks=[check("work_committed", False, dirty.splitlines()[0])], data=data)
@@ -689,6 +812,8 @@ class Conductor:
         data["verification"] = verification
         if verification["out_of_scope"]:
             warnings += self._attention(run_id, unit_id, "out_of_scope_changes", files=verification["out_of_scope"])
+            self._note_failure(run_id, unit_id, "out_of_scope_changes", R.failure_evidence(
+                "out_of_scope_changes", files=verification["out_of_scope"]))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="out_of_scope_changes")
             self._record_outcome(run_id, unit_id, False, False, "out_of_scope_changes", cost)
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
@@ -696,6 +821,8 @@ class Conductor:
             self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="classification_invalid")
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
         if not gates_passed:
+            self._note_failure(run_id, unit_id, "gates_failed", R.failure_evidence(
+                "gates_failed", gates=verification.get("gates") or []))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="gates_failed")
             self._record_outcome(run_id, unit_id, False, True, "gates_failed", cost)
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
