@@ -65,6 +65,20 @@ except ImportError:  # pragma: no cover - depends on the installed tree
 MAX_PROGRESS_EVENTS = 200
 MAX_HANDOFF_BYTES = 256 * 1024
 HANDOFF_ENV = "ECC_HANDOFF_PATH"
+# Placeholders a runner command may carry; start_unit replaces them with the
+# attempt's handoff file and its folder. CLI runners cannot always read their
+# environment (Claude print mode denies printenv) or write outside the
+# worktree, so the literal path goes in the prompt and the folder is granted
+# with --add-dir (live finding, run rmcp-m0d, 2026-10-19).
+HANDOFF_PATH_TOKEN = "{ECC_HANDOFF_PATH}"
+HANDOFF_DIR_TOKEN = "{ECC_HANDOFF_DIR}"
+
+
+def fill_handoff_tokens(argv, handoff_path):
+    """Return argv with the handoff placeholders replaced (no-op without them)."""
+    folder = os.path.dirname(handoff_path)
+    return [str(a).replace(HANDOFF_PATH_TOKEN, handoff_path).replace(HANDOFF_DIR_TOKEN, folder)
+            for a in argv]
 UNIT_ENV = "ECC_UNIT_ID"
 _UNSET = object()
 # Failures that leave durable state untouched and are worth retrying.
@@ -378,6 +392,7 @@ class Conductor:
         settings = self.health_settings(plan_unit, run.get("policy") or self.policy)
         health = H.HealthConfig(settings=settings, worktree=paths["path"], on_check=self._health_listener(
             run_id, unit_id, unit["attempts"], settings, budget=self._minutes_budget(unit, plan_unit)))
+        runner_argv = fill_handoff_tokens(runner_argv, handoff_path)
         handle = self.supervisor.start(list(runner_argv), cwd=paths["path"], env_allow=self.runner_env_allow,
                                        extra_env=env, on_line=progress, log_path=log_path,
                                        status_path=status_path, timeout=self.runner_timeout, health=health)

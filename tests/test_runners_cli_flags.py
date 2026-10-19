@@ -55,6 +55,20 @@ class ClaudeFlagTests(unittest.TestCase):
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertLess(argv.index("--allowedTools"), argv.index("--"))
 
+    def test_handoff_tokens_are_filled_with_the_attempt_path(self):
+        from openclaw_ecc_orchestrator.runs.conductor import (
+            HANDOFF_DIR_TOKEN, HANDOFF_PATH_TOKEN, fill_handoff_tokens)
+        argv = ["claude", "--add-dir", HANDOFF_DIR_TOKEN, "--", "write to " + HANDOFF_PATH_TOKEN]
+        out = fill_handoff_tokens(argv, "/s/logs/r1/U1-attempt1.handoff.json")
+        self.assertEqual(out[2], "/s/logs/r1")
+        self.assertEqual(out[-1], "write to /s/logs/r1/U1-attempt1.handoff.json")
+        self.assertEqual(fill_handoff_tokens(["x", "--", "y"], "/a/b.json"), ["x", "--", "y"])
+
+    def test_runner_prompt_names_the_handoff_path_placeholder(self):
+        from openclaw_ecc_orchestrator.cli.commands import runner_prompt
+        from openclaw_ecc_orchestrator.runs.conductor import HANDOFF_PATH_TOKEN
+        self.assertIn(HANDOFF_PATH_TOKEN, runner_prompt({"id": "U1", "title": "t"}))
+
     def test_runner_env_keeps_user_for_keychain_login(self):
         allow = ClaudeAdapter().env_allow()
         self.assertIn("USER", allow)

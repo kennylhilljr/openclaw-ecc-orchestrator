@@ -175,8 +175,9 @@ def runner_prompt(punit):
     lines.append("Commit your work on the current branch. Never push, never change other branches.")
     lines.append("Finally write a JSON handoff document (schema_version 1.0: unit_id, status, outcome, "
                  "files_changed, behavior, commands, unresolved_failures, assumptions, risks, next_action, "
-                 "commit {sha, branch, worktree}, usage, user_input_required) to the file named by the "
-                 "ECC_HANDOFF_PATH environment variable.")
+                 "commit {sha, branch, worktree}, usage, user_input_required) to this exact file with your "
+                 "file-writing tool: {ECC_HANDOFF_PATH} (the same path is in the ECC_HANDOFF_PATH "
+                 "environment variable). It is outside the repository; do not commit it.")
     return "\n".join(lines)
 
 
@@ -197,6 +198,12 @@ def runner_command(ctx, op, punit, routing, worktree_path):
                        "detail": "certify a coding CLI runner for this tier or drive the unit from Python"}])
     argv = adapter.build_invocation(runner_prompt(punit), model=routing.get("model"), cwd=worktree_path,
                                     writable=True)
+    # Grant the handoff folder (filled in by Conductor.start_unit) before the
+    # "--" that ends the options; both coding CLIs accept --add-dir.
+    if "--" in argv:
+        from ..runs.conductor import HANDOFF_DIR_TOKEN
+        cut = argv.index("--")
+        argv = argv[:cut] + ["--add-dir", HANDOFF_DIR_TOKEN] + argv[cut:]
     env_allow = list(adapter.env_allow()) if hasattr(adapter, "env_allow") else []
     return {"source": "registry", "argv": list(argv), "env_allow": env_allow}
 
