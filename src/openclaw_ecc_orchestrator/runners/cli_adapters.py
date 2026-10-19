@@ -95,9 +95,14 @@ class CliAdapter:
         # Reasoning effort for the CLI (e.g. "low"); None keeps the CLI default.
         self.effort = effort
 
+    # Not secrets, but needed at run time: Claude Code on macOS looks up its
+    # keychain login by account name and reports "Not logged in" without USER
+    # (seen 2026-10-19; certification passed because probes keep USER).
+    runtime_env: tuple[str, ...] = ("USER", "LOGNAME")
+
     def env_allow(self) -> tuple[str, ...]:
         """Names to allowlist when this CLI runs as a unit runner under the supervisor."""
-        return tuple(self.credential_env)
+        return tuple(dict.fromkeys(tuple(self.runtime_env) + tuple(self.credential_env)))
 
     # interface
     def build_invocation(self, prompt: str, model: str | None = None, cwd: str | None = None,
@@ -311,7 +316,11 @@ class ClaudeAdapter(CliAdapter):
     version_argv = ["claude", "--version"]
     auth_argv = ["claude", "auth", "status", "--json"]
     credential_env = ("HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
-    edit_tools = "Read,Edit,Write,Bash(git *),Bash(python3 *)"
+    # uv and the repo CI script: units must lock, sync and run their own gates
+    # (uv run executes arbitrary code, as python3 already can, so this adds no
+    # new capability).
+    edit_tools = ("Read,Edit,Write,Bash(git *),Bash(python3 *),Bash(uv *),"
+                  "Bash(tools/ci.sh),Bash(tools/ci.sh *),Bash(./tools/ci.sh),Bash(./tools/ci.sh *)")
 
     def _base(self, model, output_format="json"):
         argv = ["claude", "-p", "--output-format", output_format, "--no-session-persistence",

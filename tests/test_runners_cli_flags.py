@@ -48,9 +48,18 @@ class ClaudeFlagTests(unittest.TestCase):
         tools = argv[argv.index("--allowedTools") + 1]
         self.assertIn("Bash(git *)", tools)
         self.assertIn("Bash(python3 *)", tools)
+        self.assertIn("Bash(uv *)", tools)
+        self.assertIn("Bash(tools/ci.sh *)", tools)
+        self.assertNotIn("Bash(*)", tools)
         self.assertNotIn("bypassPermissions", argv)
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertLess(argv.index("--allowedTools"), argv.index("--"))
+
+    def test_runner_env_keeps_user_for_keychain_login(self):
+        allow = ClaudeAdapter().env_allow()
+        self.assertIn("USER", allow)
+        self.assertIn("HOME", allow)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", allow)
 
     def test_cancel_invocation_streams_the_probe_prompt(self):
         argv = ClaudeAdapter().build_cancel_invocation("haiku")
