@@ -69,6 +69,15 @@ class ClaudeFlagTests(unittest.TestCase):
         from openclaw_ecc_orchestrator.runs.conductor import HANDOFF_PATH_TOKEN
         self.assertIn(HANDOFF_PATH_TOKEN, runner_prompt({"id": "U1", "title": "t"}))
 
+    def test_handoff_template_in_prompt_is_schema_valid(self):
+        import json
+        from openclaw_ecc_orchestrator import schemas
+        from openclaw_ecc_orchestrator.cli.commands import HANDOFF_TEMPLATE
+        doc = json.loads(HANDOFF_TEMPLATE.replace("<UNIT_ID>", "U1").replace("<full sha>", "a" * 40)
+                         .replace("<repo/relative/path>", "src/a.py"))
+        report = schemas.validate_handoff(doc, {"id": "U1", "scope": {"files": ["src/a.py"]}})
+        self.assertTrue(report.ok, report.errors)
+
     def test_runner_env_keeps_user_for_keychain_login(self):
         allow = ClaudeAdapter().env_allow()
         self.assertIn("USER", allow)

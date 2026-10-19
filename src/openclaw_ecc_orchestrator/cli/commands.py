@@ -162,6 +162,17 @@ def predict_routing(ctx, op, run, unit_id):
             "estimated_cost_usd": selection.estimated_cost_usd, "escalation": action["action"]}
 
 
+HANDOFF_TEMPLATE = (
+    '{"schema_version": "1.0", "unit_id": "<UNIT_ID>", "status": "succeeded", '
+    '"outcome": "<one paragraph>", "files_changed": ["<repo/relative/path>"], '
+    '"behavior": "<what now works, one string>", '
+    '"commands": [{"command": "<command>", "exit_code": 0, "result": "<short result>"}], '
+    '"unresolved_failures": [], "assumptions": ["<assumption>"], "risks": ["<risk>"], '
+    '"next_action": "<next step>", '
+    '"commit": {"sha": "<full sha>", "branch": "<branch>", "worktree": "<worktree path>"}, '
+    '"usage": null, "user_input_required": false, "notes": "<optional>"}')
+
+
 def runner_prompt(punit):
     """Deterministic instructions for a coding CLI runner."""
     lines = [f"You are implementing work unit {punit['id']}: {punit.get('title', '')}."]
@@ -173,11 +184,16 @@ def runner_prompt(punit):
     if commands:
         lines.append("Acceptance commands that must pass: " + "; ".join(commands) + ".")
     lines.append("Commit your work on the current branch. Never push, never change other branches.")
-    lines.append("Finally write a JSON handoff document (schema_version 1.0: unit_id, status, outcome, "
-                 "files_changed, behavior, commands, unresolved_failures, assumptions, risks, next_action, "
-                 "commit {sha, branch, worktree}, usage, user_input_required) to this exact file with your "
-                 "file-writing tool: {ECC_HANDOFF_PATH} (the same path is in the ECC_HANDOFF_PATH "
-                 "environment variable). It is outside the repository; do not commit it.")
+    lines.append("Finally write a JSON handoff document to this exact file with your file-writing tool: "
+                 "{ECC_HANDOFF_PATH} (the same path is in the ECC_HANDOFF_PATH environment variable). "
+                 "It is outside the repository; do not commit it. It must match schemas/handoff.schema.json "
+                 "exactly: no other keys, and these types. Template (replace every <...>):")
+    lines.append(HANDOFF_TEMPLATE.replace("<UNIT_ID>", str(punit["id"])))
+    lines.append("Rules: status is one of succeeded, failed, partial, blocked; succeeded needs every "
+                 "command exit_code 0 and an empty unresolved_failures; behavior is one string, not a list; "
+                 "every command has command, exit_code (integer) and result; files_changed holds "
+                 "repository-relative paths inside the unit scope; commit.sha is the full hex SHA; "
+                 "usage is null when token counts are unknown; put anything else in notes (a string).")
     return "\n".join(lines)
 
 
