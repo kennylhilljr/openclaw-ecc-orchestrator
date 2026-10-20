@@ -185,6 +185,8 @@ def build_parser():
 
     p = sub.add_parser("resume", help="send a stopped unit back to ready, keeping its worktree and findings")
     _unit(p)
+    p.add_argument("--extra-attempts", dest="extra_attempts", type=int, default=0,
+                   help="owner grant of 1 to 3 more attempts for this unit (recorded on the unit)")
     _common(p), _mutating(p)
 
     p = sub.add_parser("cleanup", help="remove a stopped unit's worktree and branch")

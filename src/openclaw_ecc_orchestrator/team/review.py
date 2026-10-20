@@ -1,8 +1,10 @@
 """Per-unit team step (TEAM-DELIVERY-v2 section 4.1, steps 4 to 6): reviewers,
 the QA verifier, then the agent merge. Runs on a unit in `reviewing`."""
 
+import contextlib
 import fnmatch
 import os
+import threading
 
 from ..merge_queue.conflicts import diff_stats
 from ..routing.selection import required_review, select_runner
@@ -61,7 +63,41 @@ class TeamStep:
                             exclude_families=[author_family] if strict and author_family else [])
         return sel.candidates
 
+    @contextlib.contextmanager
+    def _lease_kept(self, run_id):
+        """Keep the run lease alive while a persona turn runs. A review turn can
+        outlast the lease (kimi-k3 took 5.5 minutes on M0-01's PR review); the
+        lease then expired and the verdict could not be saved (live finding,
+        rmcp-m0f). Renewed every third of the lease, and once more at the end
+        so the caller can record the result."""
+        keep = getattr(self.c, "_keep_lease", None)
+        if keep is None:
+            yield
+            return
+        period = max(1.0, float(getattr(self.c.manager, "lease_ttl", 300.0)) / 3.0)
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(period):
+                try:
+                    keep(run_id, force=True)
+                except Exception:  # noqa: BLE001 - a missed beat is retried on the next one
+                    pass
+
+        thread = threading.Thread(target=beat, name=f"lease-{run_id}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=10)
+            keep(run_id, force=True)
+
     def _turn(self, role, choice, prompt, cwd, writable, run_id, unit_id, timeout):
+        with self._lease_kept(run_id):
+            return self._turn_unkept(role, choice, prompt, cwd, writable, run_id, unit_id, timeout)
+
+    def _turn_unkept(self, role, choice, prompt, cwd, writable, run_id, unit_id, timeout):
         runner, model = choice["runner"], choice["model"]
         adapter = self.adapter(runner)
         stamp = int(self.clock() * 1000)

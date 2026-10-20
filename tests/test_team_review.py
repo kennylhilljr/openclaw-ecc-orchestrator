@@ -68,6 +68,8 @@ class TeamBase(IntegrationBase):
         return f"Reviewed.\n{mark} {json.dumps(doc)}"
 
     def cli_override(self, role, runner, prompt):
+        if role_of(prompt) in getattr(self, "slow_roles", ()):
+            self.clock.t += 600  # the turn outlasts the 60 s test lease
         if (role_of(prompt), runner) in getattr(self, "silent", ()):
             self.calls.append((role_of(prompt), runner))
             return [PY, "-c", "import sys; sys.exit(3)"]
@@ -84,6 +86,8 @@ class TeamBase(IntegrationBase):
             ((body.get("contents") or [{}])[0].get("parts") or [{}])[0].get("text") or ""
         provider = "gemini" if "googleapis" in url else ("kimi" if "moonshot" in url else "groq")
         self.calls.append((role_of(prompt), provider))
+        if role_of(prompt) in getattr(self, "slow_roles", ()):
+            self.clock.t += 600
         text = self.reply(role_of(prompt), self.head)
         if (role_of(prompt), provider) in getattr(self, "silent", ()):
             text = ""
@@ -217,6 +221,16 @@ class TriggerTests(TeamBase):
         self.assertEqual(sec["verdict"], "approved")
         self.assertIn(sec["provider"], {self.author, pr["provider"]})
         self.assertEqual(sec["independence"], "persona")
+
+    def test_a_turn_longer_than_the_lease_still_records_its_verdict(self):
+        """Live finding (rmcp-m0f): a 5.5 minute review outlasted the 5 minute lease and its verdict was lost."""
+        self.setup_unit()
+        self.slow_roles = ("pr_reviewer", "verifier")
+        self.ok(self.step.run("r1", "u1"))
+        unit = self.m.load("r1")["units"]["u1"]
+        reviews = unit["annotations"]["team"]["reviews"]
+        self.assertEqual(reviews[-1]["verdict"], "approved")
+        self.assertIn(unit["state"], ("queued_for_merge", "merged"))
 
     def test_no_security_reviewer_for_ordinary_paths(self):
         self.setup_unit()

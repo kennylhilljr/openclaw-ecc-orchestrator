@@ -49,7 +49,7 @@ from ..merge_queue.queue import approval_request_id
 from ..plugin.summary import summarize_required_user_actions
 from ..process import health as H
 from ..routing.classify import classify
-from ..routing.escalation import AttemptOutcome, EscalationController
+from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.registry import model_family
 from ..worktrees.git import git_out, rev_exists
@@ -284,14 +284,7 @@ class Conductor:
         ctrl = EscalationController(self.manager.plan_unit(run, unit_id), classification,
                                     tier_costs=self.tier_costs, clock=self.clock, policy=self.policy)
         record = (run["units"][unit_id].get("annotations") or {}).get("escalation") or {}
-        for attempt in record.get("attempts") or []:
-            if ctrl.finished:
-                break
-            ctrl.record(AttemptOutcome(
-                passed=bool(attempt.get("passed")), objective_failure=bool(attempt.get("objective_failure")),
-                cost_usd=float(attempt.get("cost_usd") or 0.0), elapsed_seconds=attempt.get("elapsed_seconds"),
-                runner=attempt.get("runner"), model=attempt.get("model"), usage=attempt.get("usage"),
-                reason=attempt.get("reason") or ""))
+        replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]))
         with self._lock:
             self._controllers[key] = ctrl
         return ctrl

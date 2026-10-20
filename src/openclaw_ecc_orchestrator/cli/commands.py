@@ -13,6 +13,7 @@ Each gated command is a `Spec`:
 * `lease_run(plan)` names the run whose conductor lease must be held.
 """
 
+import copy
 import hashlib
 import os
 import uuid
@@ -22,14 +23,14 @@ from ..merge_queue.dispatch import ConflictError, assert_parallel_safe
 from ..plugin.approvals import plan_digest
 from ..plugin.inbox import DecisionInbox
 from ..routing.classify import classify
-from ..routing.escalation import AttemptOutcome, EscalationController
+from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import select_runner
 from ..runs import state as S
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.manager import RunError
 from ..runs.repair import HANDOFF_RULES, HANDOFF_TEMPLATE, REPAIR_PROMPT_TOKEN, failure_brief
-from ..runs.store import StoreError
+from ..runs.store import StoreError, iso
 from ..worktrees.git import git_out, run_git
 from .config import UsageError, checked_path
 from .runtime import CommandFailed, fail, read_document
@@ -138,14 +139,7 @@ def predict_routing(ctx, op, run, unit_id):
                        "detail": "fix the unit's routing or policy"}])
     ctrl = EscalationController(punit, classification, tier_costs=ctx.rt.tier_costs(), clock=ctx.clock, policy=policy)
     record = (run["units"][unit_id].get("annotations") or {}).get("escalation") or {}
-    for attempt in record.get("attempts") or []:
-        if ctrl.finished:
-            break
-        ctrl.record(AttemptOutcome(
-            passed=bool(attempt.get("passed")), objective_failure=bool(attempt.get("objective_failure")),
-            cost_usd=float(attempt.get("cost_usd") or 0.0), elapsed_seconds=attempt.get("elapsed_seconds"),
-            runner=attempt.get("runner"), model=attempt.get("model"), usage=attempt.get("usage"),
-            reason=attempt.get("reason") or ""))
+    replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]))
     action = ctrl.next_action()
     if action["action"] in ("stop", "done"):
         fail(op, "escalation_allows_attempt", action["reason"],
@@ -638,6 +632,18 @@ def plan_resume(ctx):
     a = ctx.args
     run = load_run(ctx, op, a.run_id)
     unit = load_unit(op, run, a.unit)
+    extra = int(getattr(a, "extra_attempts", 0) or 0)
+    if extra < 0 or extra > 3:
+        fail(op, "extra_attempts_valid", "extra attempts must be between 0 and 3")
+    granted = int(((unit.get("annotations") or {}).get("budget_grant") or {}).get("attempts") or 0)
+    if extra and unit["state"] in (S.MERGED, S.CANCELLED):
+        fail(op, "unit_open", f"unit {a.unit} is {unit['state']}")
+    if extra and unit["state"] not in (S.NEEDS_USER, S.FAILED):
+        # Grant only: the unit keeps running; the next failure finds the extra attempt.
+        doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], target=None,
+                       budget_grant=granted + extra)
+        return Plan(doc, checks=[check("extra_attempts_valid", True, f"{granted} + {extra}")],
+                    extra={"policy": run.get("policy")})
     if unit["state"] not in (S.NEEDS_USER, S.FAILED):
         fail(op, "unit_stopped", f"unit {a.unit} is {unit['state']}; resume takes a unit in needs_user or failed")
     ann = unit.get("annotations") or {}
@@ -648,6 +654,9 @@ def plan_resume(ctx):
                        last_reason=unit.get("last_reason"), target=S.REVIEWING, verified_head=head)
         return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
                                  check("verified_head", True, head)], extra={"policy": run.get("policy")})
+    if extra:
+        run = copy.deepcopy(run)
+        run["units"][a.unit].setdefault("annotations", {})["budget_grant"] = {"attempts": granted + extra}
     ctrl = ctx.rt.conductor(run.get("policy"), op)._controller(run, a.unit)
     if ctrl is None:
         fail(op, "routing_valid", f"unit {a.unit} does not classify under the current policy")
@@ -656,7 +665,8 @@ def plan_resume(ctx):
                                   "raise budget.attempts in the plan and create a new run")
     last = ((unit.get("annotations") or {}).get("last_failure") or {}).get("reason")
     doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], last_reason=unit.get("last_reason"),
-                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action(), target=S.READY)
+                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action(), target=S.READY,
+                   budget_grant=granted + extra if extra else None)
     return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
                              check("attempts_left", True, f"{len(ctrl.history)} used; next: "
                                    f"{ctrl.next_action().get('action')} at tier {ctrl.tier}")],
@@ -666,6 +676,12 @@ def plan_resume(ctx):
 def execute_resume(ctx, plan):
     doc = plan.doc
     c = ctx.rt.conductor(plan.extra["policy"], "resume")
+    if doc.get("budget_grant"):
+        res = c.manager.annotate_unit(doc["run_id"], c.id, doc["unit_id"], "budget_grant",
+                                      {"attempts": doc["budget_grant"], "by": "owner", "at": iso(ctx.clock())})
+        if not res.get("ok", True) or doc["target"] is None:
+            res["operation"] = "resume"
+            return res
     res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], doc["target"], reason="owner_resume")
     res["operation"] = "resume"
     return res

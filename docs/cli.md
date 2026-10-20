@@ -399,6 +399,10 @@ lives in `integrations/launchd/`.
 * `resume` replays the unit's attempts through the escalation controller under the
   current policy and refuses when no attempt is left; the next dispatch then
   repairs with the last failure (for example a reviewer's findings) in its brief.
+  A unit whose code passed but whose team review stalled goes back to `reviewing`.
+  With the extra attempts option (1 to 3) the owner grants more attempts: they are
+  recorded on the unit as `budget_grant`, held in reserve and spent where the unit
+  would otherwise stop. The plan and its hash stay as approved.
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.

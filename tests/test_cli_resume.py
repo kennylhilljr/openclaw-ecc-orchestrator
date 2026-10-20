@@ -43,6 +43,27 @@ class ResumeTest(S.CliTestBase):
         self.ok(self.dispatch("alpha", "alpha.txt=a"))
         self.assertEqual(self.unit("alpha")["state"], "reviewing")
 
+    def test_owner_can_grant_extra_attempts(self):
+        """Live finding (rmcp-m0f): a valid security finding arrived after the last attempt was spent."""
+        self.create_run()
+        for _ in range(12):
+            if self.unit("alpha")["state"] != "ready":
+                break
+            self.dispatch("alpha", "alpha.txt=a", mode="fail")
+        self.assertEqual(self.unit("alpha")["state"], "needs_user")
+        doc = self.ok(self.reviewed("resume", "--run-id", self.RUN_ID, "--unit", "alpha", "--extra-attempts", "1"))
+        self.assertEqual(doc["data"]["state"], "ready")
+        self.ok(self.dispatch("alpha", "alpha.txt=a"))
+        self.assertEqual(self.unit("alpha")["state"], "reviewing")
+
+    def test_grant_without_a_stop_leaves_the_unit_where_it_is(self):
+        self.create_run()
+        self.ok(self.dispatch("alpha", "alpha.txt=a"))
+        self.ok(self.reviewed("resume", "--run-id", self.RUN_ID, "--unit", "alpha", "--extra-attempts", "1"))
+        self.assertEqual(self.unit("alpha")["state"], "reviewing")
+        code, doc = self.review_plan("resume", "--run-id", self.RUN_ID, "--unit", "alpha", "--extra-attempts", "9")
+        self.assertNotEqual(code, 0)
+
     def test_resume_refuses_a_ready_unit(self):
         self.create_run()
         code, doc = self.review_plan("resume", "--run-id", self.RUN_ID, "--unit", "alpha")

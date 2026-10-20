@@ -42,6 +42,30 @@ class AttemptOutcome:
     reason: str = ""
 
 
+def owner_grant(unit_record: Mapping[str, Any] | None) -> int:
+    """Extra attempts the owner granted this unit (``ecc resume --extra-attempts``,
+    stored as the ``budget_grant`` annotation)."""
+    grant = ((unit_record or {}).get("annotations") or {}).get("budget_grant") or {}
+    return max(0, int(grant.get("attempts") or 0))
+
+
+def replay(ctrl: "EscalationController", attempts, grant: int = 0) -> "EscalationController":
+    """Rebuild a controller from its persisted attempts. An owner grant is held
+    in reserve and spent at the first stop (during the replay or later, live),
+    so the plan's budget stays as approved and the replayed path is unchanged."""
+    ctrl.reserve_grant = grant
+    for attempt in attempts or []:
+        if ctrl.finished:
+            break
+        ctrl.record(AttemptOutcome(
+            passed=bool(attempt.get("passed")), objective_failure=bool(attempt.get("objective_failure")),
+            cost_usd=float(attempt.get("cost_usd") or 0.0), elapsed_seconds=attempt.get("elapsed_seconds"),
+            runner=attempt.get("runner"), model=attempt.get("model"), usage=attempt.get("usage"),
+            reason=attempt.get("reason") or ""))
+    ctrl.spend_reserve()
+    return ctrl
+
+
 class EscalationController:
     def __init__(self, unit: Mapping[str, Any], classification, *,
                  tier_costs: Mapping[int, float | None] | None = None,
@@ -56,6 +80,8 @@ class EscalationController:
         self.maximum_tier = classification.maximum_tier
         self.tier = self.start_tier
         self.budget_attempts = max(1, int(budget["attempts"]))
+        self.owner_extra = 0
+        self.reserve_grant = 0
         self.max_cost = float(budget["maximum_cost_usd"])
         if isinstance(ceilings.get("max_cost_usd_per_unit"), (int, float)):
             self.max_cost = min(self.max_cost, float(ceilings["max_cost_usd_per_unit"]))
@@ -82,8 +108,23 @@ class EscalationController:
         to go, so the unit's own attempt budget applies (live finding, rmcp-m0f:
         a top-tier unit got 2 of its 3 attempts and stopped on review feedback)."""
         if self.tier >= self.maximum_tier:
-            return self.budget_attempts
-        return min(self.budget_attempts, MAX_ATTEMPTS_PER_TIER)
+            return self.budget_attempts + self.owner_extra
+        return min(self.budget_attempts, MAX_ATTEMPTS_PER_TIER) + self.owner_extra
+
+    def spend_reserve(self) -> None:
+        """Use the owner's reserved grant if the controller has stopped."""
+        if self.reserve_grant and self.finished and self._pending["action"] == "stop":
+            extra, self.reserve_grant = self.reserve_grant, 0
+            self.grant(extra)
+
+    def grant(self, extra: int) -> dict:
+        """Owner grant: `extra` more repairs at the current tier, reopening a
+        stopped controller."""
+        self.owner_extra += int(extra)
+        if self.finished and self._pending["action"] == "stop":
+            self._pending = self._action("repair", "owner granted %d extra attempt(s) at tier %d"
+                                         % (extra, self.tier), "repair")
+        return dict(self._pending)
 
     def _est(self, tier: int) -> float | None:
         value = self.tier_costs.get(tier)
@@ -151,6 +192,7 @@ class EscalationController:
             else:
                 self.breaker.record_failure(provider)
         self._pending = self._decide(outcome)
+        self.spend_reserve()
         return dict(self._pending)
 
     def _decide(self, outcome: AttemptOutcome) -> dict:
