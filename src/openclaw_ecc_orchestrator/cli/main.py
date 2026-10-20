@@ -183,6 +183,10 @@ def build_parser():
     _unit(p)
     _common(p), _mutating(p)
 
+    p = sub.add_parser("resume", help="send a stopped unit back to ready, keeping its worktree and findings")
+    _unit(p)
+    _common(p), _mutating(p)
+
     p = sub.add_parser("cleanup", help="remove a stopped unit's worktree and branch")
     _unit(p)
     p.add_argument("--archive", action="store_true", help="bundle unique work first (destructive plan)")

@@ -33,6 +33,7 @@ option of any subcommand lists them in full.
 | `team-review` | gated | run the agent team on a unit in `reviewing` (TEAM-DELIVERY-v2): the PR reviewer, plus the security reviewer, architect or designer when the diff calls for them, then the QA verifier in a throwaway checkout; each role rotates across the certified providers. Changes requested or a failed verification return the unit to the coder (`ready`); with `merge_approval` `agents` in `.orchestration/team.json` the agents approve the merge and the queue merges it after re-running the gates; with `human` the approval waits for the owner as before |
 | `merge` | gated, destructive | enqueue the reviewed unit (consuming its merge approval) and process the queue until it is merged |
 | `cleanup` | gated, destructive when it archives unique work | remove a stopped unit's worktree and branch |
+| `resume` | gated | send a unit in `needs_user` or `failed` back to `ready`, keeping its worktree, attempt history and last failure |
 | `approvals list` | read only | pending approval requests |
 | `approvals approve` | gated | approve a request through the decision inbox |
 | `approvals reject` | gated | reject a request through the decision inbox |
@@ -395,6 +396,9 @@ lives in `integrations/launchd/`.
   when enqueued) and reports them in `processed_before`. Nothing is pushed.
   The rollback checkpoint carries the previous target commit and the
   `update-ref` command that restores it.
+* `resume` replays the unit's attempts through the escalation controller under the
+  current policy and refuses when no attempt is left; the next dispatch then
+  repairs with the last failure (for example a reviewer's findings) in its brief.
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.

@@ -625,6 +625,41 @@ def execute_cleanup(ctx, plan):
     return res
 
 
+# == resume ==
+def plan_resume(ctx):
+    """Send a stopped unit (needs_user or failed) back to ready. Its worktree,
+    attempt history and last failure (for example a reviewer's findings) are
+    kept, so the next dispatch repairs exactly what stopped it. Refused when the
+    unit's escalation budget has no attempt left under the current policy."""
+    op = "resume"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    unit = load_unit(op, run, a.unit)
+    if unit["state"] not in (S.NEEDS_USER, S.FAILED):
+        fail(op, "unit_stopped", f"unit {a.unit} is {unit['state']}; resume takes a unit in needs_user or failed")
+    ctrl = ctx.rt.conductor(run.get("policy"), op)._controller(run, a.unit)
+    if ctrl is None:
+        fail(op, "routing_valid", f"unit {a.unit} does not classify under the current policy")
+    if ctrl.finished:
+        fail(op, "attempts_left", f"unit {a.unit} has used its attempt budget ({len(ctrl.history)} attempts); "
+                                  "raise budget.attempts in the plan and create a new run")
+    last = ((unit.get("annotations") or {}).get("last_failure") or {}).get("reason")
+    doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], last_reason=unit.get("last_reason"),
+                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action())
+    return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
+                             check("attempts_left", True, f"{len(ctrl.history)} used; next: "
+                                   f"{ctrl.next_action().get('action')} at tier {ctrl.tier}")],
+                extra={"policy": run.get("policy")})
+
+
+def execute_resume(ctx, plan):
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "resume")
+    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], S.READY, reason="owner_resume")
+    res["operation"] = "resume"
+    return res
+
+
 # == team-review ==
 def plan_team_review(ctx):
     op = "team-review"
@@ -733,6 +768,7 @@ GATED = {
     "drive": Spec(plan_drive, execute_drive, lease=True),
     "merge": Spec(plan_merge, execute_merge, authorize=authorize_merge, lease=True),
     "cleanup": Spec(plan_cleanup, execute_cleanup, authorize=authorize_cleanup),
+    "resume": Spec(plan_resume, execute_resume, lease=True),
     "approvals.approve": Spec(plan_decision, execute_decision),
     "approvals.reject": Spec(plan_decision, execute_decision),
 }
