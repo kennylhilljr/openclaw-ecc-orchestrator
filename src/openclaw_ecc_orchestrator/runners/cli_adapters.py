@@ -98,7 +98,9 @@ class CliAdapter:
     # Not secrets, but needed at run time: Claude Code on macOS looks up its
     # keychain login by account name and reports "Not logged in" without USER
     # (seen 2026-10-19; certification passed because probes keep USER).
-    runtime_env: tuple[str, ...] = ("USER", "LOGNAME")
+    # uv's cache and offline switches travel with the runner so a sandboxed agent
+    # can reuse the owner's warm cache (live finding, rmcp-m0f).
+    runtime_env: tuple[str, ...] = ("USER", "LOGNAME", "UV_CACHE_DIR", "UV_OFFLINE", "UV_PYTHON_INSTALL_DIR")
 
     def env_allow(self) -> tuple[str, ...]:
         """Names to allowlist when this CLI runs as a unit runner under the supervisor."""
@@ -337,7 +339,11 @@ class ClaudeAdapter(CliAdapter):
     def build_invocation(self, prompt, model=None, cwd=None, writable=False):
         argv = self._base(model)
         if writable:
-            argv += ["--permission-mode", "acceptEdits", "--allowedTools", self.edit_tools]
+            # Project and local settings only: the owner's user-level plugins and hooks
+            # (for example a guardrail that refuses edits to any file named secrets.py)
+            # must not decide what an ECC unit may write (live finding, rmcp-m0f M0-05).
+            argv += ["--setting-sources", "project,local",
+                     "--permission-mode", "acceptEdits", "--allowedTools", self.edit_tools]
         return argv + ["--", prompt]
 
     def build_cancel_invocation(self, model=None, cwd=None):
@@ -385,6 +391,14 @@ class ClaudeAdapter(CliAdapter):
                 "input_tokens": usage.get("input_tokens"),
                 "output_tokens": usage.get("output_tokens"),
                 "error": error}
+
+
+def uv_cache_dir():
+    """uv's cache folder when it exists (UV_CACHE_DIR, else uv's macOS and Linux
+    default). Granted to Codex's sandbox so `uv sync` and `uv run` work offline."""
+    path = os.environ.get("UV_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "uv")
+    return path if os.path.isdir(path) else None
 
 
 def git_write_dir(cwd):
@@ -441,6 +455,9 @@ class CodexAdapter(CliAdapter):
                 # worktree that is the common .git, not the ".git" pointer
                 # file (live finding, preflight 2026-10-19).
                 argv += ["--add-dir", git_write_dir(cwd)]
+                cache = uv_cache_dir()
+                if cache:
+                    argv += ["--add-dir", cache]
         if model:
             argv += ["-m", model]
         if self.effort:

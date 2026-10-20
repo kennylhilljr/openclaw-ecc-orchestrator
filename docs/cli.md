@@ -403,6 +403,11 @@ lives in `integrations/launchd/`.
   With the extra attempts option (1 to 3) the owner grants more attempts: they are
   recorded on the unit as `budget_grant`, held in reserve and spent where the unit
   would otherwise stop. The plan and its hash stay as approved.
+* `drive` heals before it stops (TEAM-DELIVERY v5 7.1): it sets aside a unit it cannot act on and continues
+  with the rest, and the delivery lead grants bounded extra attempts, restarts a stalled review or retries a
+  merge conflict on its own. Every stop prints the exact commands to run as `next:` lines, ending with
+  the command that continues the drive. Before each later attempt the unit's branch receives the target's
+  current tip (TEAM-DELIVERY v5 4.4).
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.

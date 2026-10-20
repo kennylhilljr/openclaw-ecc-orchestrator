@@ -42,6 +42,12 @@ class ClaudeFlagTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--effort") + 1], "low")
         self.assertEqual(argv[-2:], ["--", "-rf prompt"])
 
+    def test_writable_runs_ignore_user_plugins_and_hooks(self):
+        """Live finding (rmcp-m0f): a user-level plugin hook refused M0-05's edits to platform/secrets.py."""
+        argv = ClaudeAdapter().build_invocation("x", writable=True)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
+        self.assertNotIn("--setting-sources", ClaudeAdapter().build_invocation("x"))
+
     def test_writable_allows_edit_git_and_python_only(self):
         argv = ClaudeAdapter().build_invocation("x", writable=True)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
@@ -152,11 +158,23 @@ class CodexFlagTests(unittest.TestCase):
         self.assertNotIn("--add-dir", argv)
 
     def test_writable_run_can_commit_in_its_repo_only(self):
-        argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": "/nonexistent/uv-cache"}):
+            argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
         self.assertEqual(argv.count("--add-dir"), 1)
         self.assertEqual(argv[argv.index("--add-dir") + 1], os.path.join("/w/repo", ".git"))
         self.assertNotIn("--add-dir", CodexAdapter().build_invocation("x", writable=True))
+
+    def test_writable_run_shares_the_uv_cache(self):
+        """Live finding (rmcp-m0f): the sandbox could not use uv's cache, so acceptance commands could not run."""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as cache, mock.patch.dict(os.environ, {"UV_CACHE_DIR": cache}):
+            argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
+            self.assertIn(cache, [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"])
+            self.assertNotIn(cache, CodexAdapter().build_invocation("x", cwd="/w/repo"))
+        self.assertIn("UV_CACHE_DIR", CodexAdapter().env_allow())
 
     def test_writable_worktree_grants_the_common_git_dir(self):
         """In a linked worktree .git is a pointer file; the grant must be the common .git."""

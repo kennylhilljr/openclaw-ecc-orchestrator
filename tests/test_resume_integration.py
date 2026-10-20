@@ -215,6 +215,11 @@ class ResumeIntegrationTest(H.IntegrationBase):
         wt = c2.worktrees
         self.ok(wt.cleanup(run_id, "alpha", target_branch="main"))
         self.ok(wt.cleanup(run_id, "beta", target_branch="main"))
+        # gamma's retry found main moved and ECC began merging it in (TEAM-DELIVERY v5 4.4); the attempt was
+        # cancelled mid-merge, so the conflicted merge is still in progress and the owner aborts it first.
+        gamma_wt = m2.load(run_id)["units"]["gamma"]["workspace"]["path"]
+        self.assertTrue(git(gamma_wt, "diff", "--name-only", "--diff-filter=U"))
+        git(gamma_wt, "merge", "--abort")
         self.assertFalse(wt.cleanup(run_id, "gamma", target_branch="main")["ok"])
         self.assertTrue(os.path.isfile(self.ok(wt.cleanup(run_id, "gamma", target_branch="main", archive=True))
                                        ["rollback_checkpoint"]["bundle"]))

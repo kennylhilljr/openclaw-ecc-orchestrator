@@ -682,7 +682,8 @@ def execute_resume(ctx, plan):
         if not res.get("ok", True) or doc["target"] is None:
             res["operation"] = "resume"
             return res
-    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], doc["target"], reason="owner_resume")
+    reason = "retry:owner_resume" if doc["target"] == S.READY else "owner_resume"
+    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], doc["target"], reason=reason)
     res["operation"] = "resume"
     return res
 

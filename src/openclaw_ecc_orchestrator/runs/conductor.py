@@ -52,7 +52,7 @@ from ..routing.classify import classify
 from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.registry import model_family
-from ..worktrees.git import git_out, rev_exists
+from ..worktrees.git import git_out, rev_exists, run_git
 from . import repair as R
 from . import state as S
 from .envelope import SCHEMA_VERSION, check, envelope
@@ -467,6 +467,43 @@ class Conductor:
         return doc, missing
 
     # == unit execution ==
+    def _sync_with_target(self, path):
+        """Bring the target's current tip into an existing unit worktree before an
+        attempt (TEAM-DELIVERY v5 section 4.4). Returns a note for the runner's
+        prompt, or None when the branch already contains the tip."""
+        repo = self.worktrees.repo
+        try:
+            tip = git_out(["rev-parse", f"refs/heads/{self.target}"], repo)
+        except Exception:  # noqa: BLE001 - no target branch: nothing to sync
+            return None
+        short = tip[:12]
+        if os.path.exists(os.path.join(git_out(["rev-parse", "--absolute-git-dir"], path), "MERGE_HEAD")):
+            files = git_out(["diff", "--name-only", "--diff-filter=U"], path).split()
+            return (f"A merge of {self.target} into your branch is still in progress"
+                    + (f" with conflicts in: {', '.join(files)}" if files else "")
+                    + ". Finish it first (resolve, then commit the merge), then continue the unit.")
+        if run_git(["merge-base", "--is-ancestor", tip, "HEAD"], path, check=False).returncode == 0:
+            return None
+        dirty = [line for line in git_out(["status", "--porcelain", "--untracked-files=no"], path).splitlines() if line]
+        if dirty:
+            return (f"{self.target} has moved to {short}, but your branch has uncommitted changes, so ECC did not "
+                    f"merge it. Commit your work, run `git merge --no-edit {self.target}`, resolve any conflicts, "
+                    "and make the unit pass on top of it.")
+        res = run_git(["merge", "--no-edit", "-m", f"Merge {self.target} ({short}) into the unit branch (ECC)", tip],
+                      path, check=False)
+        if res.returncode == 0:
+            return (f"Before this attempt ECC merged {self.target} ({short}) into your branch. Your unit must pass on "
+                    "top of it; dependency files it brought in are not yours to change.")
+        files = git_out(["diff", "--name-only", "--diff-filter=U"], path).split()
+        if not files:
+            run_git(["merge", "--abort"], path, check=False)
+            return (f"ECC could not merge {self.target} ({short}) into your branch: "
+                    f"{(res.stderr or res.stdout).strip()[:300]}. Run `git merge --no-edit {self.target}` yourself "
+                    "and resolve what it reports before continuing.")
+        return (f"ECC started merging {self.target} ({short}) into your branch and it conflicts in: "
+                f"{', '.join(files)}. Resolve these conflicts first, keeping both sides' intent, commit the merge, "
+                "then continue the unit.")
+
     def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None, repair_argv=None):
         op = "unit.start"
         run = self.manager.load(run_id)
@@ -488,6 +525,11 @@ class Conductor:
             res = self.manager.record_workspace(run_id, self.id, unit_id, workspace)
             if not res["ok"]:
                 return res
+        else:
+            note = self._sync_with_target(paths["path"])
+            if note and "--" in runner_argv:
+                runner_argv = list(runner_argv)
+                runner_argv[-1] = f"{runner_argv[-1]}\n\n{note}"
         before = None
         if self.git_state_guard is not None:
             try:

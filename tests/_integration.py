@@ -31,6 +31,7 @@ PY = sys.executable
 #   nohandoff SPEC...      commit files, write no handoff
 #   claim=PATHS SPEC...    commit files, handoff lists PATHS (comma separated) as changed
 #   slow:N SPEC...        print progress for N seconds, then behave like write
+#   blocked                write a handoff with status blocked, commit nothing
 #   fail | block | sleep:N
 RUNNER = r'''
 import json, os, signal, subprocess, sys, time
@@ -54,6 +55,16 @@ if mode.startswith("slow:"):
         print("working", flush=True)
         time.sleep(0.1)
     mode = "write"
+if mode == "blocked":
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    with open(os.environ["ECC_HANDOFF_PATH"], "w") as fh:
+        json.dump({"schema_version": "1.0", "unit_id": os.environ["ECC_UNIT_ID"], "status": "blocked",
+                   "outcome": "a dependency file is missing", "files_changed": [], "behavior": "nothing yet",
+                   "commands": [], "unresolved_failures": ["needs a file another unit owns"],
+                   "assumptions": [], "risks": [], "next_action": "re-run after the dependency merges",
+                   "commit": {"sha": head, "branch": "unit", "worktree": "."}, "usage": None,
+                   "user_input_required": True}, fh)
+    sys.exit(0)
 specs = sys.argv[2:]
 names = []
 for spec in specs:

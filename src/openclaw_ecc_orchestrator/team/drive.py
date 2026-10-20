@@ -24,6 +24,14 @@ from . import personas as P
 PRODUCT_MARK = "ECC_PRODUCT"
 MAX_STEPS = 500
 
+# Self-healing before the owner is interrupted (TEAM-DELIVERY v5 section 7.1). Each
+# kind has a per-unit cap that persists across drives of the same run.
+HEAL_CAPS = {"grant": 2, "review": 2, "conflict": 2, "blocked_handoff": 1}
+GRANTABLE = {"escalation_stopped", "budget_exhausted", "runner_needs_user"}
+REVIEW_STALLS = {"no_qualified_reviewer", "no_qualified_verifier"}
+OWNER_ONLY = {"runner_auth", "runner_missing", "runner_permission_denied", "routing_invalid",
+              "routing_changed_since_plan", "liveness_unverified", "runner_needs_owner"}
+
 
 def product_prompt(pack, head):
     return "\n\n".join([
@@ -148,14 +156,127 @@ class Drive:
                                cwd_fn=lambda: (repo, lambda: None), writable=False, timeout=1800.0,
                                require_kind=require_kind)
 
-    def _stop(self, reason, detail, extra=None):
+    def _stop(self, reason, detail, extra=None, next_steps=None):
         data = {"stop": reason, "detail": detail, "summary": self.summary()}
         data.update(extra or {})
-        self.state["last_stop"] = {"reason": reason, "detail": detail, "at": iso(self.clock())}
+        steps = list(next_steps or [])
+        steps.append({"kind": "continue", "run_id": self.run_id, "detail": "then continue the milestone",
+                      "command": f"ecc drive --run-id {self.run_id}"})
+        data["next_steps"] = [s.get("command") for s in steps if s.get("command")]
+        self.state["last_stop"] = {"reason": reason, "detail": detail, "at": iso(self.clock()),
+                                   "next_steps": data["next_steps"]}
         self._save()
+        actions = [{"kind": "resolve_needs_user", "run_id": self.run_id, "detail": f"{reason}: {detail}"}] + steps
         return envelope("drive", ok=False, changed=True, checks=[check("milestone_complete", False, reason)],
-                        required_user_actions=[{"kind": "resolve_needs_user", "run_id": self.run_id,
-                                                "detail": f"{reason}: {detail}"}], data=data)
+                        required_user_actions=actions, data=data)
+
+    # == self-healing and next steps ==
+    def _heals(self, uid):
+        return self.state.setdefault("heals", {}).setdefault(uid, {})
+
+    def _heal_once(self, uid, kind):
+        used = self._heals(uid)
+        if used.get(kind, 0) >= HEAL_CAPS[kind]:
+            return False
+        used[kind] = used.get(kind, 0) + 1
+        self._save()
+        return True
+
+    def _latest_handoff(self, uid):
+        logs = os.path.join(self.step.logs_dir, self.run_id)
+        try:
+            names = sorted((n for n in os.listdir(logs) if n.startswith(f"{uid}-attempt") and n.endswith(".handoff.json")),
+                           key=lambda n: int(n[len(uid) + 8:].split(".")[0] or 0))
+        except (OSError, ValueError):
+            return {}
+        for name in reversed(names):
+            try:
+                with open(os.path.join(logs, name), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                return doc if isinstance(doc, dict) else {}
+            except (OSError, ValueError):
+                continue
+        return {}
+
+    def heal(self, units, order):
+        """Try the recoveries the delivery lead may apply on its own before the
+        owner is interrupted. Returns the units healed (empty when none)."""
+        healed = []
+        m = self.c.manager
+        for uid in order:
+            u = units[uid]
+            reason = str(u.get("last_reason") or "")
+            ann = u.get("annotations") or {}
+            if u["state"] == S.NEEDS_USER and reason in REVIEW_STALLS and (ann.get("verification") or {}).get("head"):
+                if self._heal_once(uid, "review"):
+                    m.transition(self.run_id, self.c.id, uid, S.REVIEWING, reason="heal_review_stall")
+                    healed.append((uid, "review stall: back to the team review"))
+            elif u["state"] == S.BLOCKED and self._heal_once(uid, "conflict"):
+                m.annotate_unit(self.run_id, self.c.id, uid, "last_failure", {
+                    "reason": "merge_conflict", "at": iso(self.clock()),
+                    "evidence": {"reason": "merge_conflict", "handoff_problems": [
+                        "Your branch no longer merges cleanly into main. ECC merges main into your branch before "
+                        "this attempt; resolve the conflicts, keep both sides' intent, and make the unit pass."]}})
+                m.transition(self.run_id, self.c.id, uid, S.READY, reason="retry:merge_conflict")
+                healed.append((uid, "merge conflict: retry on top of main"))
+            elif u["state"] == S.NEEDS_USER and reason in GRANTABLE and reason not in OWNER_ONLY:
+                kind = "blocked_handoff" if reason == "runner_needs_user" else "grant"
+                if not (self._heal_once(uid, kind) and (kind == "grant" or self._heal_once(uid, "grant"))):
+                    continue
+                grant = ann.get("budget_grant") or {}
+                m.annotate_unit(self.run_id, self.c.id, uid, "budget_grant", {
+                    "attempts": int(grant.get("attempts") or 0) + 1, "by": "delivery_lead", "reason": reason,
+                    "at": iso(self.clock())})
+                if reason == "runner_needs_user":
+                    h = self._latest_handoff(uid)
+                    problems = [f"you reported: {x}" for x in (h.get("unresolved_failures") or [])
+                                if isinstance(x, str)][:8]
+                    if h.get("next_action"):
+                        problems.append(f"your suggested next step: {h['next_action']}")
+                    problems.append("Every dependency of this unit is merged and ECC merges main into your branch "
+                                    "before this attempt, so files other units own should now be present. Continue "
+                                    "the unit. If something only the owner can change still blocks you (credentials, "
+                                    "a tool or guardrail refusing an edit), stop and name it exactly.")
+                    m.annotate_unit(self.run_id, self.c.id, uid, "last_failure", {
+                        "reason": "blocked_handoff", "at": iso(self.clock()),
+                        "evidence": {"reason": "blocked_handoff", "handoff_problems": problems}})
+                self.c._controllers.pop((self.run_id, uid), None)
+                m.transition(self.run_id, self.c.id, uid, S.READY, reason=f"retry:heal_{reason}")
+                healed.append((uid, f"{reason}: delivery lead granted one more attempt"))
+        for uid, what in healed:
+            self.progress(f"{uid}: {what}")
+        self.state.setdefault("heal_log", []).extend(
+            {"unit": uid, "action": what, "at": iso(self.clock())} for uid, what in healed)
+        if healed:
+            self._save()
+        return healed
+
+    def next_steps(self, stuck, refused):
+        """Exact owner commands for every unit the drive could not move."""
+        steps = []
+        r = self.run_id
+        for uid, reason in stuck.items():
+            reason = str(reason or "")
+            if reason in ("runner_auth", "runner_missing"):
+                cmd = (f"sign the coding CLI back in (claude: run `claude` then /login; codex: `codex login`), "
+                       f"run `ecc preflight`, then `ecc resume --run-id {r} --unit {uid}`")
+            elif reason == "runner_permission_denied":
+                cmd = (f"allow the denied tool for ECC runs (see the unit log), then "
+                       f"`ecc resume --run-id {r} --unit {uid}`")
+            elif reason in REVIEW_STALLS:
+                cmd = f"ecc resume --run-id {r} --unit {uid}"
+            elif reason in GRANTABLE or reason.startswith("review"):
+                h = self._latest_handoff(uid) if reason == "runner_needs_user" else {}
+                hint = f" (the agent says: {h['next_action'][:300]})" if h.get("next_action") else ""
+                cmd = f"ecc resume --run-id {r} --unit {uid} --extra-attempts 1{hint}"
+            else:
+                cmd = f"ecc status --run-id {r}; then ecc resume --run-id {r} --unit {uid}"
+            steps.append({"kind": "resolve_needs_user", "run_id": r, "unit_id": uid, "detail": reason,
+                          "command": cmd})
+        for uid, why in refused.items():
+            steps.append({"kind": "inspect_refusal", "run_id": r, "unit_id": uid, "detail": why[:300],
+                          "command": f"ecc status --run-id {r}"})
+        return steps
 
     def summary(self):
         run = self.run()
@@ -188,6 +309,7 @@ class Drive:
     def loop(self):
         started = self.clock()
         baseline = self.spent(self.run())
+        refused = {}
         for _ in range(MAX_STEPS):
             run = self.run()
             units = run["units"]
@@ -200,6 +322,8 @@ class Drive:
                 return self._stop("drive_time_ceiling", f"ran {int(self.clock() - started)} s")
             acted = False
             for uid in order:
+                if uid in refused:
+                    continue
                 state = units[uid]["state"]
                 before = self._fingerprint(uid)
                 if state == S.REVIEWING:
@@ -214,17 +338,27 @@ class Drive:
                 else:
                     continue
                 if self._fingerprint(uid) == before:
-                    # Nothing moved: a plumbing refusal (plan check, lease, routing). Retrying
-                    # the same call would loop, so the owner gets the refusal instead.
+                    # Nothing moved: a plumbing refusal (plan check, lease, routing). Retrying the
+                    # same call would loop, so this unit is set aside for the rest of the drive and
+                    # the drive carries on with every unit that can still move.
                     failed = [f"{c.get('name')}: {c.get('detail')}" for c in (res or {}).get("checks") or []
                               if not c.get("ok")]
-                    return self._stop("no_progress", f"{uid} {state}: " + "; ".join(failed)[:2000])
+                    refused[uid] = f"{state}: " + "; ".join(failed)[:2000]
+                    self.progress(f"{uid}: set aside ({refused[uid][:200]})")
+                    continue
                 acted = True
                 break
             if not acted:
+                if self.heal(units, order):
+                    continue
                 stuck = {uid: units[uid].get("last_reason") for uid in order
                          if units[uid]["state"] in (S.NEEDS_USER, S.BLOCKED, S.FAILED, S.CANCELLED)}
-                return self._stop("needs_owner", json.dumps(stuck), {"diagnosis": self.triage(stuck)})
+                if not stuck and refused:
+                    return self._stop("no_progress", json.dumps(refused)[:2000],
+                                      next_steps=self.next_steps({}, refused))
+                return self._stop("needs_owner", json.dumps(stuck), {"diagnosis": self.triage(stuck),
+                                                                      "refused": refused},
+                                  next_steps=self.next_steps(stuck, refused))
         return self._stop("drive_step_limit", f"{MAX_STEPS} steps without finishing")
 
     def base_commit(self, run):
