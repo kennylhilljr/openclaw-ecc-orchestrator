@@ -88,6 +88,14 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(actions, ["repair", "escalate", "repair", "stop"])
         self.assertEqual(ctl.tier, 1)
 
+    def test_maximum_tier_uses_the_whole_attempt_budget(self):
+        """Live finding (rmcp-m0f): a unit starting at its maximum tier got 2 of 3 attempts."""
+        ctl = controller(unit(attempts=3, initial=2, maximum=2))
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(3)], ["repair", "repair", "stop"])
+        ctl = controller(unit(attempts=3, initial=0, maximum=1))
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(2)], ["repair", "escalate"])
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(3)], ["repair", "repair", "stop"])
+
     def test_single_attempt_budget_escalates_without_repair(self):
         ctl = controller(unit(attempts=1))
         self.assertEqual(ctl.record(FAIL)["action"], "escalate")

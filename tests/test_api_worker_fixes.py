@@ -211,6 +211,16 @@ class MacPathRedactionTests(unittest.TestCase):
             self.assertEqual(redaction.redact_text("cwd=%s\n" % path), "cwd=%s\n" % path)
             self.assertFalse(redaction.inspection_findings([path]), path)
 
+    def test_paths_through_hidden_directories_are_not_masked(self):
+        """Live finding (rmcp-m0f): a worktree path under ~/.local failed a handoff as secret_detected."""
+        path = ("/Users/someone/.local/share/openclaw-ecc-orchestrator/worktrees/"
+                "my-research-mcp-66e6cd383a/rmcp-m0f/M0-01")
+        self.assertFalse(redaction.contains_secret(path))
+        self.assertEqual(redaction.redact_text(path), path)
+        self.assertFalse(redaction.inspection_findings([path]))
+        hidden = "/Users/someone/.cache/" + BLOB + "/x"
+        self.assertNotIn(BLOB, redaction.redact_text(hidden))
+
     def test_long_random_segment_inside_a_path_is_still_masked(self):
         path = "/tmp/" + BLOB + "/x"
         self.assertIn(redaction.REDACTED, redaction.redact_text(path))

@@ -166,12 +166,20 @@ def _branch_spans(m: "re.Match[str]") -> list[tuple[int, int]] | None:
     return None
 
 
+def _continues_path(m: "re.Match[str]") -> bool:
+    """True when the token resumes an absolute path right after a hidden
+    directory's dot ("/.local/share/..." splits at the dot, so the rest no
+    longer starts at a path root). A credential is never preceded by "/."."""
+    i = m.start()
+    return i >= 2 and m.string[i - 1] == "." and m.string[i - 2] == "/"
+
+
 def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     token = m.group(0)
     branch = _branch_spans(m)
     if branch is not None:
         return branch
-    start = _path_start(token)
+    start = 0 if _continues_path(m) else _path_start(token)
     if start < 0:
         return [m.span()] if _is_high_entropy(token) else []
     spans = []

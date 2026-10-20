@@ -55,7 +55,7 @@ class EscalationController:
         self.start_tier = classification.chosen_tier
         self.maximum_tier = classification.maximum_tier
         self.tier = self.start_tier
-        self.attempts_per_tier = max(1, min(int(budget["attempts"]), MAX_ATTEMPTS_PER_TIER))
+        self.budget_attempts = max(1, int(budget["attempts"]))
         self.max_cost = float(budget["maximum_cost_usd"])
         if isinstance(ceilings.get("max_cost_usd_per_unit"), (int, float)):
             self.max_cost = min(self.max_cost, float(ceilings["max_cost_usd_per_unit"]))
@@ -75,6 +75,16 @@ class EscalationController:
         self._pending: dict = self._initial_action()
 
     # ------------------------------------------------------------ helpers
+    @property
+    def attempts_per_tier(self) -> int:
+        """Repairs allowed at the current tier. Below the maximum tier the cap
+        sends a struggling unit up a tier; at the maximum tier there is nowhere
+        to go, so the unit's own attempt budget applies (live finding, rmcp-m0f:
+        a top-tier unit got 2 of its 3 attempts and stopped on review feedback)."""
+        if self.tier >= self.maximum_tier:
+            return self.budget_attempts
+        return min(self.budget_attempts, MAX_ATTEMPTS_PER_TIER)
+
     def _est(self, tier: int) -> float | None:
         value = self.tier_costs.get(tier)
         return float(value) if isinstance(value, (int, float)) else None
