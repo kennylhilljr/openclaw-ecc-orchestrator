@@ -168,10 +168,13 @@ def runner_prompt(punit, brief=None):
     if commands:
         lines.append("Acceptance commands that must pass: " + "; ".join(commands) + ".")
     lines.append("Commit your work on the current branch. Never push, never change other branches.")
-    lines.append("Finally write a JSON handoff document to this exact file with your file-writing tool: "
+    lines.append("Finally write a JSON handoff document to this exact file: "
                  "{ECC_HANDOFF_PATH} (the same path is in the ECC_HANDOFF_PATH environment variable). "
-                 "It is outside the repository; do not commit it. It must match schemas/handoff.schema.json "
-                 "exactly: no other keys, and these types. Template (replace every <...>):")
+                 "It is outside the repository, and its folder is writable for you: if your file-editing tool "
+                 "refuses a path outside the repository, write it from the shell instead, for example "
+                 "cat > \"$ECC_HANDOFF_PATH\" <<'JSON' ... JSON. Never write it anywhere else and do not "
+                 "commit it. ECC validates it against its handoff schema (not in this repository): no keys other "
+                 "than the template's, and these types. Template (replace every <...>):")
     lines.append(HANDOFF_TEMPLATE.replace("<UNIT_ID>", str(punit["id"])))
     lines.append(HANDOFF_RULES)
     if brief:

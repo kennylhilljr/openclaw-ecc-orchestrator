@@ -28,7 +28,7 @@ if "USER" not in os.environ:
 if mode == "oldcli":
     print("error: unknown option '--permission-prompts'", file=sys.stderr)
     sys.exit(1)
-m = re.search(r"file-writing tool: (\S+) \(", prompt)
+m = re.search(r"to this exact file: (\S+) \(", prompt)
 if not m:
     print("cannot tell where the handoff goes")
     sys.exit(0)

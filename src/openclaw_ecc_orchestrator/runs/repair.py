@@ -206,7 +206,9 @@ def handoff_repair_prompt(unit_id, path_token, problems, template, rules):
     return "\n".join([
         f"Your work on unit {unit_id} is committed in this worktree, but its handoff file is missing or invalid.",
         f"Problems: {listed}.",
-        f"Rewrite only the handoff file at {path_token} with your file-writing tool. Do not change, add or commit "
+        f"Rewrite only the handoff file at {path_token}. Its folder is writable for you; if your file-editing "
+        "tool refuses a path outside the repository, write it from the shell (cat > \"$ECC_HANDOFF_PATH\" "
+        "<<'JSON' ... JSON). Never write it anywhere else. Do not change, add or commit "
         "any repository file. Read `git log -1` for the commit sha and branch. Template (replace every <...>):",
         template.replace("<UNIT_ID>", unit_id),
         rules,
