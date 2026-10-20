@@ -70,7 +70,8 @@ class TeamStep:
             return I.run_cli(adapter, model, prompt, cwd=cwd, writable=writable, supervisor=self.supervisor,
                              log_path=os.path.join(self.logs_dir, run_id, f"{unit_id}-{role}-{runner}-{stamp}.log"),
                              timeout=timeout, argv_override=override)
-        return I.run_api(adapter, model, prompt, timeout=min(timeout, 600.0), env=self.env, http_post=self.http_post)
+        return I.run_api(adapter, model, prompt, timeout=min(timeout, 900.0), env=self.env, http_post=self.http_post,
+                         log_path=os.path.join(self.logs_dir, run_id, f"{unit_id}-{role}-{runner}-{stamp}.log"))
 
     def _ask(self, role, mark, prompt, choice, head, cwd, writable, run_id, unit_id, timeout):
         """One turn plus one re-ask on an unparsable reply. Returns
@@ -183,6 +184,21 @@ class TeamStep:
                              candidates=self.candidates(role_tier, classification.risk, author, author_family, strict),
                              exclude=exclude, pack_tokens=tokens, head=head, cwd_fn=same_dir, writable=False,
                              timeout=1800.0)
+            if res.get("verdict") is None and role == "security_reviewer" and pr_provider in exclude:
+                # No provider independent of the PR reviewer answered. Independence from the
+                # author stays absolute; independence from the PR reviewer yields, on the record.
+                skipped = res.get("skipped") or []
+                res = self._play(role, P.REVIEW_MARK, lambda r=role: P.review_prompt(r, pack, head),
+                                 run_id=run_id, unit_id=unit_id, rotation=rotation,
+                                 panel=TC.panel_for(self.cfg, role, cls),
+                                 candidates=self.candidates(role_tier, classification.risk, author, author_family,
+                                                            strict),
+                                 exclude={author} if author else set(), pack_tokens=tokens, head=head,
+                                 cwd_fn=same_dir, writable=False, timeout=1800.0)
+                res["skipped"] = skipped + (res.get("skipped") or [])
+                if res.get("verdict") is not None:
+                    res["downgraded"] = (f"no provider independent of the PR reviewer ({pr_provider}) answered; "
+                                         "security review by the PR reviewer's provider")
             res["tier"] = role_tier
             record["reviews"].append(res)
             save()

@@ -15,10 +15,21 @@ from openclaw_ecc_orchestrator.runs.store import RunStore
 
 
 class ResumeTest(S.CliTestBase):
-    def stop(self, unit_id):
+    def stop(self, unit_id, reason="escalation_stopped"):
         mgr = RunManager(RunStore(os.path.join(self.state, "runs")))
         run = mgr.load(self.RUN_ID)
-        mgr.transition(self.RUN_ID, run["lease"]["conductor_id"], unit_id, "needs_user", reason="escalation_stopped")
+        mgr.transition(self.RUN_ID, run["lease"]["conductor_id"], unit_id, "needs_user", reason=reason)
+
+    def test_a_stalled_team_review_resumes_in_review_without_recoding(self):
+        """Live finding (rmcp-m0f): the code passed, but no security reviewer answered."""
+        self.create_run()
+        self.ok(self.dispatch("alpha", "alpha.txt=a"))
+        head = self.unit("alpha")["verified_head"]
+        self.stop("alpha", reason="no_qualified_reviewer")
+        doc = self.ok(self.reviewed("resume", "--run-id", self.RUN_ID, "--unit", "alpha"))
+        self.assertEqual(doc["data"]["state"], "reviewing")
+        alpha = self.unit("alpha")
+        self.assertEqual((alpha["state"], alpha["attempts"], alpha["verified_head"]), ("reviewing", 1, head))
 
     def test_resume_returns_a_stopped_unit_to_ready(self):
         self.create_run()

@@ -155,5 +155,6 @@ class GeminiAdapter(ApiAdapter):
                     text += part["text"]
         usage = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
         return {"text": text, "model": data.get("modelVersion") or ctx.model, "cost_usd": None,
+                "finish_reason": ((data.get("candidates") or [{}])[0] or {}).get("finishReason"),
                 "input_tokens": usage.get("promptTokenCount"),
                 "output_tokens": usage.get("candidatesTokenCount")}

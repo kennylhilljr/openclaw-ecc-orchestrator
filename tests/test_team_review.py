@@ -68,6 +68,9 @@ class TeamBase(IntegrationBase):
         return f"Reviewed.\n{mark} {json.dumps(doc)}"
 
     def cli_override(self, role, runner, prompt):
+        if (role_of(prompt), runner) in getattr(self, "silent", ()):
+            self.calls.append((role_of(prompt), runner))
+            return [PY, "-c", "import sys; sys.exit(3)"]
         self.calls.append((role_of(prompt), runner))
         text = self.reply(role_of(prompt), self.head)
         script = ("import subprocess,sys,os\n"
@@ -82,6 +85,8 @@ class TeamBase(IntegrationBase):
         provider = "gemini" if "googleapis" in url else ("kimi" if "moonshot" in url else "groq")
         self.calls.append((role_of(prompt), provider))
         text = self.reply(role_of(prompt), self.head)
+        if (role_of(prompt), provider) in getattr(self, "silent", ()):
+            text = ""
         if provider == "gemini":
             data = {"candidates": [{"content": {"parts": [{"text": text}]}}]}
         else:
@@ -198,6 +203,19 @@ class TriggerTests(TeamBase):
         sec = self.providers("security_reviewer")
         self.assertEqual(len(sec), 1)
         self.assertNotIn(sec[0], {self.author, self.providers("pr_reviewer")[0]})
+
+    def test_security_review_falls_back_to_the_pr_reviewers_provider_when_no_one_else_answers(self):
+        """Live finding (rmcp-m0f): every independent security reviewer returned an empty reply."""
+        self.setup_unit(files=("src/security/guard.py",))
+        # Everyone but the PR reviewer (kimi here; the author is codex) fails the security turn.
+        self.silent = {("security_reviewer", p) for p in ("claude", "gemini", "groq")}
+        self.ok(self.step.run("r1", "u1"))
+        reviews = self.m.load("r1")["units"]["u1"]["annotations"]["team"]["reviews"]
+        sec = [r for r in reviews if r["role"] == "security_reviewer"][-1]
+        pr = [r for r in reviews if r["role"] == "pr_reviewer"][-1]
+        self.assertEqual((pr["provider"], self.author), ("kimi", "codex"))
+        self.assertEqual((sec["provider"], sec["verdict"]), ("kimi", "approved"))
+        self.assertIn("security review by the PR reviewer's provider", sec["downgraded"])
 
     def test_no_security_reviewer_for_ordinary_paths(self):
         self.setup_unit()

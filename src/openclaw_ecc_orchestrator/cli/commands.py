@@ -626,6 +626,9 @@ def execute_cleanup(ctx, plan):
 
 
 # == resume ==
+REVIEW_STALLS = ("no_qualified_reviewer", "no_qualified_verifier")
+
+
 def plan_resume(ctx):
     """Send a stopped unit (needs_user or failed) back to ready. Its worktree,
     attempt history and last failure (for example a reviewer's findings) are
@@ -637,6 +640,14 @@ def plan_resume(ctx):
     unit = load_unit(op, run, a.unit)
     if unit["state"] not in (S.NEEDS_USER, S.FAILED):
         fail(op, "unit_stopped", f"unit {a.unit} is {unit['state']}; resume takes a unit in needs_user or failed")
+    ann = unit.get("annotations") or {}
+    head = (ann.get("verification") or {}).get("head")
+    if unit.get("last_reason") in REVIEW_STALLS and head and unit["state"] == S.NEEDS_USER:
+        # The code passed its gates; only the team review stalled (no provider answered).
+        doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"],
+                       last_reason=unit.get("last_reason"), target=S.REVIEWING, verified_head=head)
+        return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
+                                 check("verified_head", True, head)], extra={"policy": run.get("policy")})
     ctrl = ctx.rt.conductor(run.get("policy"), op)._controller(run, a.unit)
     if ctrl is None:
         fail(op, "routing_valid", f"unit {a.unit} does not classify under the current policy")
@@ -645,7 +656,7 @@ def plan_resume(ctx):
                                   "raise budget.attempts in the plan and create a new run")
     last = ((unit.get("annotations") or {}).get("last_failure") or {}).get("reason")
     doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], last_reason=unit.get("last_reason"),
-                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action())
+                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action(), target=S.READY)
     return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
                              check("attempts_left", True, f"{len(ctrl.history)} used; next: "
                                    f"{ctrl.next_action().get('action')} at tier {ctrl.tier}")],
@@ -655,7 +666,7 @@ def plan_resume(ctx):
 def execute_resume(ctx, plan):
     doc = plan.doc
     c = ctx.rt.conductor(plan.extra["policy"], "resume")
-    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], S.READY, reason="owner_resume")
+    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], doc["target"], reason="owner_resume")
     res["operation"] = "resume"
     return res
 
