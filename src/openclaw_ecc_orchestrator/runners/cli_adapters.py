@@ -321,7 +321,9 @@ class ClaudeAdapter(CliAdapter):
     # uv and the repo CI script: units must lock, sync and run their own gates
     # (uv run executes arbitrary code, as python3 already can, so this adds no
     # new capability).
-    edit_tools = ("Read,Edit,Write,Bash(git *),Bash(python3 *),Bash(uv *),"
+    # Skill: the repository's skills (.claude/skills) and Claude Code's bundled ones
+    # (/simplify, /verify, /code-review) are part of every unit's definition of done.
+    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),"
                   "Bash(tools/ci.sh),Bash(tools/ci.sh *),Bash(./tools/ci.sh),Bash(./tools/ci.sh *)")
 
     def _base(self, model, output_format="json"):

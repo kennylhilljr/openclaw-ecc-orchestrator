@@ -32,7 +32,8 @@ ATTENTION_STATES = {S.NEEDS_USER, S.INTERRUPTED, S.BLOCKED}
 # "handoff" is deliberately absent: only record_handoff may write it, after
 # validating the document, because the verifying transition trusts it.
 ANNOTATION_KEYS = {"verification", "review", "merge", "conflicts", "notes", "escalation", "health",
-                   "last_failure", "handoff_repair", "team", "budget_grant"}
+                   "last_failure", "handoff_repair", "team", "budget_grant",
+                   "skills_pass"}
 
 
 class _Tx:

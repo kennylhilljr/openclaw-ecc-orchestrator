@@ -235,6 +235,7 @@ class Runtime:
                           (policy or {}).get("protected_commands") or ()),
                       clock=self.clock, policy=policy, certified_runners=certified, catalog=catalog,
                       tier_costs=self.tier_costs(), auto_retry=True,
-                      handoff_repair_turns=self.team(operation).get("handoff_repair_turns", 1))
+                      handoff_repair_turns=self.team(operation).get("handoff_repair_turns", 1),
+                      skills_pass=self.team(operation).get("skills_pass"))
         holder["c"] = c
         return c

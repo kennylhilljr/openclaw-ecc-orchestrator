@@ -6,11 +6,15 @@ import os
 import unittest
 
 try:
-    from ._integration import git
+    from ._integration import PY, git
+    from ._units import work_unit
     from .test_team_drive import DriveBase
+    from .test_team_review import CATALOG, CERTIFIED
 except ImportError:  # discovered as a top level module
-    from _integration import git
+    from _integration import PY, git
+    from _units import work_unit
     from test_team_drive import DriveBase
+    from test_team_review import CATALOG, CERTIFIED
 
 from openclaw_ecc_orchestrator.cli.output import render_human
 
@@ -85,6 +89,49 @@ class V5Tests(DriveBase):
         self.assertTrue(state["done"])
         self.assertEqual(git(self.repo, "show", "ecc/r1/alpha:hotfix.txt"), "hotfix")
         self.assertEqual(git(self.repo, "show", "main:a.txt"), "alpha")
+
+
+    def test_skills_pass_runs_after_a_non_claude_author_and_is_verified(self):
+        """TEAM-DELIVERY v6 4.5: Claude Code's skills run on another author's work before the gates."""
+        script = os.path.join(self.tmp, "skills.py")
+        seen = {}
+        with open(script, "w") as fh:
+            fh.write("import subprocess\n"
+                     "open('a.txt', 'a').write('simplified\\n')\n"
+                     "subprocess.run(['git', 'commit', '-qam', 'Skills pass: simplify'], check=True)\n")
+
+        def argv(prompt, path):
+            seen["prompt"] = prompt
+            return [PY, script]
+
+        c, m, _ = self.conductor("c1", certified_runners=CERTIFIED, catalog=CATALOG, auto_retry=True,
+                                 policy=self.policy, skills_pass={"runner": "claude"}, skills_pass_argv=argv)
+        self.ok(c.create_run({"units": [work_unit("alpha", files=["a.txt"], commands=[f"{PY} -c pass"])]},
+                             run_id="r1"))
+        self.ok(c.assign_unit("r1", "alpha"))
+        author = m.load("r1")["units"]["alpha"]["routing"]["runner"]
+        self.assertNotEqual(author, "claude")
+        self.ok(c.start_unit("r1", "alpha", self.argv("write", "a.txt=alpha")))
+        self.ok(c.wait_unit("r1", "alpha"))
+        unit = m.load("r1")["units"]["alpha"]
+        self.assertEqual(unit["state"], "reviewing")
+        record = unit["annotations"]["skills_pass"]
+        self.assertEqual((record["author"], record["commits"], record["status"]), (author, 1, "ran"))
+        self.assertEqual(unit["annotations"]["verification"]["head"], record["head_after"])
+        self.assertIn("/simplify, /verify and /code-review", seen["prompt"])
+        self.assertIn("a.txt", seen["prompt"])
+
+    def test_no_skills_pass_when_claude_wrote_the_unit(self):
+        c, m, _ = self.conductor("c1", certified_runners=["claude"], catalog=CATALOG, auto_retry=True,
+                                 policy=self.policy, skills_pass={"runner": "claude"},
+                                 skills_pass_argv=lambda prompt, path: self.fail("should not run"))
+        self.ok(c.create_run({"units": [work_unit("alpha", files=["a.txt"], commands=[f"{PY} -c pass"],
+                                                  routing={"initial_tier": 2, "maximum_tier": 2})]}, run_id="r1"))
+        self.ok(c.assign_unit("r1", "alpha"))
+        self.assertEqual(m.load("r1")["units"]["alpha"]["routing"]["runner"], "claude")
+        self.ok(c.start_unit("r1", "alpha", self.argv("write", "a.txt=alpha")))
+        self.ok(c.wait_unit("r1", "alpha"))
+        self.assertNotIn("skills_pass", m.load("r1")["units"]["alpha"]["annotations"])
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@ class Conductor:
                  runner_env_allow=(), protected_globs=(), clock=time.time, policy=None, certified_runners=None,
                  catalog=None, breaker=None, tier_costs=None, lease_renew_interval=10.0,
                  git_state_guard=_UNSET, health_override=None, auto_retry=False, handoff_repair_turns=0,
-                 repair_timeout=900.0):
+                 repair_timeout=900.0, skills_pass=None, skills_pass_argv=None):
         """`runner_timeout` and `gate_timeout` are optional hard wall clock
         ceilings in seconds, None (off) by default; setting them is
         discouraged because health monitoring already stops hung processes.
@@ -130,6 +130,10 @@ class Conductor:
         self.auto_retry = bool(auto_retry)
         self.handoff_repair_turns = int(handoff_repair_turns)
         self.repair_timeout = float(repair_timeout)
+        # team.json "skills_pass" (TEAM-DELIVERY v6 4.5); `skills_pass_argv(prompt, path)`
+        # replaces the Claude command line in tests.
+        self.skills_pass = dict(skills_pass) if isinstance(skills_pass, dict) else None
+        self.skills_pass_argv = skills_pass_argv
         self.dispatcher = Dispatcher(manager)
         self._handles = {}
         self._cancel_terminal = {}
@@ -467,6 +471,75 @@ class Conductor:
         return doc, missing
 
     # == unit execution ==
+    def _run_skills_pass(self, run_id, unit_id):
+        """After an attempt by an author other than the skills runner (Claude Code by
+        default), a fresh session of that runner applies the repository's build skills
+        and its own (/simplify, /verify, /code-review, /security-review for high-risk
+        units) to the unit's changes and commits fixes within scope, before the gates
+        (TEAM-DELIVERY v6 4.5). Never fails the attempt: the gates and reviewers that
+        follow judge the result; the record says what happened."""
+        cfg = self.skills_pass
+        if not cfg or cfg.get("enabled") is False:
+            return None
+        run = self.manager.load(run_id)
+        unit = run["units"][unit_id]
+        runner = cfg.get("runner", "claude")
+        author = (unit.get("routing") or {}).get("runner")
+        if not author or author == runner:
+            return None
+        path = (unit.get("workspace") or {}).get("path")
+        if not path or not os.path.isdir(path):
+            return None
+        record = {"runner": runner, "author": author, "attempt": unit.get("attempts"), "at": iso(self.clock())}
+        plan_unit = self.manager.plan_unit(run, unit_id)
+        files = list((plan_unit.get("scope") or {}).get("files") or [])
+        high = plan_unit.get("risk") == "high"
+        skills = "/simplify, /verify and /code-review" + (", then /security-review" if high else "")
+        base = git_out(["merge-base", "HEAD", f"refs/heads/{self.target}"], path)
+        prompt = (
+            f"You are the skills pass for work unit {unit_id}, written by {author}. Read AGENTS.md first. The unit's "
+            f"changes are `git diff {base[:12]}...HEAD` on this branch. Run {skills} on those changes, following the "
+            "repository skills in .agents/skills (run-research-mcp, simplify-change, verify-change, review-change"
+            + (", security-review" if high else "") + "). Fix what they find, but only in the unit's files: "
+            + ", ".join(files) + ". Run the unit's acceptance commands ("
+            + "; ".join((plan_unit.get("acceptance") or {}).get("commands") or [])
+            + ") after any fix, commit each fix on this branch with a message starting \"Skills pass:\", and never "
+            "push, switch branches or touch other files. Finish with one line: ECC_SKILLS "
+            '{"simplify": "...", "verify": "...", "code_review": "..."' + (', "security_review": "..."' if high else "")
+            + '} summarizing what each found and changed.')
+        if self.skills_pass_argv is not None:
+            argv = list(self.skills_pass_argv(prompt, path))
+            env_allow = ()
+        else:
+            from ..runners.probes import get_adapter
+            names = {c.get("runner") if isinstance(c, dict) else c for c in (self.certified_runners or [])}
+            if runner not in names:
+                record["status"] = "skipped: runner not certified"
+                self.manager.annotate_unit(run_id, self.id, unit_id, "skills_pass", record)
+                return record
+            adapter = get_adapter(runner)
+            model = (((run.get("policy") or self.policy or {}).get("cli_models") or {}).get(runner) or {}).get(
+                cfg.get("class", "standard"))
+            argv = adapter.build_invocation(prompt, model=model, cwd=path, writable=True)
+            env_allow = tuple(adapter.env_allow())
+        log_path = os.path.join(self.log_root, run_id, f"{unit_id}-skills-attempt{unit.get('attempts')}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        before = git_out(["rev-parse", "HEAD"], path)
+        res = self.supervisor.run(list(argv), cwd=path, env_allow=env_allow, log_path=log_path,
+                                  timeout=float(cfg.get("timeout_minutes", 30)) * 60)
+        after = git_out(["rev-parse", "HEAD"], path)
+        leftovers = git_out(["status", "--porcelain"], path)
+        if leftovers:
+            # Uncommitted edits from the pass are kept aside, never discarded and never verified.
+            run_git(["stash", "push", "--include-untracked", "-m", f"skills pass leftovers {unit_id}"], path,
+                    check=False)
+        record.update(status="ran" if res.get("exit_code") == 0 else f"exit {res.get('exit_code')}",
+                      head_before=before, head_after=after,
+                      commits=int(git_out(["rev-list", "--count", f"{before}..{after}"], path) or 0),
+                      leftovers_stashed=bool(leftovers), log_path=log_path)
+        self.manager.annotate_unit(run_id, self.id, unit_id, "skills_pass", record)
+        return record
+
     def _sync_with_target(self, path):
         """Bring the target's current tip into an existing unit worktree before an
         attempt (TEAM-DELIVERY v5 section 4.4). Returns a note for the runner's
@@ -841,6 +914,7 @@ class Conductor:
                 self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="handoff_invalid")
                 self._record_outcome(run_id, unit_id, False, False, "handoff_invalid", cost)
             return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), True
+        self._run_skills_pass(run_id, unit_id)
         return self._verify(run_id, unit_id, data, cost), True
 
     def _verify(self, run_id, unit_id, data, cost=0.0):

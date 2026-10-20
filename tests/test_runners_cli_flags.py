@@ -55,6 +55,7 @@ class ClaudeFlagTests(unittest.TestCase):
         self.assertIn("Bash(git *)", tools)
         self.assertIn("Bash(python3 *)", tools)
         self.assertIn("Bash(uv *)", tools)
+        self.assertIn("Skill", tools.split(","))  # repository and bundled skills (TEAM-DELIVERY v6 4.5)
         self.assertIn("Bash(tools/ci.sh *)", tools)
         self.assertNotIn("Bash(*)", tools)
         self.assertNotIn("bypassPermissions", argv)
