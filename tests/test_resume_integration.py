@@ -110,12 +110,19 @@ class ResumeIntegrationTest(H.IntegrationBase):
         self.assertEqual(m1.load(run_id)["units"]["alpha"]["state"], "merged")
         self.assertEqual(git(self.repo, "show", "main:README.md"), "alpha")
 
-        # gamma can run now; it branched from the run base, so it conflicts at merge.
+        # gamma can run now. It branches from main's tip, so it already has alpha's work
+        # (live finding, rmcp-m0f); a change that lands on main while gamma is in flight
+        # makes it conflict at merge.
         res = self.ok(d1.dispatch(run_id, "conductor-1", ["w1"]))
         self.assertEqual(res["data"]["assigned"], [{"unit_id": "gamma", "worker_id": "w1"}])
         self.ok(c1.start_unit(run_id, "gamma", self.write("README.md=gamma", "docs/gamma.md=g")))
         self.ok(c1.wait_unit(run_id, "gamma"))
-        pairs = predict_changed_conflicts(self.repo, base, {"alpha": "ecc/run1/alpha", "gamma": "ecc/run1/gamma"})
+        gamma_base = m1.load(run_id)["units"]["gamma"]["workspace"]["base_commit"]
+        self.assertEqual(gamma_base, git(self.repo, "rev-parse", "main"))
+        with open(os.path.join(self.repo, "README.md"), "w") as fh:
+            fh.write("hotfix")
+        git(self.repo, "commit", "-qam", "hotfix on main")
+        pairs = predict_changed_conflicts(self.repo, gamma_base, {"main": "main", "gamma": "ecc/run1/gamma"})
         self.assertEqual(pairs[0]["files"], ["README.md"])
         decision = self.approve(c1, run_id, "gamma")
         self.ok(c1.enqueue_merge(run_id, "gamma", self.ok(c1.broker.resolve(decision))["data"]))

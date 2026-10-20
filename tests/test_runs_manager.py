@@ -288,6 +288,14 @@ class BudgetTests(ManagerBase):
         self.assertEqual(self.mgr.load(run_id)["units"]["a"]["state"], "needs_user")
         self.assertEqual(res["required_user_actions"][0]["kind"], "budget_exhausted")
 
+    def test_owner_grant_extends_attempt_budget(self):
+        run_id = self.create([unit("a", budget={"attempts": 1})])
+        self.drive(run_id, "a", ["assigned", "running", "failed", "ready"])
+        self.mgr.annotate_unit(run_id, "c1", "a", "budget_grant", {"attempts": 1})
+        res = self.mgr.assign_unit(run_id, "c1", "a", "w1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.mgr.load(run_id)["units"]["a"]["attempts"], 2)
+
     def test_minutes_budget_is_advisory(self):
         run_id = self.create([unit("a", budget={"minutes": 10})])
         self.drive(run_id, "a", ["assigned", "running"])

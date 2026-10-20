@@ -194,7 +194,7 @@ class TeamStep:
         ws = unit["workspace"]
         verification = (unit.get("annotations") or {}).get("verification") or {}
         head = verification.get("head")
-        base = ws["base_commit"]
+        base = verification.get("base_commit") or ws["base_commit"]
         punit = c.manager.plan_unit(run, unit_id)
         repo = c.worktrees.repo
         stats = diff_stats(repo, head, base)

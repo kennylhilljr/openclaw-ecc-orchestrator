@@ -115,6 +115,9 @@ class DriveTests(DriveBase):
         self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
         self.assertEqual({u["state"] for u in self.m.load("r1")["units"].values()}, {"merged"})
         self.assertEqual(git(self.repo, "show", "main:b.txt"), "beta")
+        # Live finding (rmcp-m0f): a dependent unit branches from main after its dependency merged.
+        beta_base = self.m.load("r1")["units"]["beta"]["workspace"]["base_commit"]
+        self.assertEqual(git(self.repo, "show", f"{beta_base}:a.txt"), "alpha")
         self.assertTrue(os.path.isfile(res["data"]["report"]))
         roles = [r for r, _ in self.calls]
         self.assertEqual(roles[0], "plan_check")

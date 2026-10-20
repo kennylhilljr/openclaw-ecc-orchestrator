@@ -475,7 +475,11 @@ class Conductor:
             return envelope(op, ok=False, checks=[check("unit_assigned", False, unit["state"] if unit else "unknown")])
         paths = self.worktrees.paths(run_id, unit_id)
         if not os.path.isdir(paths["path"]):
-            base = (run.get("metadata") or {}).get("base_commit") or self.target
+            # Branch from the target's current tip: a unit becomes ready only after its
+            # dependencies merged there, so the run's starting commit would leave them out
+            # (live finding, rmcp-m0f: M0-08 started without M0-01 and M0-03).
+            base = self.target if rev_exists(self.worktrees.repo, f"refs/heads/{self.target}") \
+                else (run.get("metadata") or {}).get("base_commit") or self.target
             created = self.worktrees.create(run_id, unit_id, base_ref=base, owner=unit["owner"])
             if not created["ok"]:
                 return created
@@ -815,7 +819,13 @@ class Conductor:
             return envelope(op, ok=False, checks=[check("work_committed", False, dirty.splitlines()[0])], data=data)
         verification = self.gate(plan_unit, workspace["path"], run_id=run_id)
         gates_passed = bool(verification["passed"])
-        stats = diff_stats(self.worktrees.repo, workspace["branch"], workspace["base_commit"])
+        # A dependency may merge after this worktree was created.  Verify the
+        # unit against the newest target commit it has incorporated, not the
+        # worktree's creation point, or inherited dependency files look like
+        # out-of-scope changes owned by this unit.
+        base = git_out(["merge-base", workspace["branch"], self.target], self.worktrees.repo)
+        stats = diff_stats(self.worktrees.repo, workspace["branch"], base)
+        verification["base_commit"] = base
         verification["head"] = git_out(["rev-parse", "HEAD"], workspace["path"])
         verification["changed_files"] = stats["files"]
         verification["diff_stats"] = {k: stats[k] for k in ("files_changed", "lines_added", "lines_removed")}
@@ -871,7 +881,9 @@ class Conductor:
         head = (unit["annotations"].get("verification") or {}).get("head")
         if not head:
             return envelope(op, ok=False, checks=[check("verified_head_recorded", False)])
-        stats = diff_stats(self.worktrees.repo, head, unit["workspace"]["base_commit"])
+        base = (unit["annotations"].get("verification") or {}).get("base_commit") \
+            or unit["workspace"]["base_commit"]
+        stats = diff_stats(self.worktrees.repo, head, base)
         classification = self._classify(run, unit_id, stats)
         chosen = select_reviewer(unit.get("routing") or {}, classification, self.certified_runners or [],
                                  self.catalog, self.policy, breaker=self.breaker, now=self.clock())
@@ -935,7 +947,9 @@ class Conductor:
                       check("branch_matches_verified_head", bool(head) and tip == head, f"tip={tip}")]
             if not all(c["ok"] for c in checks):
                 return envelope(op, ok=False, checks=checks)
-            stats = diff_stats(self.worktrees.repo, head, unit["workspace"]["base_commit"])
+            base = (unit["annotations"].get("verification") or {}).get("base_commit") \
+                or unit["workspace"]["base_commit"]
+            stats = diff_stats(self.worktrees.repo, head, base)
             classification = self._classify(run, unit_id, stats)
             sufficient, reasons = review_satisfies(review, routing, classification, self.certified_runners,
                                                    self.catalog, self.policy, breaker=self.breaker, now=self.clock())
