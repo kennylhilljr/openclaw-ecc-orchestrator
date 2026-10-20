@@ -29,7 +29,7 @@ DEFAULTS = {
                       "cost_cap_usd_per_turn": 1.50},
         "designer": {"class": "standard", "images": True, "panel": ["gemini", "codex", "claude"],
                      "when_paths": [], "cost_cap_usd_per_turn": 0.50},
-        "delivery_lead": {"class": "economical", "panel": ["gemini", "groq", "kimi", "codex", "claude"],
+        "delivery_lead": {"class": "standard", "panel": ["gemini", "groq", "kimi", "codex", "claude"],
                           "when": ["budget_stop", "milestone_end"], "cost_cap_usd_per_turn": 0.25},
         "product_owner": {"class": "advanced", "pair": True, "panel": ["kimi", "codex", "claude"],
                           "at": "milestone_end", "cost_cap_usd_per_turn": 2.00},
