@@ -93,7 +93,7 @@ class Conductor:
                  runner_env_allow=(), protected_globs=(), clock=time.time, policy=None, certified_runners=None,
                  catalog=None, breaker=None, tier_costs=None, lease_renew_interval=10.0,
                  git_state_guard=_UNSET, health_override=None, auto_retry=False, handoff_repair_turns=0,
-                 repair_timeout=900.0, skills_pass=None, skills_pass_argv=None):
+                 repair_timeout=900.0, skills_pass=None, skills_pass_argv=None, lessons_state_dir=None):
         """`runner_timeout` and `gate_timeout` are optional hard wall clock
         ceilings in seconds, None (off) by default; setting them is
         discouraged because health monitoring already stops hung processes.
@@ -134,6 +134,8 @@ class Conductor:
         # replaces the Claude command line in tests.
         self.skills_pass = dict(skills_pass) if isinstance(skills_pass, dict) else None
         self.skills_pass_argv = skills_pass_argv
+        # TEAM-DELIVERY v7 4.6: failures and coders' `Lesson:` notes feed the run's lessons log.
+        self.lessons_state_dir = lessons_state_dir
         self.dispatcher = Dispatcher(manager)
         self._handles = {}
         self._cancel_terminal = {}
@@ -389,8 +391,21 @@ class Conductor:
         return envelope(op, ok=True, changed=True, checks=[check("returned_to_coder", True, reason)],
                         data={"next_action": nxt})
 
+    def _lessons(self, run_id):
+        if not self.lessons_state_dir:
+            return None
+        from ..team.learning import Lessons
+        return Lessons(self.lessons_state_dir, run_id)
+
     def _note_failure(self, run_id, unit_id, reason, evidence, fix=None):
         """Record what the next attempt needs to know (`last_failure`)."""
+        log = self._lessons(run_id)
+        if log is not None:
+            from ..team.learning import capture_failure
+            try:
+                capture_failure(log, unit_id, reason, evidence, at=iso(self.clock()))
+            except OSError:
+                pass
         try:
             unit = self.manager.load(run_id)["units"][unit_id]
             self.manager.annotate_unit(run_id, self.id, unit_id, "last_failure", {
@@ -897,6 +912,13 @@ class Conductor:
             self._record_outcome(run_id, unit_id, False, False, missing, cost)
             return envelope(op, ok=False, changed=True, checks=[check("handoff_valid", False, missing)],
                             data=data), True
+        log = self._lessons(run_id)
+        if log is not None and isinstance(doc, dict):
+            from ..team.learning import capture_handoff
+            try:
+                capture_handoff(log, unit_id, doc, at=iso(self.clock()))
+            except OSError:
+                pass
         res = self.manager.record_handoff(run_id, self.id, unit_id, doc, head=head)
         data["handoff"] = (res.get("data") or {}).get("handoff")
         if not res["ok"]:

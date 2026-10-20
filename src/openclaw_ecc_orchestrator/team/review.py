@@ -17,6 +17,7 @@ from ..worktrees.git import git_out, run_git
 from . import config as TC
 from . import evidence as E
 from . import invoke as I
+from . import learning as L
 from . import personas as P
 from .rotation import Rotation
 
@@ -154,6 +155,7 @@ class TeamStep:
                       "cost_usd": turn.get("cost_usd"), "skipped": skipped_all, "at": iso(self.clock())}
             if verdict is not None:
                 record.update(verdict=verdict["verdict"], findings=verdict.get("findings"),
+                              lessons=verdict.get("lessons"),
                               checks=verdict.get("checks"), downgraded=verdict.get("downgraded"))
                 return record
             if problem.startswith("runner error"):
@@ -240,6 +242,7 @@ class TeamStep:
                 pack_tokens=tokens, head=head, cwd_fn=same_dir, writable=False, timeout=1800.0)
             res["tier"] = role_tier
             record["reviews"].append(res)
+            L.capture_verdict(L.Lessons(self.state_dir, run_id), unit_id, res, at=iso(self.clock()))
             save()
             if role == "pr_reviewer":
                 pr_provider = res.get("provider")
@@ -258,6 +261,7 @@ class TeamStep:
             pack_tokens=0, head=head, cwd_fn=lambda: self._scratch(repo, head, run_id, unit_id), writable=True,
             timeout=float(vspec.get("timeout_minutes", 30)) * 60, require_kind="coding_cli")
         record["verification"] = vres
+        L.capture_verdict(L.Lessons(self.state_dir, run_id), unit_id, vres, at=iso(self.clock()))
         save()
         if vres.get("verdict") is None:
             return c._needs_user(run_id, unit_id, "no_qualified_verifier",

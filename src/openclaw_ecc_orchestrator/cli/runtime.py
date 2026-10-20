@@ -236,6 +236,7 @@ class Runtime:
                       clock=self.clock, policy=policy, certified_runners=certified, catalog=catalog,
                       tier_costs=self.tier_costs(), auto_retry=True,
                       handoff_repair_turns=self.team(operation).get("handoff_repair_turns", 1),
-                      skills_pass=self.team(operation).get("skills_pass"))
+                      skills_pass=self.team(operation).get("skills_pass"),
+                      lessons_state_dir=self.cfg.state_dir)
         holder["c"] = c
         return c

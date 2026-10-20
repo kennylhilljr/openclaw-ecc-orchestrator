@@ -19,6 +19,7 @@ from ..runs.store import iso
 from ..worktrees.git import git_out, run_git
 from . import config as TC
 from . import evidence as E
+from . import learning as L
 from . import personas as P
 
 PRODUCT_MARK = "ECC_PRODUCT"
@@ -123,6 +124,7 @@ class Drive:
         self.gate_runner = gate_runner
         self.state_path = os.path.join(step.state_dir, "team", f"{run_id}-drive.json")
         self.state = self._load()
+        self.steward = L.Steward(self)
 
     # == persistence ==
     def _load(self):
@@ -243,8 +245,10 @@ class Drive:
                 self.c._controllers.pop((self.run_id, uid), None)
                 m.transition(self.run_id, self.c.id, uid, S.READY, reason=f"retry:heal_{reason}")
                 healed.append((uid, f"{reason}: delivery lead granted one more attempt"))
+        log = L.Lessons(self.step.state_dir, self.run_id)
         for uid, what in healed:
             self.progress(f"{uid}: {what}")
+            log.add(source="drive", role="delivery_lead", unit=uid, what=f"healed: {what}", at=iso(self.clock()))
         self.state.setdefault("heal_log", []).extend(
             {"unit": uid, "action": what, "at": iso(self.clock())} for uid, what in healed)
         if healed:
@@ -320,6 +324,8 @@ class Drive:
                 return self._stop("drive_cost_ceiling", f"spent {self.spent(run) - baseline} USD")
             if self.max_seconds is not None and self.clock() - started > self.max_seconds:
                 return self._stop("drive_time_ceiling", f"ran {int(self.clock() - started)} s")
+            if self.steward.due():
+                self.steward.run()
             acted = False
             for uid in order:
                 if uid in refused:
@@ -397,8 +403,12 @@ class Drive:
         base = self.base_commit(run)
         head = git_out(["rev-parse", f"refs/heads/{self.c.target}"], repo)
         milestone = self.cfg.get("milestone") or {}
+        if self.steward.due(final=True):
+            self.progress("milestone end: practices steward")
+            self.steward.run(final=True)
+            head = git_out(["rev-parse", f"refs/heads/{self.c.target}"], repo)
         report = {"run_id": self.run_id, "milestone": milestone.get("name"), "head": head, "base": base,
-                  "at": iso(self.clock())}
+                  "at": iso(self.clock()), "practices": (self.state.get("learning") or {}).get("runs") or []}
         if "milestone_end" in (self.cfg["roles"]["architect"].get("when") or []) and not self.state.get("drift"):
             stat, diff = E.diff_text(repo, base, head)
             refs = E.design_references(repo, " ".join(str(u.get("description") or "") for u in run["plan"]["units"]))
@@ -549,6 +559,17 @@ class Drive:
         lines += ["", "## Retrospective", ""] + [f"- {f.get('what')}" for f in
                                                   ((retro.get("narrative") or {}).get("findings") or [])]
         lines += ["", "```json", json.dumps(retro.get("table"), indent=1, default=str), "```", ""]
+        lines += ["## Practices learned during the milestone", ""]
+        practices = report.get("practices") or []
+        if not practices:
+            lines.append("- No practice changes.")
+        for r in practices:
+            lines.append(f"- Pass {r.get('n')}: {r.get('status')}; applied {', '.join(r.get('applied') or []) or 'none'}"
+                         f"; proposed for the owner {', '.join(r.get('proposed') or []) or 'none'}"
+                         + (f"; commit `{r['merged_commit'][:12]}`" if r.get("merged_commit") else ""))
+        ledger = L.settings(self.cfg)["ledger"]
+        lines += ["", f"Lessons log: `{L.Lessons(self.step.state_dir, self.run_id).path}`; ledger in the repository: "
+                      f"`{ledger}` (its \"Proposed for the owner\" section lists what needs your decision).", ""]
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
         atomic_write_json(path[:-3] + ".json", report)
