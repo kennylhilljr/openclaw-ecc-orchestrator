@@ -291,8 +291,9 @@ class Drive:
             if res.get("provider"):
                 used.add(res["provider"])
         report["product"] = verdicts
-        accepted = len(verdicts) >= 1 and all(v.get("verdict") == "accept" for v in verdicts) \
-            and len({v.get("provider") for v in verdicts}) == len(verdicts)
+        # Two product owner personas in separate sessions; different providers are
+        # preferred, not required (independence is the persona, owner decision 2026-10-19).
+        accepted = len(verdicts) >= 1 and all(v.get("verdict") == "accept" for v in verdicts)
         report["verdict"] = "accept" if accepted else "reject"
         path = self.write_report(report)
         if not accepted:
@@ -301,29 +302,49 @@ class Drive:
                         data={"report": path, "summary": self.summary(), "verdict": "accept"})
 
     def _consult_product(self, pack, head, exclude):
+        """One product owner verdict. Providers not yet used are tried first; a
+        provider that errors is skipped, never counted as a reject; if no other
+        provider answers, a used one plays the persona again in a new session."""
         role = "product_owner"
         cls = TC.role_class(self.cfg, role)
         candidates = self.step.candidates(TC.CLASS_TIER[cls], "low", None, None, False)
         rotation = self.step.rotation(self.run_id)
         panel = TC.panel_for(self.cfg, role, cls)
-        choice, skipped = rotation.choose(role, panel, candidates, exclude=set(exclude))
-        if choice is None:
-            return {"role": role, "provider": None, "verdict": None, "skipped": skipped}
-        turn = self.step._turn(role, choice, product_prompt(pack, head), self.c.worktrees.repo, False, self.run_id,
-                               "_milestone", 1800.0)
-        doc, problem = parse_product(turn.get("text"), head)
-        if doc is None and not turn.get("error"):
-            again = f"Your previous reply could not be used: {problem}. Reply again.\n\n" + product_prompt(pack, head)
-            turn = self.step._turn(role, choice, again, self.c.worktrees.repo, False, self.run_id, "_milestone",
-                                   1800.0)
-            doc, problem = parse_product(turn.get("text"), head)
-        out = {"role": role, "provider": choice["runner"], "model": turn.get("model") or choice["model"]}
-        if doc is None:
-            out.update(verdict="reject", problem=problem or turn.get("error"))
-        else:
-            out.update(verdict=doc["verdict"], criteria=doc["criteria"], findings=doc.get("findings"),
-                       downgraded=doc.get("downgraded"))
-        return out
+        skipped_all = []
+        for avoid in (set(exclude), set()):
+            tried = set()
+            for _ in range(max(1, len(panel))):
+                pool = [c for c in candidates if c["runner"] not in tried]
+                choice, skipped = rotation.choose(role, panel, pool, exclude=avoid)
+                skipped_all += [{"provider": p, "reason": r} for p, r in skipped]
+                if choice is None:
+                    break
+                tried.add(choice["runner"])
+                turn = self.step._turn(role, choice, product_prompt(pack, head), self.c.worktrees.repo, False,
+                                       self.run_id, "_milestone", 1800.0)
+                if turn.get("error"):
+                    skipped_all.append({"provider": choice["runner"], "reason": f"runner error: {turn['error']}"})
+                    continue
+                doc, problem = parse_product(turn.get("text"), head)
+                if doc is None:
+                    again = (f"Your previous reply could not be used: {problem}. Reply again.\n\n"
+                             + product_prompt(pack, head))
+                    turn = self.step._turn(role, choice, again, self.c.worktrees.repo, False, self.run_id,
+                                           "_milestone", 1800.0)
+                    if turn.get("error"):
+                        skipped_all.append({"provider": choice["runner"],
+                                            "reason": f"runner error: {turn['error']}"})
+                        continue
+                    doc, problem = parse_product(turn.get("text"), head)
+                out = {"role": role, "provider": choice["runner"], "model": turn.get("model") or choice["model"],
+                       "skipped": skipped_all, "independence": "provider" if avoid or not exclude else "persona"}
+                if doc is None:
+                    out.update(verdict="reject", problem=problem)
+                else:
+                    out.update(verdict=doc["verdict"], criteria=doc["criteria"], findings=doc.get("findings"),
+                               downgraded=doc.get("downgraded"))
+                return out
+        return {"role": role, "provider": None, "verdict": None, "skipped": skipped_all}
 
     def retro_table(self, run):
         units = {}

@@ -204,18 +204,19 @@ class TriggerTests(TeamBase):
         self.assertEqual(len(sec), 1)
         self.assertNotIn(sec[0], {self.author, self.providers("pr_reviewer")[0]})
 
-    def test_security_review_falls_back_to_the_pr_reviewers_provider_when_no_one_else_answers(self):
-        """Live finding (rmcp-m0f): every independent security reviewer returned an empty reply."""
+    def test_independence_is_the_persona_not_the_provider(self):
+        """Owner decision (rmcp-m0f): when no other provider answers, a provider already playing the
+        author or PR reviewer plays the security reviewer persona in its own session; nothing blocks."""
         self.setup_unit(files=("src/security/guard.py",))
-        # Everyone but the PR reviewer (kimi here; the author is codex) fails the security turn.
         self.silent = {("security_reviewer", p) for p in ("claude", "gemini", "groq")}
         self.ok(self.step.run("r1", "u1"))
         reviews = self.m.load("r1")["units"]["u1"]["annotations"]["team"]["reviews"]
-        sec = [r for r in reviews if r["role"] == "security_reviewer"][-1]
         pr = [r for r in reviews if r["role"] == "pr_reviewer"][-1]
-        self.assertEqual((pr["provider"], self.author), ("kimi", "codex"))
-        self.assertEqual((sec["provider"], sec["verdict"]), ("kimi", "approved"))
-        self.assertIn("security review by the PR reviewer's provider", sec["downgraded"])
+        sec = [r for r in reviews if r["role"] == "security_reviewer"][-1]
+        self.assertEqual(pr["independence"], "provider")
+        self.assertEqual(sec["verdict"], "approved")
+        self.assertIn(sec["provider"], {self.author, pr["provider"]})
+        self.assertEqual(sec["independence"], "persona")
 
     def test_no_security_reviewer_for_ordinary_paths(self):
         self.setup_unit()

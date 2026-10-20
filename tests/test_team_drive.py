@@ -57,6 +57,8 @@ class DriveBase(TeamBase):
     def cli_override(self, role, runner, prompt):
         r = self.role_of_prompt(prompt)
         self.calls.append((r, runner))
+        if (r, runner) in getattr(self, "silent", ()):
+            return [PY, "-c", "import sys; sys.exit(3)"]
         text = self.reply(r, None)
         return [PY, "-c", f"print({json.dumps(text)})"]
 
@@ -67,7 +69,7 @@ class DriveBase(TeamBase):
         provider = "gemini" if "googleapis" in url else ("kimi" if "moonshot" in url else "groq")
         r = self.role_of_prompt(prompt)
         self.calls.append((r, provider))
-        text = self.reply(r, None)
+        text = "" if (r, provider) in getattr(self, "silent", ()) else self.reply(r, None)
         data = {"candidates": [{"content": {"parts": [{"text": text}]}}]} if provider == "gemini" else \
             {"choices": [{"message": {"content": text}}]}
         return HttpResponse(200, json.dumps(data))
@@ -138,6 +140,15 @@ class DriveTests(DriveBase):
         self.assertNotEqual(owners[0], owners[1])
         with open(res["data"]["report"]) as fh:
             self.assertIn("Verdict: **reject**", fh.read())
+
+    def test_product_owner_pair_proceeds_on_one_provider(self):
+        """Owner decision (rmcp-m0f): a silent provider is skipped, not a reject, and the pair may share
+        a provider as two personas in separate sessions."""
+        self.silent = {("product_owner", p) for p in ("claude", "codex", "gemini", "groq")}
+        res = self.make(self.units2()).go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        owners = [p for r, p in self.calls if r == "product_owner" and (r, p) not in self.silent]
+        self.assertEqual(owners, ["kimi", "kimi"])
 
     def test_at_td_13_cost_ceiling_stops_cleanly(self):
         """AT-TD-13: the drive stops at its cost ceiling."""

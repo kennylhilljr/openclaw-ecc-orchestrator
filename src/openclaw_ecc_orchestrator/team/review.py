@@ -129,6 +129,24 @@ class TeamStep:
         return {"role": role, "provider": None, "verdict": None, "skipped": skipped_all,
                 "problem": "no eligible provider produced a verdict"}
 
+    def _play_preferring_other_providers(self, role, mark, prompt_fn, *, avoid, strict_candidates,
+                                         open_candidates, **kw):
+        """Independence is the persona and the fresh session, not the provider
+        (owner decision, 2026-10-19). Other providers are tried first for
+        diversity; if none of them produces a verdict, any provider eligible for
+        the role's class plays the persona in its own session. The record says
+        which kind of independence the verdict has."""
+        res = self._play(role, mark, prompt_fn, candidates=strict_candidates, exclude=set(avoid), **kw)
+        if res.get("verdict") is not None:
+            res["independence"] = "provider"
+            return res
+        first = res.get("skipped") or []
+        res = self._play(role, mark, prompt_fn, candidates=open_candidates, exclude=set(), **kw)
+        res["skipped"] = first + (res.get("skipped") or [])
+        if res.get("verdict") is not None:
+            res["independence"] = "persona"
+        return res
+
     # == the step ==
     def run(self, run_id, unit_id):
         op = "team.review"
@@ -175,30 +193,15 @@ class TeamStep:
             cls = TC.role_class(self.cfg, role, tier)
             role_tier = max(TC.CLASS_TIER[cls], tier if role == "pr_reviewer" else 0)
             cls = {0: "economical", 1: "standard", 2: "advanced"}[role_tier]
-            exclude = {author} if author else set()
+            avoid = {author} if author else set()
             if role == "security_reviewer" and pr_provider:
-                exclude.add(pr_provider)
-            res = self._play(role, P.REVIEW_MARK, lambda r=role: P.review_prompt(r, pack, head),
-                             run_id=run_id, unit_id=unit_id, rotation=rotation,
-                             panel=TC.panel_for(self.cfg, role, cls),
-                             candidates=self.candidates(role_tier, classification.risk, author, author_family, strict),
-                             exclude=exclude, pack_tokens=tokens, head=head, cwd_fn=same_dir, writable=False,
-                             timeout=1800.0)
-            if res.get("verdict") is None and role == "security_reviewer" and pr_provider in exclude:
-                # No provider independent of the PR reviewer answered. Independence from the
-                # author stays absolute; independence from the PR reviewer yields, on the record.
-                skipped = res.get("skipped") or []
-                res = self._play(role, P.REVIEW_MARK, lambda r=role: P.review_prompt(r, pack, head),
-                                 run_id=run_id, unit_id=unit_id, rotation=rotation,
-                                 panel=TC.panel_for(self.cfg, role, cls),
-                                 candidates=self.candidates(role_tier, classification.risk, author, author_family,
-                                                            strict),
-                                 exclude={author} if author else set(), pack_tokens=tokens, head=head,
-                                 cwd_fn=same_dir, writable=False, timeout=1800.0)
-                res["skipped"] = skipped + (res.get("skipped") or [])
-                if res.get("verdict") is not None:
-                    res["downgraded"] = (f"no provider independent of the PR reviewer ({pr_provider}) answered; "
-                                         "security review by the PR reviewer's provider")
+                avoid.add(pr_provider)
+            res = self._play_preferring_other_providers(
+                role, P.REVIEW_MARK, lambda r=role: P.review_prompt(r, pack, head), avoid=avoid,
+                strict_candidates=self.candidates(role_tier, classification.risk, author, author_family, strict),
+                open_candidates=self.candidates(role_tier, classification.risk, None, None, False),
+                run_id=run_id, unit_id=unit_id, rotation=rotation, panel=TC.panel_for(self.cfg, role, cls),
+                pack_tokens=tokens, head=head, cwd_fn=same_dir, writable=False, timeout=1800.0)
             res["tier"] = role_tier
             record["reviews"].append(res)
             save()
@@ -211,12 +214,13 @@ class TeamStep:
 
         vspec = self.cfg["roles"]["verifier"]
         vtier = TC.CLASS_TIER[TC.role_class(self.cfg, "verifier")]
-        vres = self._play("verifier", P.VERIFY_MARK, lambda: P.verify_prompt(pack, head), run_id=run_id,
-                          unit_id=unit_id, rotation=rotation, panel=TC.panel_for(self.cfg, "verifier", None),
-                          candidates=self.candidates(vtier, classification.risk, author, author_family, False),
-                          exclude={author} if author else set(), pack_tokens=0, head=head,
-                          cwd_fn=lambda: self._scratch(repo, head, run_id, unit_id), writable=True,
-                          timeout=float(vspec.get("timeout_minutes", 30)) * 60, require_kind="coding_cli")
+        vres = self._play_preferring_other_providers(
+            "verifier", P.VERIFY_MARK, lambda: P.verify_prompt(pack, head), avoid={author} if author else set(),
+            strict_candidates=self.candidates(vtier, classification.risk, author, author_family, False),
+            open_candidates=self.candidates(vtier, classification.risk, None, None, False),
+            run_id=run_id, unit_id=unit_id, rotation=rotation, panel=TC.panel_for(self.cfg, "verifier", None),
+            pack_tokens=0, head=head, cwd_fn=lambda: self._scratch(repo, head, run_id, unit_id), writable=True,
+            timeout=float(vspec.get("timeout_minutes", 30)) * 60, require_kind="coding_cli")
         record["verification"] = vres
         save()
         if vres.get("verdict") is None:
