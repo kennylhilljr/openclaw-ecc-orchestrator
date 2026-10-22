@@ -623,7 +623,7 @@ def execute_cleanup(ctx, plan):
 
 
 # == resume ==
-REVIEW_STALLS = ("no_qualified_reviewer", "no_qualified_verifier")
+REVIEW_STALLS = ("no_qualified_reviewer", "no_qualified_verifier", "verifier_inconclusive")
 
 
 def plan_resume(ctx):

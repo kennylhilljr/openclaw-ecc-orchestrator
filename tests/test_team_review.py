@@ -181,6 +181,42 @@ class ReviewFlowTests(TeamBase):
         self.assertTrue(verify_line and verify_line[0].endswith("HEAD"), lines)
         self.assertNotIn("_verify", git(self.repo, "worktree", "list"), "the throwaway checkout is removed")
 
+    @staticmethod
+    def _blocked(head):
+        doc = {"verdict": "fail", "head": head, "findings": [],
+               "checks": [{"what": "tests", "how": "uv run pytest", "expected": "pass",
+                           "actual": "hatchling fetch failed: no network", "ok": False,
+                           "blocked": "no network in the sandbox"},
+                          {"what": "api", "how": "direct calls", "expected": "y", "actual": "y", "ok": True}]}
+        return f"{P.VERIFY_MARK} {json.dumps(doc)}"
+
+    def test_verifier_blocked_by_its_environment_does_not_cost_an_attempt(self):
+        """Live finding (rm-m0b M0-02, 2026-10-22): the verifier could not run the acceptance commands (no
+        network), said so, and the unit went back to the coder nine times. ECC's own gates had passed on the
+        same head, so the verdict is inconclusive and the unit goes on to approval."""
+        self.setup_unit()
+        self.replies["verifier"] = [self._blocked]
+        attempts = self.unit()["attempts"]
+        self.ok(self.step.run("r1", "u1"))
+        u = self.unit()
+        self.assertEqual(u["state"], "merged")
+        self.assertEqual(u["attempts"], attempts)
+        vres = u["annotations"]["team"]["verification"]
+        self.assertEqual(vres["verdict"], "inconclusive")
+        self.assertIn("ECC gates passed", vres["accepted"])
+
+    def test_inconclusive_verifier_without_passed_gates_stops_for_the_owner(self):
+        self.setup_unit()
+        verification = dict(self.unit()["annotations"]["verification"], passed=False)
+        self.m.annotate_unit("r1", self.c.id, "u1", "verification", verification)
+        self.replies["verifier"] = [self._blocked]
+        attempts = self.unit()["attempts"]
+        self.step.run("r1", "u1")
+        u = self.unit()
+        self.assertEqual(u["state"], "needs_user")
+        self.assertEqual(u["last_reason"], "verifier_inconclusive")
+        self.assertEqual(u["attempts"], attempts)
+
     def test_at_td_08_agents_approve_and_merge(self):
         """AT-TD-08: approving review and verification on the same head merge without operator input."""
         self.setup_unit()
@@ -315,6 +351,23 @@ class ApiPersonaTests(TeamBase):
                                 '"findings": [{"severity": "blocker", "what": "x"}]}', P.REVIEW_MARK, head)
         self.assertEqual(ok["verdict"], "changes_requested")
         self.assertIsNone(P.parse_verdict("no line", P.REVIEW_MARK, head)[0])
+
+    def test_verify_parser_separates_blocked_checks_from_failed_ones(self):
+        head = "a" * 40
+
+        def verdict(value, *checks):
+            line = json.dumps({"verdict": value, "head": head, "checks": list(checks)})
+            return P.parse_verdict(f"{P.VERIFY_MARK} {line}", P.VERIFY_MARK, head)[0]["verdict"]
+
+        blocked = {"what": "t", "ok": False, "blocked": "no network"}
+        passed, failed = {"what": "a", "ok": True}, {"what": "b", "ok": False}
+        self.assertEqual(verdict("fail", blocked, passed), "inconclusive")
+        self.assertEqual(verdict("pass", blocked, passed), "inconclusive")
+        self.assertEqual(verdict("inconclusive", passed), "inconclusive")
+        self.assertEqual(verdict("fail", blocked, failed), "fail")
+        self.assertEqual(verdict("inconclusive", blocked, failed), "fail")
+        self.assertEqual(verdict("pass", passed), "pass")
+        self.assertEqual(verdict("fail", passed), "fail")
 
 
 if __name__ == "__main__":

@@ -270,6 +270,18 @@ class TeamStep:
             ev = R.failure_evidence("verification_failed", verification={
                 "verdict": "fail", "checks": vres.get("checks"), "findings": vres.get("findings")})
             return self._returned(c.return_for_changes(run_id, unit_id, "verification_failed", ev), record)
+        if vres["verdict"] == "inconclusive":
+            # The verifier's environment stopped some checks and none it ran
+            # failed. Sending the unit back to the coder cannot fix that (live
+            # finding, rm-m0b M0-02: nine attempts lost to a sandbox with no
+            # network); ECC's own gates on this head decide instead.
+            blocked = "; ".join(f"{ch.get('what')}: {ch.get('blocked')}" for ch in vres.get("checks") or []
+                                if ch.get("blocked"))
+            if not (verification.get("passed") is True and verification.get("head") == head):
+                return c._needs_user(run_id, unit_id, "verifier_inconclusive",
+                                     f"verifier {vres.get('provider')} could not run: {blocked}", op)
+            vres["accepted"] = f"inconclusive verifier ({blocked}); ECC gates passed on {head[:12]}"
+            save()
         return self._approve_and_merge(run_id, unit_id, pr, vres, head, record, op)
 
     def _handle_review(self, run_id, unit_id, res, op):

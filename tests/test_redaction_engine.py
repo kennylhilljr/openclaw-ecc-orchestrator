@@ -98,6 +98,35 @@ class EnginePatternTests(unittest.TestCase):
         self.assertIs(process_redact.looks_secret_name, redaction.looks_secret_name)
 
 
+class JsonLineTests(unittest.TestCase):
+    """Live finding (rm-m0b M0-02, 2026-10-22): masking "session_id": "<uuid>" together with its quotes, and
+    "thinking_tokens": null as a value, left Claude's result line invalid JSON in the log. The verdict
+    inside it was then reported as "no ECC_VERIFY line" and its cost as $0.00."""
+
+    RESULT = {"type": "result", "subtype": "success", "is_error": False, "stop_reason": "end_turn",
+              "session_id": "0f9c2d1e-7a3b-4c5d-9e8f-123456789abc", "total_cost_usd": 0.4473,
+              "usage": {"input_tokens": 24, "output_tokens": 9550,
+                        "output_tokens_details": {"thinking_tokens": None}},
+              "modelUsage": {"claude-opus": {}},
+              "result": 'Checked.\nECC_VERIFY {"verdict": "pass", "head": "2f6abdbb5c78", "checks": []}'}
+
+    def test_redacted_result_line_stays_json_and_parses(self):
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        line = json.dumps(self.RESULT, separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertNotIn(self.RESULT["session_id"], out)
+            self.assertEqual(doc["session_id"], REDACTED)
+            parsed = ClaudeAdapter().parse_output(out)
+            self.assertIn("ECC_VERIFY", parsed["text"])
+            self.assertEqual(parsed["cost_usd"], 0.4473)
+
+    def test_quoted_secret_value_is_masked_inside_its_quotes(self):
+        out = Redactor().redact('{"api_key": "abc123xyz", "n": 1}')
+        self.assertNotIn("abc123xyz", out)
+        self.assertEqual(json.loads(out), {"api_key": REDACTED, "n": 1})
+
+
 class ArgvRedactionTests(unittest.TestCase):
     def test_secret_flags(self):
         argv = ["tool", "--token", "hunter2hunter2xyz", "--password", "Sup3rS3cretPass", "--api-key=abcdef1",

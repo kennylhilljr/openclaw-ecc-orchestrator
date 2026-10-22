@@ -464,6 +464,10 @@ class CodexAdapter(CliAdapter):
             argv += ["-m", model]
         if self.effort:
             argv += ["-c", 'model_reasoning_effort="%s"' % self.effort]
+        # Both sandboxes block the network, so uv must build from the shared
+        # cache: a fresh checkout's `uv run` otherwise fetches its build
+        # backend from PyPI and fails (live finding, rm-m0b M0-02 verifier).
+        argv += ["-c", 'shell_environment_policy.set.UV_OFFLINE="1"']
         return argv + ["--", prompt]
 
     def parse_auth(self, result):

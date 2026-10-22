@@ -216,7 +216,13 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
             if index == 0 and _benign_named_value(text[m.start(0):m.start(1)], value):
                 continue
             if value and value != REDACTED and value.strip("\"'") != REDACTED:
-                spans.append(m.span(1))
+                start, end = m.span(1)
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    # Mask inside the quotes so a JSON line stays JSON (live
+                    # finding, rm-m0b: "session_id":[REDACTED] broke Claude's
+                    # result line and its verdict and cost were lost).
+                    start, end = start + 1, end - 1
+                spans.append((start, end))
     return _merge(spans)
 
 
@@ -225,12 +231,14 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
 _COUNTER_NAME_RE = re.compile(r"(?i)(?:count|limit|tokens)[\"']?\s*[:=]\s*$")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _STRUCTURAL_VALUES = frozenset({"[", "{", "[]", "{}"})
+_JSON_LITERALS_RE = re.compile(r"(?:null|true|false)[}\]]*")
 
 
 def _benign_named_value(prefix: str, value: str) -> bool:
     """True for values the name rule must leave visible (unquoted numbers of
-    counter or limit fields, and bare JSON structure tokens)."""
-    if value in _STRUCTURAL_VALUES:
+    counter or limit fields, bare JSON structure tokens, and JSON null, true
+    and false, as in "thinking_tokens":null)."""
+    if value in _STRUCTURAL_VALUES or _JSON_LITERALS_RE.fullmatch(value):
         return True
     return bool(_NUMBER_RE.fullmatch(value) and _COUNTER_NAME_RE.search(prefix))
 

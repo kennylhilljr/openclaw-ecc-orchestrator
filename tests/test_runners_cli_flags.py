@@ -177,6 +177,18 @@ class CodexFlagTests(unittest.TestCase):
             self.assertNotIn(cache, CodexAdapter().build_invocation("x", cwd="/w/repo"))
         self.assertIn("UV_CACHE_DIR", CodexAdapter().env_allow())
 
+    def test_sandboxed_commands_run_uv_offline(self):
+        """Live finding (rm-m0b M0-02, 2026-10-22): the sandbox has no network, so `uv run` in the verifier's
+        fresh checkout tried to fetch hatchling from PyPI and every acceptance command failed. Offline, uv
+        builds from the shared cache."""
+        for writable in (False, True):
+            with self.subTest(writable=writable):
+                argv = CodexAdapter(effort="low").build_invocation("x", cwd="/w/repo", writable=writable)
+                overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+                self.assertIn('shell_environment_policy.set.UV_OFFLINE="1"', overrides)
+                self.assertEqual(overrides[0], 'model_reasoning_effort="low"')
+                self.assertLess(argv.index("-c"), argv.index("--"))
+
     def test_writable_worktree_grants_the_common_git_dir(self):
         """In a linked worktree .git is a pointer file; the grant must be the common .git."""
         import subprocess

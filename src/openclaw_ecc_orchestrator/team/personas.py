@@ -11,7 +11,7 @@ import re
 REVIEW_MARK = "ECC_REVIEW"
 VERIFY_MARK = "ECC_VERIFY"
 REVIEW_VERDICTS = ("approved", "changes_requested", "rejected")
-VERIFY_VERDICTS = ("pass", "fail")
+VERIFY_VERDICTS = ("pass", "fail", "inconclusive")
 SEVERITIES = ("blocker", "major", "minor")
 
 TITLES = {
@@ -104,11 +104,15 @@ def verify_prompt(pack, head):
         "requirement ids the unit traces to;\n"
         "- for a unit with no user-facing surface, check its contract with a sample of realistic inputs.",
         "A check fails when the real output differs from what the design says, even if the tests pass.",
+        "A check your environment stops before it can observe the behavior (no network, a missing tool, a "
+        "sandbox refusal) has not failed: give it \"ok\": false plus \"blocked\": \"<what stopped it>\", never "
+        "a blocker finding. When every check that did not pass was blocked, the verdict is inconclusive, not fail.",
         LESSONS_RULE,
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
-        f'{VERIFY_MARK} {{"verdict": "pass|fail", "head": "{head}", "checks": [{{"what": "<behavior>", '
-        '"how": "<command or call>", "expected": "<text>", "actual": "<text>", "ok": true}], '
-        '"findings": [{"severity": "blocker|major|minor", "what": "<text>"}]' + LESSONS_JSON + '}',
+        f'{VERIFY_MARK} {{"verdict": "pass|fail|inconclusive", "head": "{head}", "checks": [{{"what": '
+        '"<behavior>", "how": "<command or call>", "expected": "<text>", "actual": "<text>", "ok": true, '
+        '"blocked": null}], "findings": [{"severity": "blocker|major|minor", "what": "<text>"}]'
+        + LESSONS_JSON + '}',
         "# Evidence\n\n" + pack,
     ])
 
@@ -145,9 +149,17 @@ def parse_verdict(text, mark, head):
     if mark == VERIFY_MARK:
         checks = [c for c in (doc.get("checks") or []) if isinstance(c, dict)]
         doc["checks"] = checks
-        if doc["verdict"] == "pass" and any(c.get("ok") is False for c in checks):
+        blocked = [c for c in checks if c.get("ok") is not True and c.get("blocked")]
+        failed = [c for c in checks if c.get("ok") is False and not c.get("blocked")]
+        if failed and doc["verdict"] != "fail":
+            doc["downgraded"] = f"{doc['verdict']} with a failed check"
             doc["verdict"] = "fail"
-            doc["downgraded"] = "pass with a failed check"
+        elif blocked and not failed and doc["verdict"] != "inconclusive" and not any(
+                f.get("severity") == "blocker" for f in findings):
+            # The environment, not the change, stopped these checks (live
+            # finding, rm-m0b M0-02: no network for `uv run`).
+            doc["downgraded"] = f"{doc['verdict']} with only blocked checks"
+            doc["verdict"] = "inconclusive"
     return doc, None
 
 

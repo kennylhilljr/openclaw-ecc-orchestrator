@@ -29,7 +29,7 @@ MAX_STEPS = 500
 # kind has a per-unit cap that persists across drives of the same run.
 HEAL_CAPS = {"grant": 2, "review": 2, "conflict": 2, "blocked_handoff": 1}
 GRANTABLE = {"escalation_stopped", "budget_exhausted", "runner_needs_user"}
-REVIEW_STALLS = {"no_qualified_reviewer", "no_qualified_verifier"}
+REVIEW_STALLS = {"no_qualified_reviewer", "no_qualified_verifier", "verifier_inconclusive"}
 OWNER_ONLY = {"runner_auth", "runner_missing", "runner_permission_denied", "routing_invalid",
               "routing_changed_since_plan", "liveness_unverified", "runner_needs_owner"}
 
