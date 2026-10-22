@@ -324,6 +324,11 @@ class Drive:
                 return self._stop("drive_cost_ceiling", f"spent {self.spent(run) - baseline} USD")
             if self.max_seconds is not None and self.clock() - started > self.max_seconds:
                 return self._stop("drive_time_ceiling", f"ran {int(self.clock() - started)} s")
+            # Take the lease back if a long step let it lapse; only another
+            # conductor's live lease is a reason to stop.
+            keep = getattr(self.c, "_keep_lease", None)
+            if keep is not None:
+                keep(self.run_id)
             if self.steward.due():
                 self.steward.run()
             acted = False
@@ -338,6 +343,13 @@ class Drive:
                 elif state == S.QUEUED_FOR_MERGE:
                     self.progress(f"{uid}: merge queue")
                     res = self.c.process_merge_queue()
+                elif state == S.INTERRUPTED:
+                    # The runner exited but its result was never processed (the
+                    # drive stopped or lost its lease). Its commits stay on the
+                    # branch; the next attempt starts from them.
+                    self.progress(f"{uid}: interrupted; retrying")
+                    res = self.c.manager.transition(self.run_id, self.c.id, uid, S.READY,
+                                                    reason="retry:interrupted")
                 elif state == S.READY:
                     self.progress(f"{uid}: dispatch (attempt {int(units[uid].get('attempts') or 0) + 1})")
                     res = self.dispatch(uid)

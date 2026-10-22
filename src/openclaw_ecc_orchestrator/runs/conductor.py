@@ -35,6 +35,7 @@ and is never cancelled for it.
    consumes the approval through the broker.
 """
 
+import contextlib
 import copy
 import json
 import os
@@ -548,6 +549,7 @@ class Conductor:
             # Uncommitted edits from the pass are kept aside, never discarded and never verified.
             run_git(["stash", "push", "--include-untracked", "-m", f"skills pass leftovers {unit_id}"], path,
                     check=False)
+        self._keep_lease(run_id, force=True)  # the pass can outlast the lease; take it back before recording
         record.update(status="ran" if res.get("exit_code") == 0 else f"exit {res.get('exit_code')}",
                       head_before=before, head_after=after,
                       commits=int(git_out(["rev-list", "--count", f"{before}..{after}"], path) or 0),
@@ -688,6 +690,36 @@ class Conductor:
         return self.wait_unit(run_id, unit_id)
 
     # == lease keeping ==
+    @contextlib.contextmanager
+    def lease_heartbeat(self, run_id):
+        """Keep the run lease alive through a long blocking step that has no
+        runner handle to poll: the skills pass and the gates. The skills pass on
+        rm-m0b M0-02 ran six minutes, the five-minute lease expired, and every
+        later mutation was refused (live finding, 2026-10-21). Renewed every
+        third of the lease, and once more at the end so the caller can record
+        the result."""
+        period = max(1.0, float(getattr(self.manager, "lease_ttl", 300.0)) / 3.0)
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(period):
+                try:
+                    self._keep_lease(run_id, force=True)
+                except Exception:  # noqa: BLE001 - a missed beat is retried on the next one
+                    pass
+
+        thread = threading.Thread(target=beat, name=f"lease-{run_id}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            try:
+                self._keep_lease(run_id, force=True)
+            except Exception:  # noqa: BLE001 - the caller's own mutation reports a lost lease
+                pass
+
     def _keep_lease(self, run_id, force=False):
         """Renew the run lease when due; re-acquire it when it merely expired.
         Returns (held, detail)."""
@@ -936,7 +968,8 @@ class Conductor:
                 self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="handoff_invalid")
                 self._record_outcome(run_id, unit_id, False, False, "handoff_invalid", cost)
             return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), True
-        self._run_skills_pass(run_id, unit_id)
+        with self.lease_heartbeat(run_id):
+            self._run_skills_pass(run_id, unit_id)
         return self._verify(run_id, unit_id, data, cost), True
 
     def _verify(self, run_id, unit_id, data, cost=0.0):
@@ -955,7 +988,8 @@ class Conductor:
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="uncommitted_changes")
             self._record_outcome(run_id, unit_id, False, False, "uncommitted_changes", cost)
             return envelope(op, ok=False, checks=[check("work_committed", False, dirty.splitlines()[0])], data=data)
-        verification = self.gate(plan_unit, workspace["path"], run_id=run_id)
+        with self.lease_heartbeat(run_id):
+            verification = self.gate(plan_unit, workspace["path"], run_id=run_id)
         gates_passed = bool(verification["passed"])
         # A dependency may merge after this worktree was created.  Verify the
         # unit against the newest target commit it has incorporated, not the

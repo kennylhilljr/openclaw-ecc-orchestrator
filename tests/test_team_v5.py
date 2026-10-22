@@ -121,6 +121,42 @@ class V5Tests(DriveBase):
         self.assertIn("/simplify, /verify and /code-review", seen["prompt"])
         self.assertIn("a.txt", seen["prompt"])
 
+    def test_lease_is_kept_through_a_skills_pass_longer_than_the_lease(self):
+        """Live finding rm-m0b M0-02: a six minute skills pass outlived the five minute lease and
+        every later mutation was refused. The heartbeat keeps (or takes back) the lease."""
+        script = os.path.join(self.tmp, "skills.py")
+        with open(script, "w") as fh:
+            fh.write("import subprocess\n"
+                     "open('a.txt', 'a').write('simplified\\n')\n"
+                     "subprocess.run(['git', 'commit', '-qam', 'Skills pass: simplify'], check=True)\n")
+
+        def argv(prompt, path):
+            self.clock.t += 600  # far past the 60 s test lease
+            return [PY, script]
+
+        c, m, _ = self.conductor("c1", certified_runners=CERTIFIED, catalog=CATALOG, auto_retry=True,
+                                 policy=self.policy, skills_pass={"runner": "claude"}, skills_pass_argv=argv)
+        self.ok(c.create_run({"units": [work_unit("alpha", files=["a.txt"], commands=[f"{PY} -c pass"])]},
+                             run_id="r1"))
+        self.ok(c.assign_unit("r1", "alpha"))
+        self.ok(c.start_unit("r1", "alpha", self.argv("write", "a.txt=alpha")))
+        self.ok(c.wait_unit("r1", "alpha"))
+        unit = m.load("r1")["units"]["alpha"]
+        self.assertEqual(unit["state"], "reviewing")
+        self.assertEqual(unit["annotations"]["skills_pass"]["status"], "ran")
+
+    def test_drive_retries_an_interrupted_unit(self):
+        """A unit whose runner finished while no drive was processing it (process_gone) is retried,
+        not left for the owner."""
+        drive = self.make(self.units2())
+        self.ok(self.c.assign_unit("r1", "alpha"))
+        self.ok(self.m.transition("r1", "c1", "alpha", "interrupted", reason="process_gone"))
+        self.clock.t += 600  # the old lease has lapsed too
+        res = drive.go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        self.assertEqual(self.m.load("r1")["units"]["alpha"]["state"], "merged")
+        self.assertIn("alpha", self.dispatched)
+
     def test_no_skills_pass_when_claude_wrote_the_unit(self):
         c, m, _ = self.conductor("c1", certified_runners=["claude"], catalog=CATALOG, auto_retry=True,
                                  policy=self.policy, skills_pass={"runner": "claude"},
