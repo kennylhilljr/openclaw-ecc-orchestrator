@@ -157,8 +157,9 @@ def predict_routing(ctx, op, run, unit_id):
             "estimated_cost_usd": selection.estimated_cost_usd, "escalation": action["action"]}
 
 
-def runner_prompt(punit, brief=None):
-    """Deterministic instructions for a coding CLI runner."""
+def runner_prompt(punit, brief=None, persona=None):
+    """Deterministic instructions for a coding CLI runner. `persona` is an
+    optional (name, text) pair from the repository's persona files."""
     lines = [f"You are implementing work unit {punit['id']}: {punit.get('title', '')}."]
     if punit.get("description"):
         lines.append(str(punit["description"]))
@@ -179,7 +180,25 @@ def runner_prompt(punit, brief=None):
     lines.append(HANDOFF_RULES)
     if brief:
         lines.append(brief)
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if persona and persona[1]:
+        from ..team.personas import with_persona
+        text = with_persona(text, persona[0], persona[1])
+    return text
+
+
+def coder_persona(ctx, op):
+    """(name, text) of the persona team.json assigns to the coder, or None.
+    A persona that is assigned but missing fails the command."""
+    from ..team import personas as TP
+    name = TP.persona_for(ctx.rt.team(op), "coder")
+    if not name:
+        return None
+    text = TP.load_persona(ctx.rt.repo_top(op), name)
+    if text is None:
+        fail(op, "team_personas_present", f"team.json assigns persona {name!r} to the coder, but "
+             f"{os.path.join(*TP.PERSONA_DIR, name + '.md')} is missing or empty")
+    return name, text
 
 
 def runner_command(ctx, op, punit, routing, worktree_path, brief=None):
@@ -197,7 +216,8 @@ def runner_command(ctx, op, punit, routing, worktree_path, brief=None):
              f"runner {routing['runner']} is an API runner; CLI dispatch launches coding CLI runners only",
              actions=[{"kind": "resolve_needs_user", "run_id": ctx.args.run_id, "unit_id": punit["id"],
                        "detail": "certify a coding CLI runner for this tier or drive the unit from Python"}])
-    argv = _with_handoff_dir(adapter.build_invocation(runner_prompt(punit, brief), model=routing.get("model"),
+    argv = _with_handoff_dir(adapter.build_invocation(runner_prompt(punit, brief, coder_persona(ctx, op)),
+                                                      model=routing.get("model"),
                                                       cwd=worktree_path, writable=True))
     # Same runner and permissions, prompt filled in by the conductor: the
     # handoff-only repair turn (TEAM-DELIVERY-v2 5.2).
@@ -704,6 +724,11 @@ def plan_team_review(ctx):
         team = TC.load(ctx.rt.team(op))
     except TC.TeamConfigError as exc:
         fail(op, "team_config_valid", str(exc))
+    from ..team.personas import PERSONA_DIR, missing_personas
+    missing = missing_personas(ctx.rt.repo_top(op), team)
+    if missing:
+        fail(op, "team_personas_present", "team.json assigns personas the repository does not define: "
+             + ", ".join(os.path.join(*PERSONA_DIR, n + ".md") for n in missing))
     head = ((unit.get("annotations") or {}).get("verification") or {}).get("head")
     doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], verified_head=head,
                    author=(unit.get("routing") or {}).get("runner"), merge_approval=team["merge_approval"],
@@ -736,6 +761,11 @@ def plan_drive(ctx):
         team = TC.load(ctx.rt.team(op))
     except TC.TeamConfigError as exc:
         fail(op, "team_config_valid", str(exc))
+    from ..team.personas import PERSONA_DIR, missing_personas
+    missing = missing_personas(ctx.rt.repo_top(op), team)
+    if missing:
+        fail(op, "team_personas_present", "team.json assigns personas the repository does not define: "
+             + ", ".join(os.path.join(*PERSONA_DIR, n + ".md") for n in missing))
     budget = ((run.get("policy") or {}).get("budget") or {})
     max_cost = a.max_cost_usd if a.max_cost_usd is not None else budget.get("max_cost_usd_total")
     states = {}

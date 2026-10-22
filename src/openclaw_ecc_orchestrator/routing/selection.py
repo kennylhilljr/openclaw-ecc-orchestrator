@@ -255,6 +255,18 @@ def select_reviewer(author: Selection | Mapping, classification, certified_runne
         return result
     author_runner, author_family = _author_identity(author)
     review_tier, strict = required_review(author, classification)
+    if review_independence(policy) == "persona":
+        chosen = select_runner(review_tier, certified_runners, catalog, policy, role="review",
+                               risk=classification.risk, breaker=breaker, now=now)
+        if chosen.ok:
+            chosen.independent_family = False
+            chosen.reasons.append("review tier %d for author %s (%s); independence by persona and session"
+                                  % (review_tier, author_runner, author_family))
+        else:
+            chosen.blocking = strict
+            chosen.reasons.append("no qualified reviewer at tier %d%s" % (
+                review_tier, "; high-risk work cannot complete" if strict else ""))
+        return chosen
     exclude_runners = [author_runner] if (classification.requires_independent_review or strict) \
         else []
     common = dict(role="review", risk=classification.risk, breaker=breaker, now=now,
@@ -301,6 +313,24 @@ def _author_identity(author: Any) -> tuple[str, str | None]:
     return runner, family
 
 
+REVIEW_INDEPENDENCE = ("provider", "persona")
+
+
+def review_independence(policy: Mapping | None) -> str:
+    """How a repository shows that a review is independent of its author.
+
+    ``provider`` (the default): the reviewer runs on a different runner, and
+    for strict reviews in a different model family. ``persona``: independence
+    comes from a distinct reviewer persona in its own session (TEAM-DELIVERY
+    v3), so the reviewer may use the author's runner and model family. The
+    tier and eligibility rules apply either way. Set it with the repository
+    policy key ``review_independence``; a single-provider repository needs
+    ``persona``.
+    """
+    value = policy.get("review_independence") if isinstance(policy, Mapping) else None
+    return value if value in REVIEW_INDEPENDENCE else "provider"
+
+
 def required_review(author: Any, classification) -> tuple[int, bool]:
     """(review tier, strict) for ``author``'s work on ``classification``.
 
@@ -339,6 +369,7 @@ def review_satisfies(review: Mapping | None, author: Any, classification, certif
     if not isinstance(review, Mapping):
         return False, ["no review record"]
     tier, strict = required_review(author, classification)
+    by_persona = review_independence(policy) == "persona"
     author_runner, author_family = _author_identity(author)
     runner = normalize_provider(review.get("runner")) if review.get("runner") else ""
     rtier = review.get("tier")
@@ -346,10 +377,10 @@ def review_satisfies(review: Mapping | None, author: Any, classification, certif
         reasons.append("review does not name the runner that produced it")
     if not (isinstance(rtier, int) and not isinstance(rtier, bool)) or rtier < tier:
         reasons.append("review tier %r is below the required tier %d" % (rtier, tier))
-    if runner and author_runner and runner == author_runner and (
+    if runner and author_runner and runner == author_runner and not by_persona and (
             strict or classification.requires_independent_review):
         reasons.append("reviewer runner %s is the author runner" % runner)
-    if strict:
+    if strict and not by_persona:
         family = _family_of(runner, review.get("model"))
         if not author_family:
             reasons.append("author model family is unknown; tier %d review independence cannot be shown"
@@ -363,11 +394,12 @@ def review_satisfies(review: Mapping | None, author: Any, classification, certif
         # tier the review ran at (at least the required tier): certified,
         # allowed, serving that tier for review, permitted for the risk, not
         # the author runner, and for strict reviews outside the author family.
-        independent = strict or classification.requires_independent_review
+        independent = (strict or classification.requires_independent_review) and not by_persona
         eligible = select_runner(rtier, certified_runners, catalog, policy, role="review",
                                  risk=classification.risk, breaker=breaker, now=now,
                                  exclude_runners=[author_runner] if independent and author_runner else [],
-                                 exclude_families=[author_family] if strict and author_family else [])
+                                 exclude_families=[author_family] if independent and strict and author_family
+                                 else [])
         if runner not in {c["runner"] for c in eligible.candidates}:
             why = next((r["reason"] for r in eligible.rejected if r["runner"] == runner), "not certified")
             reasons.append("reviewer runner %s is not an eligible reviewer at tier %d: %s" % (runner, rtier, why))

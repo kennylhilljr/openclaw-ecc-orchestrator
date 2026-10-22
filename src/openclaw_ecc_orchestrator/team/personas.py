@@ -6,6 +6,7 @@ report-file mechanics are dropped. Every role ends with one parsable line.
 """
 
 import json
+import os
 import re
 
 REVIEW_MARK = "ECC_REVIEW"
@@ -214,4 +215,63 @@ def practices_review_prompt(role, lessons, pack, head):
         '"findings": [{"severity": "blocker|major|minor", "where": "<path:line>", "what": "<text>"}]}',
         "Lessons cited:\n" + items,
         "# The change\n\n" + pack,
+    ])
+
+
+# == repository personas (SDD) ==
+# A role can act as a persona the target repository defines in
+# `.claude/agents/<name>.md` (the sdd_framework persona files). team.json maps
+# roles to persona names under "personas"; the file is read from the main
+# repository, never from a unit worktree, so a unit cannot rewrite the persona
+# its reviewers play.
+PERSONA_DIR = (".claude", "agents")
+PERSONA_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+PERSONA_ROLES = ("coder", "steward")   # roles outside config.ROLES that may take a persona
+MAX_PERSONA_CHARS = 8000
+
+
+def persona_path(repo, name):
+    return os.path.join(repo, *PERSONA_DIR, name + ".md")
+
+
+def load_persona(repo, name):
+    """The body of the persona file `name` in `repo` without its front matter,
+    capped at MAX_PERSONA_CHARS, or None when the name is invalid or the file
+    is missing or empty."""
+    if not repo or not isinstance(name, str) or not PERSONA_NAME_RE.match(name):
+        return None
+    try:
+        with open(persona_path(repo, name), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + 4:]
+    text = text.strip()
+    return text[:MAX_PERSONA_CHARS] or None
+
+
+def persona_for(team_cfg, role):
+    """The persona name team.json assigns to `role`, or None."""
+    return ((team_cfg or {}).get("personas") or {}).get(role)
+
+
+def missing_personas(repo, team_cfg):
+    """Persona names team.json assigns that `repo` does not define."""
+    names = sorted(set(((team_cfg or {}).get("personas") or {}).values()))
+    return [n for n in names if load_persona(repo, n) is None]
+
+
+def with_persona(prompt, name, text):
+    """`prompt` preceded by the persona definition, when there is one."""
+    if not text:
+        return prompt
+    return "\n\n".join([
+        f"You act as the `{name}` persona of this repository. Its definition follows; it sets your scope, "
+        "inputs and limits. Where it conflicts with the instructions after it, the instructions after it win "
+        "(they set this turn's task and the exact reply format).",
+        f"<persona name=\"{name}\">\n{text}\n</persona>",
+        prompt,
     ])

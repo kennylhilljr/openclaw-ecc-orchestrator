@@ -84,6 +84,8 @@ select_reviewer(author, classification, certified_runners, catalog, policy, *,
 
 The review tier is `classification.review_tier`, raised to 2 when the author worked at Tier 2. A forged low author tier cannot lower it. The author runner is excluded when independence is required. A reviewer from a different model family is tried first. For Tier 2 or high risk reviews a different family is mandatory; otherwise the same family is accepted with a warning. When no qualified reviewer exists for Tier 2 or high risk work, `blocking` is true and the unit cannot complete. Families come from the runner profile, or for hosting providers (Groq, OpenRouter) from the model id; an unrecognised id yields a unique `unknown:` family.
 
+A repository that uses one provider sets `review_independence: persona` in its policy (`config.yaml`; the default is `provider`). Independence then comes from a distinct reviewer persona in its own session (TEAM-DELIVERY v3), so the reviewer may use the author's runner and model family. The tier, certification and risk rules still apply, and `review_satisfies` accepts such a review in the conductor and the merge queue.
+
 ## Escalation
 
 ```python
@@ -111,4 +113,4 @@ Actions are `attempt`, `repair`, `escalate`, `stop` and `done`. The controller s
 | merge queue enqueue | `classify` with the actual diff at the branch tip and `review_satisfies` again, so a review that no longer meets the review tier blocks the merge |
 | after each attempt | `EscalationController.record`; its record is persisted and replayed after a restart |
 
-A high risk unit therefore reaches the merge queue only with a Tier 2 review from a runner outside the author's model family.
+A high risk unit therefore reaches the merge queue only with a Tier 2 review from a runner outside the author's model family, unless the policy sets `review_independence: persona`.

@@ -99,6 +99,9 @@ class TeamStep:
             return self._turn_unkept(role, choice, prompt, cwd, writable, run_id, unit_id, timeout)
 
     def _turn_unkept(self, role, choice, prompt, cwd, writable, run_id, unit_id, timeout):
+        name = P.persona_for(self.cfg, role)
+        if name:
+            prompt = P.with_persona(prompt, name, P.load_persona(self.c.worktrees.repo, name))
         runner, model = choice["runner"], choice["model"]
         adapter = self.adapter(runner)
         stamp = int(self.clock() * 1000)

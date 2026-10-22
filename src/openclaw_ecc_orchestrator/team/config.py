@@ -62,6 +62,15 @@ def load(doc):
             cfg["max_pack_tokens"].update(value or {})
         else:
             cfg[key] = copy.deepcopy(value)
+    personas = cfg.get("personas", {})
+    if not isinstance(personas, dict):
+        raise TeamConfigError("personas must be an object mapping roles to persona names")
+    from .personas import PERSONA_NAME_RE, PERSONA_ROLES
+    for role, name in personas.items():
+        if role not in ROLES and role not in PERSONA_ROLES:
+            raise TeamConfigError(f"personas: unknown role {role!r}")
+        if not isinstance(name, str) or not PERSONA_NAME_RE.match(name):
+            raise TeamConfigError(f"personas.{role}: {name!r} is not a persona name")
     if cfg["merge_approval"] not in ("agents", "human"):
         raise TeamConfigError("merge_approval must be agents or human")
     if not (0 < float(cfg["share_cap"]) <= 1):

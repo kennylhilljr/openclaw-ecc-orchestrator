@@ -70,6 +70,15 @@
       },
       "description": "Providers that may author units (default: every allowed provider whose runner can author). Lets API providers review without authoring while dispatch launches coding CLIs only."
     },
+    "review_independence": {
+      "type": "string",
+      "enum": [
+        "provider",
+        "persona"
+      ],
+      "default": "provider",
+      "description": "How a review shows independence from its author. provider (default): a different runner, and for strict reviews a different model family. persona: a distinct reviewer persona in its own session, so a single-provider repository can review and merge."
+    },
     "budget": {
       "type": "object",
       "required": [

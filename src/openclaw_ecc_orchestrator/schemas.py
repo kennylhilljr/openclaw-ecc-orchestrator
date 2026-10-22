@@ -137,7 +137,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
                      "protected_commands", "allowed_providers", "budget"],
         "optional": ["author_providers", "model_preferences", "retired_model_ids", "cli_models", "runner_costs",
                      "cost_estimation", "circuit_breaker", "openrouter",
-                     "catalog_max_age_seconds", "health"],
+                     "catalog_max_age_seconds", "health", "review_independence"],
         "nested_required": {"budget": ["max_cost_usd_per_unit", "max_cost_usd_total",
                                        "max_minutes_per_unit"]},
         "enums": {"allowed_providers[]": list(KNOWN_PROVIDERS)},
@@ -484,6 +484,9 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
                 report.error("allowed_providers contains unknown provider %s" % _show(name))
             else:
                 allowed.append(norm)
+
+    if "review_independence" in doc and doc["review_independence"] not in ("provider", "persona"):
+        report.error("review_independence must be provider or persona")
 
     authors = doc.get("author_providers")
     if "author_providers" in doc and _check_str_list(authors, "author_providers", report, allow_empty=False):
