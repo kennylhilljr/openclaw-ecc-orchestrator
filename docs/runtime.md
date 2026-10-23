@@ -421,6 +421,29 @@ There is one engine, `handoffs.redaction`; `process.redact` re-exports it.
 Log lines, the line callback, `status.json`, the returned result and error
 messages all pass through the process redactor. Errors never echo a value.
 
+Redaction must leave a JSON line parseable, because `team.invoke.run_cli`
+reads Claude's result line back from the log. When `ClaudeAdapter.parse_output`
+cannot parse it, the reply text is lost and the verdict check reports
+`no ECC_REVIEW line` (or `no ECC_VERIFY line`) even though the reply had one.
+The name rule therefore masks a quoted value inside its quotes, and
+`_benign_named_value` leaves unmasked the values that cannot be credentials:
+JSON structure tokens, `null`, `true` and `false`, and numbers on counter
+fields (names ending in `count`, `limit` or `tokens`). These values may
+carry the brackets that close their object or array, as in
+`"thinking_tokens":15327}`.
+
+Live findings: rm-m0b (2026-10-22) lost a verifier verdict to
+`"session_id":[REDACTED]` and `"thinking_tokens":[REDACTED]` written over
+`null`. The rm-m0d plan check (2026-10-23) stopped with
+`plan_check_failed: reviewer output unusable: no ECC_REVIEW line`. Claude CLI
+had started writing a number for `thinking_tokens`, and `_NUMBER_RE` in
+`src/openclaw_ecc_orchestrator/handoffs/redaction.py` did not accept the
+closing `}`, so the number and the brace were both masked. The fix (commit
+`a4a7d79`) lets `_NUMBER_RE` end in `[}\]]*`, the same allowance
+`_JSON_LITERALS_RE` already had. Regression test:
+`JsonLineTests.test_counter_closing_an_object_stays_json` in
+`tests/test_redaction_engine.py`.
+
 ### Orchestrator git
 
 `worktrees.git.run_git` is the only way the orchestrator runs git. It passes
