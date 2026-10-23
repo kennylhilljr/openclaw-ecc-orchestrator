@@ -69,8 +69,8 @@ _SECRET_NAME = re.compile(r"(?i)(?:%s)|(?:^|[_.-])(?:key|pass|pwd)(?:$|[_.-])" %
 _VALUE_RULES = [
     # NAME=value, NAME: value, "name": "value" with a secret looking name.
     re.compile(
-        r"(?i)\b[A-Za-z0-9_.-]*(?:%s|_key\b|_pass\b|_pwd\b)[A-Za-z0-9_.-]*[\"']?"
-        r"\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;\"']+)" % _NAME_WORDS),
+        r"(?i)\b[A-Za-z0-9_.-]*(?:%s|_key\b|_pass\b|_pwd\b)[A-Za-z0-9_.-]*(?:\\?[\"'])?"
+        r"\s*[:=]\s*(\\\"(?:[^\"\\]|\\[^\"])*\\\"|\"[^\"]*\"|'[^']*'|[^\s,;\"']+)" % _NAME_WORDS),
     # Authorization: <scheme> <credential>, or Authorization: <credential>.
     re.compile(r"(?i)\b(?:proxy-)?authorization\s*[:=]\s*(?:[A-Za-z]+\s+)?([^\s,;\"']{4,})"),
     # Bearer / Basic credentials of any length.
@@ -228,12 +228,21 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
                 continue
             if value and value != REDACTED and value.strip("\"'") != REDACTED:
                 start, end = m.span(1)
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                if len(value) >= 4 and value.startswith('\\"') and value.endswith('\\"'):
+                    # The same inside a JSON string, where the quotes are
+                    # escaped (live finding, rm-m0f M0-20).
+                    start, end = start + 2, end - 2
+                elif len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                     # Mask inside the quotes so a JSON line stays JSON (live
                     # finding, rm-m0b: "session_id":[REDACTED] broke Claude's
                     # result line and its verdict and cost were lost).
                     start, end = start + 1, end - 1
-                spans.append((start, end))
+                else:
+                    # An unquoted value keeps a trailing backslash: it escapes
+                    # the quote that ends the JSON string around it.
+                    end -= len(value) - len(value.rstrip("\\"))
+                if end > start:
+                    spans.append((start, end))
     return _merge(spans)
 
 

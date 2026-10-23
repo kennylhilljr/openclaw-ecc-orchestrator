@@ -134,6 +134,21 @@ class JsonLineTests(unittest.TestCase):
             self.assertEqual(doc["usage"]["output_tokens_details"], {"thinking_tokens": 15327})
             self.assertIn("ECC_REVIEW", ClaudeAdapter().parse_output(out)["text"])
 
+    def test_escaped_quotes_inside_a_json_string_stay_escaped(self):
+        """Live finding (rm-m0f M0-20, 2026-10-23): inside Claude's result string,
+        `SecretState.INVALID = \\"invalid\\"` and `test_secrets.py:62\\"` lost the backslash that
+        escapes a quote, the line stopped being JSON and six reviews read "no ECC_REVIEW line"."""
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        text = ('`SecretState.INVALID = "invalid"` matches the LLD.\n'
+                'ECC_REVIEW {"verdict": "approved", "head": "2f6abdbb5c78", "findings": [{"severity": "minor", '
+                '"where": "tests/unit/platform/test_secrets.py:62", "what": "order", "api_key": "abc123xyz"}]}')
+        line = json.dumps(dict(self.RESULT, result=text), separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertNotIn("abc123xyz", out)
+            self.assertIn("ECC_REVIEW", ClaudeAdapter().parse_output(out)["text"])
+            self.assertEqual(doc["result"].splitlines()[-1][:11], "ECC_REVIEW ")
+
     def test_quoted_secret_value_is_masked_inside_its_quotes(self):
         out = Redactor().redact('{"api_key": "abc123xyz", "n": 1}')
         self.assertNotIn("abc123xyz", out)
