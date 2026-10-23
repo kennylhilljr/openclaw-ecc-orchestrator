@@ -121,6 +121,19 @@ class JsonLineTests(unittest.TestCase):
             self.assertIn("ECC_VERIFY", parsed["text"])
             self.assertEqual(parsed["cost_usd"], 0.4473)
 
+    def test_counter_closing_an_object_stays_json(self):
+        """Live finding (rm-m0d plan check, 2026-10-23): "thinking_tokens":15327} was masked with its
+        brace, the result line stopped being JSON and the plan check read "no ECC_REVIEW line"."""
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        result = dict(self.RESULT, usage={"output_tokens": 15327,
+                                          "output_tokens_details": {"thinking_tokens": 15327}},
+                      result='Checked.\nECC_REVIEW {"verdict": "approved", "head": "2f6abdbb5c78", "findings": []}')
+        line = json.dumps(result, separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertEqual(doc["usage"]["output_tokens_details"], {"thinking_tokens": 15327})
+            self.assertIn("ECC_REVIEW", ClaudeAdapter().parse_output(out)["text"])
+
     def test_quoted_secret_value_is_masked_inside_its_quotes(self):
         out = Redactor().redact('{"api_key": "abc123xyz", "n": 1}')
         self.assertNotIn("abc123xyz", out)

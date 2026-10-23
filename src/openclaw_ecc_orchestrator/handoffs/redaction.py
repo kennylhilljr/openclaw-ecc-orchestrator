@@ -240,7 +240,7 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
 # Usage counters such as "promptTokenCount": 12 or "max_tokens": 64 match the
 # secret name rule ("token") but hold plain numbers, never credentials.
 _COUNTER_NAME_RE = re.compile(r"(?i)(?:count|limit|tokens)[\"']?\s*[:=]\s*$")
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?[}\]]*")  # "thinking_tokens":15327} ends an object
 _STRUCTURAL_VALUES = frozenset({"[", "{", "[]", "{}"})
 _JSON_LITERALS_RE = re.compile(r"(?:null|true|false)[}\]]*")
 
