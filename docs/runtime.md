@@ -444,6 +444,20 @@ closing `}`, so the number and the brace were both masked. The fix (commit
 `JsonLineTests.test_counter_closing_an_object_stays_json` in
 `tests/test_redaction_engine.py`.
 
+In run rm-m0f (2026-10-23), M0-20 used up six attempts on reviews that read
+`no ECC_REVIEW line`, though the last reviewer had approved. Inside Claude's
+result string the quotes are escaped. For `SecretState.INVALID = \"invalid\"`
+and `test_secrets.py:62\"`, the name rule took the backslash before the quote
+as an unquoted value and masked it, so the quote ended the JSON string. The
+fix (commit `fff89ae`) is in the same file,
+`src/openclaw_ecc_orchestrator/handoffs/redaction.py`: the first rule of
+`_VALUE_RULES` now accepts a value in escaped quotes (`\"...\"`) and a name in
+escaped quotes, and `_redaction_spans` masks inside the escaped quotes and
+leaves the trailing backslash of an unquoted value outside the mask. Values in
+escaped quotes, such as `\"api_key\": \"...\"` inside a JSON string, were not
+masked before and are now. Regression test:
+`JsonLineTests.test_escaped_quotes_inside_a_json_string_stay_escaped`.
+
 ### Orchestrator git
 
 `worktrees.git.run_git` is the only way the orchestrator runs git. It passes
