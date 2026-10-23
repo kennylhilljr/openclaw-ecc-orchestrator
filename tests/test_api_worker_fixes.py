@@ -234,6 +234,22 @@ class MacPathRedactionTests(unittest.TestCase):
     def test_slash_bearing_secret_outside_a_path_is_still_masked(self):
         secret = "Zq3/Lw9KpT2vXr8/Ys4mNb7QcH1dFg6jRk0pAe5u"  # gitleaks:allow
         self.assertNotIn(secret, redaction.redact_text("value " + secret))
+        self.assertNotIn(secret, redaction.redact_text("value " + secret + " here"))
+
+    def test_repository_relative_file_paths_are_not_masked(self):
+        """SDD unit descriptions cite versioned documents such as
+        docs/prd/components/PRD-platform-v3.md; they failed work unit validation
+        as secret_detected."""
+        for path in ("docs/prd/components/PRD-platform-v3.md", "docs/prd/components/PRD-security-v1.md",
+                     "src/research_mcp/platform/migrations/state/0001_init.sql"):
+            self.assertFalse(redaction.contains_secret(path), path)
+            self.assertFalse(redaction.contains_secret("see %s section 2.4" % path), path)
+            self.assertEqual(redaction.redact_text(path), path)
+
+    def test_long_random_segment_in_a_relative_path_is_still_masked(self):
+        path = "docs/" + BLOB + ".md"
+        self.assertIn(redaction.REDACTED, redaction.redact_text(path))
+        self.assertNotIn(BLOB, redaction.redact_text(path))
 
 
 class ProviderAccountIdTests(unittest.TestCase):

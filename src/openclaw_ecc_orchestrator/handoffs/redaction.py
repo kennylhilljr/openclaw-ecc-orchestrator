@@ -174,12 +174,23 @@ def _continues_path(m: "re.Match[str]") -> bool:
     return i >= 2 and m.string[i - 1] == "." and m.string[i - 2] == "/"
 
 
+# Repository-relative file paths (for example docs/prd/components/PRD-platform-v3.md)
+# are judged one segment at a time, like absolute paths: joined, the folders and a
+# versioned file name reach 32 characters with mixed case and digits. The token
+# stops at the extension's dot, so a following known extension marks the path.
+_FILE_EXT_RE = re.compile(r"\.(?:md|py|pyi|json|ya?ml|toml|txt|sql|sh|mjs|js|ts|html|css|cfg|ini|lock)\b")
+
+
+def _repo_relative_path(m: "re.Match[str]") -> bool:
+    return "/" in m.group(0) and _FILE_EXT_RE.match(m.string, m.end()) is not None
+
+
 def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     token = m.group(0)
     branch = _branch_spans(m)
     if branch is not None:
         return branch
-    start = 0 if _continues_path(m) else _path_start(token)
+    start = 0 if _continues_path(m) or _repo_relative_path(m) else _path_start(token)
     if start < 0:
         return [m.span()] if _is_high_entropy(token) else []
     spans = []
