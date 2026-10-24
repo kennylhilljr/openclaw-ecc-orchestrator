@@ -421,11 +421,25 @@ There is one engine, `handoffs.redaction`; `process.redact` re-exports it.
 Log lines, the line callback, `status.json`, the returned result and error
 messages all pass through the process redactor. Errors never echo a value.
 
-Redaction must leave a JSON line parseable, because `team.invoke.run_cli`
-reads Claude's result line back from the log. When `ClaudeAdapter.parse_output`
-cannot parse it, the reply text is lost and the verdict check reports
-`no ECC_REVIEW line` (or `no ECC_VERIFY line`) even though the reply had one.
-The name rule therefore masks a quoted value inside its quotes, and
+A CLI turn no longer reads its verdict from the log. `team.invoke.run_cli`
+passes the adapter's `parse_output` to `Supervisor.run` as `parse_stdout`. The
+process handle keeps the raw stdout in memory, parses it when the process ends,
+redacts the string values of the parsed result with that process's redactor,
+and returns them as `parsed`, which is not written to `status.json`. The raw
+stdout is then dropped. Output the adapter cannot parse is a runner error
+(`unparsable CLI output`), never a verdict. Before this change (commit
+`fffa9f2`), 38 of the 63 Claude result lines logged in runs rm-m0b, rm-m0d and
+rm-m0f were invalid JSON after masking; each became `no ECC_REVIEW line` and
+counted as changes requested. The change is in
+`src/openclaw_ecc_orchestrator/process/supervisor.py` (`parse_stdout`,
+`ProcessHandle._parsed`) and `src/openclaw_ecc_orchestrator/team/invoke.py`
+(`run_cli`); regression tests in `tests/test_invoke_raw_parse.py`. The rules
+below still matter for every log line and for API turns.
+
+Redaction should leave a JSON line parseable, so a log stays readable. The
+three live findings below broke Claude's result line, and the verdict check
+reported `no ECC_REVIEW line` (or `no ECC_VERIFY line`) even though the reply
+had one. The name rule therefore masks a quoted value inside its quotes, and
 `_benign_named_value` leaves unmasked the values that cannot be credentials:
 JSON structure tokens, `null`, `true` and `false`, and numbers on counter
 fields (names ending in `count`, `limit` or `tokens`). These values may
