@@ -27,16 +27,26 @@ def _stdout_from_log(path):
 
 def run_cli(adapter, model, prompt, *, cwd, writable, supervisor, log_path, timeout=1800.0, argv_override=None):
     """One turn of a coding CLI. `argv_override(prompt) -> argv` replaces the
-    adapter command (tests)."""
+    adapter command (tests).
+
+    The adapter parses the raw stdout inside the process handle, which returns
+    only redacted values; the log stays redacted line by line. Parsing the log
+    instead lost 38 of 63 Claude verdicts to masking that broke the JSON line
+    (live findings rm-m0b, rm-m0d, rm-m0f). Output the adapter cannot parse is
+    a runner error, never a verdict."""
     argv = argv_override(prompt) if argv_override else adapter.build_invocation(prompt, model=model, cwd=cwd,
                                                                                  writable=writable)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    parses = hasattr(adapter, "parse_output") and not argv_override
+    extra = {"parse_stdout": adapter.parse_output} if parses else {}
     res = supervisor.run(list(argv), cwd=cwd, env_allow=tuple(adapter.env_allow()), log_path=log_path,
-                         timeout=timeout)
+                         timeout=timeout, **extra)
     stdout = _stdout_from_log(log_path)
-    parsed = adapter.parse_output(stdout) if hasattr(adapter, "parse_output") and not argv_override else {}
-    text = parsed.get("text") if parsed.get("text") else stdout
+    parsed = res.get("parsed") or {} if parses else {}
+    text = parsed.get("text") or stdout
     error = parsed.get("error") or res.get("error")
+    if parses and not parsed and not error:
+        error = "unparsable CLI output (see the log)"
     if res.get("exit_code") not in (0, None) and not error:
         error = f"exit {res.get('exit_code')}"
     if res.get("timed_out"):

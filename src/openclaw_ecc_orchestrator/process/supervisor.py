@@ -156,8 +156,10 @@ class ExitWatcher:
 
 class ProcessHandle:
     def __init__(self, argv, cwd, env, redactor, on_line, log_path, status_path, timeout, grace, clock, on_start,
-                 health=None):
+                 health=None, parse_stdout=None):
         self.argv = list(argv)
+        self.parse_stdout = parse_stdout
+        self._raw_stdout = [] if parse_stdout else None
         self.cwd = cwd
         self._env = env
         self.redactor = redactor
@@ -412,6 +414,8 @@ class ProcessHandle:
                             streams_closed_at = time.monotonic()
                     else:
                         counts[name] += 1
+                        if name == "stdout" and self._raw_stdout is not None:
+                            self._raw_stdout.append(line)
                         clean = streams[name].feed(line)
                         if log:
                             log.write(f"[{name}] {clean}\n")
@@ -457,6 +461,8 @@ class ProcessHandle:
                     break
                 if line is not None:
                     counts[name] += 1
+                    if name == "stdout" and self._raw_stdout is not None:
+                        self._raw_stdout.append(line)
                     clean = streams[name].feed(line)
                     if log:
                         log.write(f"[{name}] {clean}\n")
@@ -511,8 +517,24 @@ class ProcessHandle:
             except OSError as exc:
                 result["error"] = (result["error"] or "") + " status_write_failed: " + self.redactor.redact(
                     f"{type(exc).__name__}: {exc.strerror or exc}")
+        if self.parse_stdout:
+            result["parsed"] = self._parsed()  # in memory only, not in status.json
         self._result = result
         self._done.set()
+
+    def _parsed(self):
+        """``parse_stdout`` applied to the raw stdout, which never leaves this
+        handle; string values are redacted with this process's redactor. The
+        log is redacted line by line, and masking can break a JSON line that a
+        parser would read (live findings rm-m0b, rm-m0d, rm-m0f)."""
+        raw, self._raw_stdout = "\n".join(self._raw_stdout or []), None
+        try:
+            parsed = self.parse_stdout(raw)
+        except Exception:
+            parsed = None
+        if not isinstance(parsed, dict):
+            return {}
+        return {k: self.redactor.redact(v) if isinstance(v, str) else v for k, v in parsed.items()}
 
 
 class Supervisor:
@@ -524,7 +546,7 @@ class Supervisor:
         self.grace = float(grace)
 
     def start(self, argv, cwd, *, env_allow=(), extra_env=None, public_env=None, on_line=None, log_path=None,
-              status_path=None, timeout=None, grace=None, on_start=None, health=None):
+              status_path=None, timeout=None, grace=None, on_start=None, health=None, parse_stdout=None):
         """Start ``argv`` in ``cwd``.
 
         ``extra_env`` values are secrets: every value is registered with this
@@ -532,6 +554,8 @@ class Supervisor:
         (for example a per unit TMPDIR) are set without being treated as secrets.
         ``health`` (a ``process.health.HealthConfig``) enables hang detection;
         ``timeout`` is an optional hard wall clock ceiling, off by default.
+        ``parse_stdout(raw) -> dict`` reads the unredacted stdout once the
+        process ends; the result's ``parsed`` holds its redacted string values.
         """
         if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)) or not argv:
             raise TypeError("argv must be a non-empty list of strings (no shell strings)")
@@ -549,7 +573,8 @@ class Supervisor:
         for value in (extra_env or {}).values():
             redactor.add_secret(str(value))
         handle = ProcessHandle(argv, cwd, env, redactor, on_line, log_path, status_path, timeout,
-                               self.grace if grace is None else float(grace), self.clock, on_start, health=health)
+                               self.grace if grace is None else float(grace), self.clock, on_start, health=health,
+                               parse_stdout=parse_stdout)
         return handle._start()
 
     def run(self, argv, cwd, **kwargs):
