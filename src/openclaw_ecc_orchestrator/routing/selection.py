@@ -185,6 +185,12 @@ def select_runner(tier: int, certified_runners: Any, catalog: Mapping | None,
                 reject("role coordination not permitted")
                 continue
             classes = tuple(profile.default_cli_models)
+        if capability_class not in classes and review_independence(policy) == "persona" \
+                and ((policy.get("cli_models") or {}).get(name) or {}).get(capability_class):
+            # A single-provider team has no other runner for this class; the
+            # policy names the model it uses (live finding, rm-m0f: Claude-only
+            # low-risk units had no tier 0 author).
+            classes = tuple(classes) + (capability_class,)
         if capability_class not in classes:
             reject("does not serve %s for %s" % (capability_class, role))
             continue
