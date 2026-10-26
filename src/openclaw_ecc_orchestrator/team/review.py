@@ -280,7 +280,9 @@ class TeamStep:
             # network); ECC's own gates on this head decide instead.
             blocked = "; ".join(f"{ch.get('what')}: {ch.get('blocked')}" for ch in vres.get("checks") or []
                                 if ch.get("blocked"))
-            if not (verification.get("passed") is True and verification.get("head") == head):
+            # A high-risk or security unit never merges on it: the owner decides
+            # (live finding, rm-m0f M0-22: a Keychain unit merged this way).
+            if high or not (verification.get("passed") is True and verification.get("head") == head):
                 return c._needs_user(run_id, unit_id, "verifier_inconclusive",
                                      f"verifier {vres.get('provider')} could not run: {blocked}", op)
             vres["accepted"] = f"inconclusive verifier ({blocked}); ECC gates passed on {head[:12]}"

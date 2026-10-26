@@ -503,6 +503,18 @@ class Drive:
         return {"role": role, "provider": None, "verdict": None, "skipped": skipped_all}
 
     def retro_table(self, run):
+        stops = {}
+        # Every stop and return, from the event log: a stop outside the
+        # escalation record (shared_git_state_changed, an owner resume) still
+        # has a cause (live finding, rm-m0f: four retries had none).
+        for event in self.c.manager.store.read_events(self.run_id):
+            data = event.get("data") or {}
+            if event.get("type") != "unit.state_changed":
+                continue
+            reason = str(data.get("reason") or "")
+            if data.get("to") in (S.NEEDS_USER, S.FAILED, S.BLOCKED) or reason.startswith("review:"):
+                uid = (data.get("unit") or {}).get("id")
+                stops.setdefault(uid, []).append(reason.removeprefix("review:") or data.get("to"))
         units = {}
         for uid, u in run["units"].items():
             esc = (u.get("annotations") or {}).get("escalation") or {}
@@ -510,7 +522,8 @@ class Drive:
             units[uid] = {"attempts": u.get("attempts"), "minutes": round(float(u.get("minutes_used") or 0), 1),
                           "cost_usd": u.get("cost_usd"), "tier": (u.get("routing") or {}).get("tier"),
                           "author": (u.get("routing") or {}).get("runner"),
-                          "failures": [a.get("reason") for a in esc.get("attempts") or [] if not a.get("passed")],
+                          "failures": stops.get(uid) or [a.get("reason") for a in esc.get("attempts") or []
+                                                         if not a.get("passed")],
                           "reviews": [{"role": r.get("role"), "provider": r.get("provider"),
                                        "verdict": r.get("verdict")} for r in team.get("reviews") or []],
                           "verifier": {k: (team.get("verification") or {}).get(k) for k in ("provider", "verdict")}}

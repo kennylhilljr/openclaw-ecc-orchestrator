@@ -75,6 +75,28 @@ HANDOFF_ENV = "ECC_HANDOFF_PATH"
 # with --add-dir (live finding, run rmcp-m0d, 2026-10-19).
 HANDOFF_PATH_TOKEN = "{ECC_HANDOFF_PATH}"
 HANDOFF_DIR_TOKEN = "{ECC_HANDOFF_DIR}"
+# Consecutive requests for changes from one reviewer role before the unit
+# stops for the owner instead of trying again.
+REJECTION_CAP = 3
+
+
+def runner_usage(stdout):
+    """``{"cost_usd": x}`` from a coding CLI's own JSON result line (Claude's
+    ``total_cost_usd``), read from the raw stdout inside the process handle.
+    Agents rarely fill ``usage`` in their handoff, so without this every unit
+    reported 0.0 (live finding, rm-m0f)."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{") or "total_cost_usd" not in line:
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        value = doc.get("total_cost_usd") if isinstance(doc, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return {"cost_usd": float(value)}
+    return {}
 
 
 def fill_handoff_tokens(argv, handoff_path):
@@ -379,6 +401,17 @@ class Conductor:
         with self._lock:
             self._controllers.pop((run_id, unit_id), None)
         self._note_failure(run_id, unit_id, reason, evidence)
+        streak = 0
+        for attempt in reversed(attempts):
+            if attempt.get("passed") or attempt.get("reason") != reason:
+                break
+            streak += 1
+        if reason.endswith("_changes_requested") and streak >= REJECTION_CAP:
+            # The same reviewer role keeps asking for changes: another attempt
+            # rarely helps, so the owner reads the findings (live finding, rm-m0f
+            # M0-20: seven attempts on six pr_reviewer rejections).
+            return self._needs_user(run_id, unit_id, "repeated_rejections",
+                                    f"{reason} {streak} times in a row", op)
         ctrl = self._controller(self.manager.load(run_id), unit_id)
         nxt = ctrl.next_action() if ctrl is not None else {"action": "stop", "reason": "no controller"}
         if nxt["action"] in ("stop", "done"):
@@ -657,7 +690,8 @@ class Conductor:
         runner_argv = fill_handoff_tokens(runner_argv, handoff_path)
         handle = self.supervisor.start(list(runner_argv), cwd=paths["path"], env_allow=self.runner_env_allow,
                                        extra_env=env, on_line=progress, log_path=log_path,
-                                       status_path=status_path, timeout=self.runner_timeout, health=health)
+                                       status_path=status_path, timeout=self.runner_timeout, health=health,
+                                       parse_stdout=runner_usage)
         if handle.pid is None:
             result = handle.wait()
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="spawn_failed")
@@ -891,6 +925,8 @@ class Conductor:
             value = doc["usage"].get("cost_usd")
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost = float(value)
+        if not cost:
+            cost = float((result.get("parsed") or {}).get("cost_usd") or 0.0)
         cancel = self._cancel_terminal.get(key)
         if result["cancelled"] and cancel is not None:
             terminal, reason = cancel
