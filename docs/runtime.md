@@ -170,6 +170,30 @@ Pending units become ready automatically once all dependencies are merged.
   attempt is fed back to the controller and its record is persisted, so a
   new conductor rebuilds the controller after a restart. A `stop` from the
   controller moves the unit to `needs_user` (`escalation_stopped`).
+* Findings from the research-mcp M0 run `rm-m0f` (2026-10-25), fixed in
+  commit `c02a6c8`, with the file and the fix for each; regression tests in
+  `tests/test_m0_retro.py`:
+  * M0-22, a Keychain unit, merged on an inconclusive verifier verdict,
+    because ECC accepts that verdict when its own gates passed on the same
+    head. In `team/review.py` a unit that needs the security reviewer (high
+    risk, a `high_risk_paths` file or a security signal) now stops in
+    `needs_user` (`verifier_inconclusive`) instead; other units keep the old
+    acceptance.
+  * M0-20 took seven attempts on six pr_reviewer rejections. In
+    `runs/conductor.py`, `return_for_changes` stops the unit in `needs_user`
+    (`repeated_rejections`) when the same `<role>_changes_requested` reason
+    ends `REJECTION_CAP` (3) attempts in a row. The owner reads the findings
+    and resumes or rescopes; `ecc resume` allows one more attempt.
+  * Four retries had no cause in the retrospective: the
+    `shared_git_state_changed` stops never reach the escalation record.
+    `Drive.retro_table` in `team/drive.py` now lists every transition into
+    `needs_user`, `failed` or `blocked`, and every review return, from the
+    run's event log.
+  * Every unit reported `cost_usd` 0.0, because agents rarely fill `usage` in
+    their handoff. `start_unit` in `runs/conductor.py` passes `runner_usage`
+    as the supervisor's `parse_stdout`, which reads Claude's
+    `total_cost_usd` from the raw result line; the handoff value still wins
+    when it is set.
 * `Conductor.select_reviewer` re-classifies with the verified diff and calls
   `routing.select_reviewer` with the author's routing record. When no
   qualified reviewer exists for Tier 2 or high risk work, the unit moves to
