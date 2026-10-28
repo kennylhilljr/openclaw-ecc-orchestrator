@@ -16,6 +16,12 @@
     "rm -rf*",
     "git clean -fdx*"
   ],
+  "generated_file_couplings": [
+    {
+      "source": "src/models.py",
+      "generated": "schemas/model.json"
+    }
+  ],
   "allowed_providers": [
     "claude",
     "codex",

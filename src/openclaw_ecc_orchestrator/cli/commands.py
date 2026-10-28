@@ -28,6 +28,7 @@ from ..runs import state as S
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.manager import RunError
+from ..runs.plan_lint import lint_plan
 from ..runs.store import StoreError
 from ..worktrees.git import git_out, run_git
 from .config import UsageError, checked_path
@@ -101,6 +102,19 @@ def plan_create_run(ctx):
     tip = branch_tip(repo, cfg.target_branch)
     if tip is None:
         fail(op, "target_branch_exists", cfg.target_branch)
+    target_paths = run_git(["ls-tree", "-r", "-z", "--name-only", tip], repo).stdout.split("\0")
+    lint = lint_plan(plan, target_paths=target_paths, policy=policy)
+    lint_metadata = {
+        "finding_digest": lint["finding_digest"],
+        "finding_count": len(lint["findings"]),
+        "exemptions": lint["exemptions"],
+        "override": bool(a.allow_lint_findings),
+    }
+    if lint["findings"] and not a.allow_lint_findings:
+        fail(op, "plan_lint", f"{len(lint['findings'])} active findings; run lint-plan {path} for details",
+             actions=[{"kind": "review_plan_lint", "run_id": a.run_id,
+                       "detail": "resolve the findings or explicitly review --allow-lint-findings"}],
+             data=dict(lint, plan_file=path, target_commit=tip))
     if ctx.rt.store.exists(a.run_id):
         fail(op, "run_id_unique", f"run {a.run_id} already exists")
     res = ctx.rt.manager.create_run(plan, cfg.conductor_id, run_id=a.run_id, dry_run=True, policy=policy,
@@ -114,13 +128,17 @@ def plan_create_run(ctx):
                    plan_sha256=summary["plan_sha256"], layers=summary["layers"], ready=summary["ready"],
                    repo=repo, target_branch=cfg.target_branch, base_commit=tip, policy_file=policy_path,
                    policy_sha256=plan_digest(policy) if policy is not None else None,
-                   worktree_root=cfg.worktree_root, conductor_id=cfg.conductor_id)
-    return Plan(doc, checks=res["checks"], extra={"plan": plan, "policy": policy})
+                   plan_lint=lint_metadata, worktree_root=cfg.worktree_root, conductor_id=cfg.conductor_id)
+    warnings = ([f"plan lint override admits {len(lint['findings'])} active findings"]
+                if lint["findings"] else [])
+    return Plan(doc, checks=res["checks"], warnings=warnings,
+                extra={"plan": plan, "policy": policy, "lint": lint_metadata})
 
 
 def execute_create_run(ctx, plan):
     c = ctx.rt.conductor(plan.extra["policy"], "create-run")
-    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"])
+    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"],
+                        metadata={"plan_lint": plan.extra["lint"]})
 
 
 # == dispatch ==
