@@ -53,9 +53,6 @@ blocks `ps`, a few process tests in `tests/test_runs_manager.py` and
 
 pytest also runs the suite with the settings in `pyproject.toml` once the
 optional `test` extra is installed (`python -m pip install -e ".[test]"`).
-Run either runner with a system `python3.11`: when the interpreter is inside
-a virtual environment, about 85 tests fail, so treat failures from a venv
-run with suspicion until that is fixed.
 
 Plugin tests, from `integrations/openclaw-plugin/` with Node 22 or later:
 
