@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+.venv/
+*.egg-info/
 node_modules/
 dist/
 coverage/

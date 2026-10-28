@@ -51,6 +51,9 @@ Process liveness checks call `ps` (`runs/liveness.py`); in a sandbox that
 blocks `ps`, a few process tests in `tests/test_runs_manager.py` and
 `tests/test_runners_cli_flags.py` fail for that reason.
 
+pytest also runs the suite with the settings in `pyproject.toml` once the
+optional `test` extra is installed (`python -m pip install -e ".[test]"`).
+
 Plugin tests, from `integrations/openclaw-plugin/` with Node 22 or later:
 
 ```sh
