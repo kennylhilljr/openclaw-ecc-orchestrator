@@ -47,7 +47,8 @@ _PREFIX_PATTERNS = [
 ]
 _PREFIX_RE = re.compile("|".join("(?:%s)" % p for p in _PREFIX_PATTERNS))
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_=\-]{32,}")
+_TOKEN_MIN_LEN = 32
+_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_=\-]{%d,}" % _TOKEN_MIN_LEN)
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _ENTROPY_THRESHOLD = 4.0
 
@@ -108,12 +109,36 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _path_start(token: str) -> int:
+    """Index where an absolute path begins inside a token match, or -1.
+
+    "/" is a token character because base64 secrets contain it, so a whole
+    path such as a venv interpreter would otherwise be scored as one token.
+    A path starts the match, or follows "=" (``cwd=/x``); base64 only uses
+    "=" as trailing padding, so "=/" does not occur inside a secret.
+    """
+    if token.startswith("/"):
+        return 0
+    i = token.find("=/")
+    return i + 1 if i >= 0 else -1
+
+
+def _token_spans(m: re.Match) -> list[tuple[int, int]]:
+    token, base = m.group(0), m.start()
+    cut = _path_start(token)
+    if cut < 0:
+        return [m.span()] if _is_high_entropy(token) else []
+    # Score the text before the path as before, then each path segment alone.
+    parts = [(0, cut)] + [(cut + s.start(), cut + s.end()) for s in re.finditer(r"[^/]+", token[cut:])]
+    return [(base + a, base + b) for a, b in parts
+            if b - a >= _TOKEN_MIN_LEN and _is_high_entropy(token[a:b])]
+
+
 def _detect_spans(text: str) -> list[tuple[int, int]]:
     spans = [m.span() for m in _PREFIX_RE.finditer(text)]
     spans += [m.span() for m in _PEM_BLOCK_RE.finditer(text)]
     for m in _TOKEN_RE.finditer(text):
-        if _is_high_entropy(m.group(0)):
-            spans.append(m.span())
+        spans += _token_spans(m)
     return spans
 
 
