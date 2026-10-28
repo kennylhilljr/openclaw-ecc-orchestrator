@@ -6,6 +6,7 @@ number of directory segments; ``*`` and ``?`` never cross a ``/``.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 import unicodedata
 import urllib.parse
@@ -42,6 +43,7 @@ def unsafe_path_reason(path: object) -> str | None:
     return None
 
 
+@lru_cache(maxsize=4096)
 def _glob_to_regex(pattern: str) -> re.Pattern:
     out = []
     i = 0

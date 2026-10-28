@@ -225,6 +225,28 @@
     "catalog_max_age_seconds": {
       "type": "number",
       "exclusiveMinimum": 0
+    },
+    "generated_file_couplings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "source",
+          "generated"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1
+          },
+          "generated": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "description": "Path-pattern pairs which must be owned by the same work unit."
     }
   },
   "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block."

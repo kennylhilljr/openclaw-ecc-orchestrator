@@ -25,6 +25,7 @@ option of any subcommand lists them in full.
 | Subcommand | Kind | What it does |
 | :- | :- | :- |
 | `create-run` | gated | validate a plan (`plan`, `run-id`) and create a run pinned to the target branch tip |
+| `lint-plan` | read only | lint a plan against the pinned target tree and print stable findings and their digest |
 | `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, pending approvals and `required_user_actions` |
 | `dispatch` | gated | route, assign, create the worktree, run the runner, validate the handoff and verify; the unit ends in `reviewing` on success |
 | `verify` | gated | re-run the gates in the unit worktree and check head, cleanliness and scope; changes no run state |
@@ -252,9 +253,18 @@ the same pass and reported as a warning. `approval.resolved` is emitted with
 
 ## Subcommand notes
 
+* `lint-plan plan <file>` is read only. It checks DAG relationships,
+  unordered overlapping scopes, acceptance paths against the pinned target
+  tree, configured generated-file couplings, transitive capability
+  requirements and structured exemptions. Findings are sorted before their
+  SHA-256 digest is computed, so equivalent input produces the same review
+  artifact. Active findings return a failed envelope and exit code 1.
 * `create-run` requires `run-id` and `plan` (a JSON file holding
   `{"units": [...]}` or a list of work units; duplicate keys are refused).
-  The plan pins the target tip as the base commit.
+  The plan pins the target tip as the base commit and refuses active lint
+  findings. `allow-lint-findings` is an explicit override: its boolean,
+  finding count and digest, plus applied exemptions, are included in the
+  command plan reviewed by `review-plan` and persisted in run metadata.
 * `dispatch` works on a `ready` unit whose scope does not overlap an active
   unit. The plan predicts the routing the conductor will choose (classify,
   the escalation controller rebuilt from the persisted record,

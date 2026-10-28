@@ -1,0 +1,89 @@
+{
+  "units": [
+    {
+      "schema_version": "1.0",
+      "id": "generate-schema",
+      "title": "Generate schema",
+      "depends_on": [],
+      "scope": {
+        "files": [
+          "src/models.py",
+          "schemas/model.json"
+        ]
+      },
+      "acceptance": {
+        "commands": [
+          "python3 -m unittest"
+        ],
+        "paths": [
+          "schemas/work_unit.schema.json"
+        ]
+      },
+      "risk": "low",
+      "capabilities": {
+        "network": false,
+        "secrets": []
+      },
+      "routing": {
+        "initial_tier": 0,
+        "maximum_tier": 1,
+        "reviewer_must_differ_from_author": true
+      },
+      "budget": {
+        "attempts": 2,
+        "minutes": 10,
+        "maximum_cost_usd": 0.25
+      },
+      "rollback": "Revert the documentation commit.",
+      "traits": [
+        "mechanical"
+      ],
+      "provides": [
+        "schema-ready"
+      ]
+    },
+    {
+      "schema_version": "1.0",
+      "id": "consume-schema",
+      "title": "Consume schema",
+      "depends_on": [
+        "generate-schema"
+      ],
+      "scope": {
+        "files": [
+          "docs/schema.md"
+        ]
+      },
+      "acceptance": {
+        "commands": [
+          "python3 -m unittest"
+        ],
+        "paths": [
+          "docs/runtime.md"
+        ]
+      },
+      "risk": "low",
+      "capabilities": {
+        "network": false,
+        "secrets": []
+      },
+      "routing": {
+        "initial_tier": 0,
+        "maximum_tier": 1,
+        "reviewer_must_differ_from_author": true
+      },
+      "budget": {
+        "attempts": 2,
+        "minutes": 10,
+        "maximum_cost_usd": 0.25
+      },
+      "rollback": "Revert the documentation commit.",
+      "traits": [
+        "mechanical"
+      ],
+      "requires": [
+        "schema-ready"
+      ]
+    }
+  ]
+}
