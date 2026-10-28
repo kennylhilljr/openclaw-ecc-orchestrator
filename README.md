@@ -3,6 +3,21 @@
 Thin, provider-aware orchestration plugin for ECC workflows running through
 OpenClaw.
 
+## Run the CLI locally
+
+Python 3.11 or later is required. The package has no runtime Python
+dependencies.
+
+```sh
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+ecc-orchestrator --help
+```
+
+See the [CLI operator guide](docs/cli.md) for subcommands, configuration
+precedence, exit codes, and approval gates.
+
 Planned responsibilities:
 
 - validate ECC-style task DAGs;
