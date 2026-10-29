@@ -434,6 +434,29 @@ lives in `integrations/launchd/`.
 * `drive` refuses a run whose plan file changed after `create-run` (same units in a new layout is not a
   change), before the architect's plan check. The stop names the file's plan sha and the next command:
   `create-run --replace` with the same run id while nothing was dispatched, otherwise a new run.
+* `drive` runs the delivery lead's close step before the milestone review when `.orchestration/team.json`
+  has a `milestone.close` block. Every check reads the target branch, so the drift check, the gates and
+  the product owners start only from a target that holds the close step's commits:
+  * `commands`: run in a detached checkout of the target (the plan-status generator that sets merged rows
+    to done, trace-check with every merged unit due). `{units}` (merged unit ids, comma separated) and
+    `{milestone}` are filled in. A non-zero exit stops with `close_command_failed`; a command that
+    changes files stops with `close_changes_pending` until those changes are committed to the target.
+  * `plan` and `test_plan`: the test plan must name the plan's file (for example `M1-plan-v6`), else
+    `test_plan_stale`.
+  * `handoff` (default `docs/build/{milestone}-handoff-v1.md`) must be on the target. When it is missing
+    the drive drafts it under `<state_dir>/reports/` from `handoff_template` (read from the target) with
+    the close evidence and stops with `handoff_missing`.
+  * `owner_checks`: a list of `{"id", "title", "steps"}`. Each needs a line in the handoff on the target
+    that names its id and a result (Passed or Failed); otherwise the drive stops with
+    `owner_checks_pending` and prints every pending check's steps, instead of a product rejection.
+
+  ```json
+  {"milestone": {"name": "M1", "close": {
+    "commands": ["node tools/sdd/cli.mjs trace-check --due {units}"],
+    "plan": "docs/build/M1-plan-v6.md", "test_plan": "docs/test/test-plan-v5.md",
+    "handoff_template": "docs/sdd/templates/handoff.md",
+    "owner_checks": [{"id": "OC-01", "title": "install and doctor", "steps": ["research-mcp install", "research-mcp doctor"]}]}}}
+  ```
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.

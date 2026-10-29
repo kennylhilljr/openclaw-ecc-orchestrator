@@ -9,6 +9,7 @@ product owner pair. The drive stops only for section 7's conditions.
 
 import json
 import os
+import re
 import shlex
 
 from ..merge_queue.conflicts import diff_stats
@@ -94,6 +95,16 @@ def parse_product(text, head):
         doc["verdict"] = "reject"
         doc["downgraded"] = "accept with an unmet or missing criterion"
     return doc, None
+
+
+_RESULT_RE = re.compile(r"\b(?:passed|pass|failed|fail)\b", re.IGNORECASE)
+
+
+def _owner_check_recorded(text, check_id):
+    """True when a line of the handoff names `check_id` and a result (Passed
+    or Failed), as research-mcp's M0 handoff records OC-01 and OC-02."""
+    named = re.compile(r"(?<![\w-])" + re.escape(check_id) + r"(?![\w-])")
+    return any(named.search(line) and _RESULT_RE.search(named.sub("", line)) for line in text.splitlines())
 
 
 class Drive:
@@ -413,6 +424,9 @@ class Drive:
             self.progress("milestone end: practices steward")
             self.steward.run(final=True)
             head = git_out(["rev-parse", f"refs/heads/{self.c.target}"], repo)
+        stop = self.milestone_close(run, head)
+        if stop is not None:
+            return stop
         report = {"run_id": self.run_id, "milestone": milestone.get("name"), "head": head, "base": base,
                   "at": iso(self.clock()), "practices": (self.state.get("learning") or {}).get("runs") or []}
         if "milestone_end" in (self.cfg["roles"]["architect"].get("when") or []) and not self.state.get("drift"):
@@ -528,14 +542,109 @@ class Drive:
         commands = (self.cfg.get("milestone") or {}).get("gate_commands") or []
         if not commands or self.gate_runner is None:
             return []
+        return self._on_head(head, lambda path: [self.gate_runner(cmd, path) for cmd in commands])
+
+    def _on_head(self, head, fn):
+        """Call fn(path) in a throwaway detached checkout of `head`."""
         repo = self.c.worktrees.repo
         path = os.path.join(self.step.worktree_root, "_milestone", f"{self.run_id}-{int(self.clock() * 1000)}")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         run_git(["worktree", "add", "-q", "--detach", path, head], repo)
         try:
-            return [self.gate_runner(cmd, path) for cmd in commands]
+            return fn(path)
         finally:
             run_git(["worktree", "remove", "--force", path], repo, check=False)
+
+    def _read_at(self, head, path):
+        proc = run_git(["show", f"{head}:{path}"], self.c.worktrees.repo, check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    # == milestone close ==
+    def milestone_close(self, run, head):
+        """The delivery lead's close step before the product review (issue #12).
+        research-mcp M0 was rejected twice for bookkeeping: merged units still
+        `planned` in the plan, a test plan gate naming plan v1, and owner checks
+        with no recorded result, or recorded on a branch not yet merged. Every
+        check here reads the target branch, so the review starts only from a
+        target that holds the close step's commits. Configured in team.json
+        `milestone.close`; `{milestone}` and `{units}` (the merged unit ids,
+        comma separated) are filled into commands and paths."""
+        milestone = self.cfg.get("milestone") or {}
+        close = milestone.get("close") or {}
+        if not close:
+            return None
+        name = str(milestone.get("name") or "milestone")
+        target = self.c.target
+        merged = sorted(uid for uid, u in run["units"].items() if u["state"] == S.MERGED)
+
+        def fill(text):
+            return str(text).replace("{milestone}", name).replace("{units}", ",".join(merged))
+
+        commands = [fill(c) for c in close.get("commands") or []]
+        self.progress("milestone end: delivery lead close step")
+
+        def run_commands(path):
+            out = [self.gate_runner(cmd, path) for cmd in commands] if self.gate_runner else []
+            status = git_out(["status", "--porcelain", "--untracked-files=all"], path)
+            return out, [line[3:] for line in status.splitlines() if line.strip()]
+
+        results, changed = self._on_head(head, run_commands) if commands else ([], [])
+        problems, steps = [], []
+        for r in results:
+            if r.get("exit_code") != 0:
+                problems.append(("close_command_failed", f"`{r.get('command')}` exit {r.get('exit_code')}: "
+                                                         f"{str(r.get('output_tail') or '')[-600:]}"))
+        if changed:
+            problems.append(("close_changes_pending", f"the close commands change {', '.join(changed[:20])} on "
+                                                      f"{target} at {head[:12]}"))
+            steps.append(f"on {target}, run {'; '.join(commands)}, then commit the changes")
+        plan_doc, test_plan = close.get("plan"), close.get("test_plan")
+        if plan_doc and test_plan:
+            stem = os.path.splitext(os.path.basename(fill(plan_doc)))[0]
+            if stem not in (self._read_at(head, fill(test_plan)) or ""):
+                problems.append(("test_plan_stale", f"{fill(test_plan)} on {target} does not name {stem}"))
+                steps.append(f"point the milestone gate in {fill(test_plan)} at {stem} and commit it to {target}")
+        handoff = fill(close.get("handoff") or "docs/build/{milestone}-handoff-v1.md")
+        text = self._read_at(head, handoff)
+        checks = [c for c in close.get("owner_checks") or [] if isinstance(c, dict) and c.get("id")]
+        if text is None:
+            draft = self._draft_handoff(head, name, fill, close, results, checks, os.path.basename(handoff))
+            problems.append(("handoff_missing", f"{handoff} is not on {target}; a draft is at {draft}"))
+            steps.append(f"complete the draft {draft} and commit it to {target} as {handoff}")
+        pending = [c for c in checks if not _owner_check_recorded(text or "", c["id"])]
+        if pending:
+            problems.append(("owner_checks_pending", "owner checks pending: " + ", ".join(c["id"] for c in pending)))
+            for c in pending:
+                how = "; ".join(str(s) for s in c.get("steps") or []) or "see the test plan"
+                steps.append(f"owner check {c['id']} ({c.get('title') or ''}): {how}; record the result (Passed or "
+                             f"Failed, date, evidence) in a row naming {c['id']} in {handoff} on {target}")
+        self.state["close"] = {"head": head, "merged_units": merged, "commands": results, "changed": changed,
+                               "problems": [{"kind": k, "detail": d} for k, d in problems]}
+        self._save()
+        if not problems:
+            return None
+        return self._stop(problems[0][0], "; ".join(d for _, d in problems), {"close": self.state["close"]},
+                          next_steps=[{"kind": "milestone_close", "run_id": self.run_id, "detail": s, "command": s}
+                                      for s in steps])
+
+    def _draft_handoff(self, head, name, fill, close, results, checks, filename):
+        """The milestone handoff drafted from the repository's template (on the
+        target branch) with the close step's evidence; the owner completes and
+        commits it."""
+        template = close.get("handoff_template")
+        text = self._read_at(head, fill(template)) if template else None
+        lines = [fill(text).rstrip() if text else f"# {name} handoff (v1)", "",
+                 "## Gate evidence (drafted by ECC)", "", f"Target branch at `{head}`.", ""]
+        lines += [f"- `{r.get('command')}`: exit {r.get('exit_code')}" for r in results] or ["- (no close commands)"]
+        if checks:
+            lines += ["", "| Check | Result |", "| --- | --- |"]
+            lines += [f"| Owner check {c['id']} ({c.get('title') or ''}) | *pending: run the steps and record "
+                      f"Passed or Failed, the date and the evidence* |" for c in checks]
+        os.makedirs(self.reports_dir, exist_ok=True)
+        path = os.path.join(self.reports_dir, f"{self.run_id}-{filename}")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
 
     def product_pack(self, report):
         repo = self.c.worktrees.repo

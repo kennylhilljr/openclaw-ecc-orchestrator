@@ -160,6 +160,88 @@ class DriveTests(DriveBase):
         self.assertEqual(self.architect_turns(), 1)
         self.assertTrue(self.drive.state["plan_check"]["cached"])
 
+    # Issue #12: research-mcp M0 was rejected twice for bookkeeping the close step catches.
+    HANDOFF = "docs/build/M0-handoff-v1.md"
+
+    def commit_on(self, branch, path, content):
+        """Commit `path` on `branch` without touching any checkout."""
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+
+            def g(*args, stdin=None):
+                return subprocess.run(["git", *args], cwd=self.repo, env=env, input=stdin, text=True, check=True,
+                                      capture_output=True).stdout.strip()
+            g("read-tree", branch)
+            blob = g("hash-object", "-w", "--stdin", stdin=content)
+            g("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+            commit = g("commit-tree", g("write-tree"), "-p", branch, "-m", f"owner: {path}")
+        self.move(branch, commit)
+        return commit
+
+    def move(self, branch, commit):
+        git(self.repo, "update-ref", f"refs/heads/{branch}", commit)
+        if branch == "main":  # the test repo checks main out; the merge queue refuses a stale checkout
+            git(self.repo, "reset", "-q", "--hard", "main")
+
+    def close_team(self, **close):
+        spec = {"owner_checks": [{"id": "OC-01", "title": "install",
+                                  "steps": ["run research-mcp install", "run research-mcp doctor"]}]}
+        spec.update(close)
+        return {"merge_approval": "agents", "milestone": {"name": "M0", "close": spec}}
+
+    def test_owner_checks_pending_stop_before_the_product_review(self):
+        self.commit_on("main", self.HANDOFF, "# M0 handoff\n\n| Owner check OC-01 (install) | *pending* |\n")
+        res = self.make(self.units2(), team=self.close_team()).go()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["stop"], "owner_checks_pending")
+        self.assertIn("run research-mcp install; run research-mcp doctor", res["data"]["next_steps"][0])
+        self.assertEqual({u["state"] for u in self.m.load("r1")["units"].values()}, {"merged"})
+        self.assertNotIn("product_owner", [r for r, _ in self.calls])
+
+    def test_review_starts_only_once_the_results_are_on_the_target_branch(self):
+        self.commit_on("main", self.HANDOFF, "# M0 handoff\n")
+        drive = self.make(self.units2(), team=self.close_team())
+        self.assertEqual(drive.go()["data"]["stop"], "owner_checks_pending")
+        git(self.repo, "branch", "owner-checks", "main")
+        recorded = self.commit_on("owner-checks", self.HANDOFF,
+                                  "# M0 handoff\n\n| Owner check OC-01 (install) | Passed, 2026-10-25 |\n")
+        self.assertEqual(drive.go()["data"]["stop"], "owner_checks_pending")
+        self.move("main", recorded)
+        res = drive.go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        with open(res["data"]["report"][:-3] + ".json") as fh:
+            self.assertEqual(json.load(fh)["head"], recorded)
+        self.assertIn("product_owner", [r for r, _ in self.calls])
+
+    def test_missing_handoff_is_drafted_from_the_template(self):
+        self.commit_on("main", "docs/sdd/handoff.md", "# {milestone} handoff (v1)\n\n## What changed\n")
+        res = self.make(self.units2(), team=self.close_team(handoff_template="docs/sdd/handoff.md")).go()
+        self.assertEqual(res["data"]["stop"], "handoff_missing")
+        draft = res["data"]["close"]["problems"][0]["detail"].rsplit(" ", 1)[-1]
+        with open(draft) as fh:
+            text = fh.read()
+        self.assertTrue(text.startswith("# M0 handoff (v1)"))
+        self.assertIn("| Owner check OC-01 (install) | *pending", text)
+
+    def test_close_command_changes_must_be_on_the_target_first(self):
+        """The plan-status generator's output (merged rows set to done) is committed before the review."""
+        import subprocess
+
+        def runner(cmd, path):
+            p = subprocess.run(cmd, shell=True, cwd=path, capture_output=True, text=True)
+            return {"command": cmd, "exit_code": p.returncode, "output_tail": p.stdout + p.stderr}
+        self.commit_on("main", self.HANDOFF, "# M0 handoff\n")
+        cmd = f"{PY} -c \"open('status.txt', 'w').write('{{units}}')\""
+        drive = self.make(self.units2(), team=self.close_team(commands=[cmd], owner_checks=[]))
+        drive.gate_runner = runner
+        res = drive.go()
+        self.assertEqual(res["data"]["stop"], "close_changes_pending")
+        self.assertIn("status.txt", res["data"]["detail"])
+        self.commit_on("main", "status.txt", "alpha,beta")
+        self.assertTrue(drive.go()["ok"])
+
     def test_drive_checks_again_after_a_cached_failure(self):
         self.replies["plan_check"] = ["changes_requested"]
         self.drive = self.make(self.units2())
