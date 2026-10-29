@@ -433,7 +433,7 @@ lives in `integrations/launchd/`.
   current tip (TEAM-DELIVERY v5 4.4).
 * `drive` refuses a run whose plan file changed after `create-run` (same units in a new layout is not a
   change), before the architect's plan check. The stop names the file's plan sha and the next command:
-  `create-run --replace` with the same run id while nothing was dispatched, otherwise a new run.
+  `create-run` with `replace` and the same run id while nothing was dispatched, otherwise a new run.
 * `drive` runs the delivery lead's close step before the milestone review when `.orchestration/team.json`
   has a `milestone.close` block. Every check reads the target branch, so the drift check, the gates and
   the product owners start only from a target that holds the close step's commits:
@@ -452,7 +452,7 @@ lives in `integrations/launchd/`.
 
   ```json
   {"milestone": {"name": "M1", "close": {
-    "commands": ["node tools/sdd/cli.mjs trace-check --due {units}"],
+    "commands": ["tools/milestone-close.sh {units}"],
     "plan": "docs/build/M1-plan-v6.md", "test_plan": "docs/test/test-plan-v5.md",
     "handoff_template": "docs/sdd/templates/handoff.md",
     "owner_checks": [{"id": "OC-01", "title": "install and doctor", "steps": ["research-mcp install", "research-mcp doctor"]}]}}}

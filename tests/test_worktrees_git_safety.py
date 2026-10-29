@@ -147,13 +147,15 @@ class GuardTests(Base):
         changes = self.diff(allow_refs=[self.unit["branch"]])
         self.assertTrue(any("refs/heads/main" in c and "moved" in c for c in changes), changes)
 
-    def test_new_tag_branch_and_remote_ref_detected(self):
+    def test_new_tag_and_branch_detected_remote_ref_ignored(self):
         git(self.wt, "tag", "v9")
         git(self.wt, "branch", "side")
         git(self.wt, "update-ref", "refs/remotes/origin/fake", "HEAD")
         changes = " ".join(self.diff(allow_refs=[self.unit["branch"]]))
-        for ref in ("refs/tags/v9", "refs/heads/side", "refs/remotes/origin/fake"):
+        for ref in ("refs/tags/v9", "refs/heads/side"):
             self.assertIn(ref, changes)
+        # Issue #11: remote-tracking refs only mirror a fetch; the owner's push moves them.
+        self.assertNotIn("refs/remotes/", changes)
 
     def test_deleted_ref_detected(self):
         git(self.repo, "branch", "keep")
