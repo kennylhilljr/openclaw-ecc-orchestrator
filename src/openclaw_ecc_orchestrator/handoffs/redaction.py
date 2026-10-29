@@ -51,7 +51,8 @@ _PREFIX_PATTERNS = [
 ]
 _PREFIX_RE = re.compile("|".join("(?:%s)" % p for p in _PREFIX_PATTERNS))
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_=\-]{32,}")
+_TOKEN_MIN_LEN = 32
+_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_=\-]{%d,}" % _TOKEN_MIN_LEN)
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _ENTROPY_THRESHOLD = 4.0
 

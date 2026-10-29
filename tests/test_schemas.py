@@ -111,6 +111,42 @@ class WorkUnitTests(unittest.TestCase):
     def test_scope_globs_allowed(self):
         self.assertTrue(schemas.validate_work_unit(work_unit(scope={"files": ["src/pkg/**/*.py"]})).ok)
 
+    def test_acceptance_paths_are_safe_repository_patterns(self):
+        valid = work_unit(acceptance={
+            "commands": ["pytest -q"],
+            "paths": ["src/pkg/**/*.py", "schemas/work_unit.schema.json"],
+        })
+        self.assertTrue(schemas.validate_work_unit(valid).ok)
+        for paths in (["../outside.py"], ["/etc/passwd"], [""], "src/pkg.py"):
+            with self.subTest(paths=paths):
+                invalid = work_unit(acceptance={"commands": ["pytest -q"], "paths": paths})
+                self.assertFalse(schemas.validate_work_unit(invalid).ok)
+
+    def test_capability_contract_tokens_must_be_nonempty_strings(self):
+        self.assertTrue(schemas.validate_work_unit(
+            work_unit(provides=["schema-ready"], requires=["models-ready"])).ok)
+        for field, value in (("provides", [""]), ("requires", [1]),
+                             ("provides", "schema-ready")):
+            with self.subTest(field=field, value=value):
+                self.assertFalse(schemas.validate_work_unit(work_unit(**{field: value})).ok)
+
+    def test_lint_exemptions_require_code_reason_and_closed_shape(self):
+        valid = work_unit(lint_exemptions=[{
+            "code": "requirements.unsatisfied",
+            "reason": "Reviewed legacy boundary",
+        }])
+        self.assertTrue(schemas.validate_work_unit(valid).ok)
+        for exemption in ({"reason": "missing code"},
+                          {"code": "requirements.unsatisfied"},
+                          {"code": "", "reason": "empty code"},
+                          {"code": "requirements.unsatisfied", "reason": ""},
+                          {"code": "requirements.unsatisfied", "reason": "reviewed",
+                           "ticket": "OPS-1"},
+                          "not-an-object"):
+            with self.subTest(exemption=exemption):
+                report = schemas.validate_work_unit(work_unit(lint_exemptions=[exemption]))
+                self.assertFalse(report.ok)
+
     def test_negative_budgets_rejected(self):
         for field, value in (("attempts", -1), ("attempts", 0), ("minutes", -5),
                              ("maximum_cost_usd", -0.01), ("attempts", True),
@@ -266,6 +302,26 @@ class PolicyTests(unittest.TestCase):
     def test_glob_lists_must_be_strings(self):
         self.assertFalse(schemas.validate_repository_policy(policy(high_risk_paths="x")).ok)
         self.assertFalse(schemas.validate_repository_policy(policy(high_risk_paths=["/abs/**"])).ok)
+
+    def test_generated_file_couplings_are_safe_closed_pairs(self):
+        valid = policy(generated_file_couplings=[{
+            "source": "src/models/**/*.py",
+            "generated": "schemas/*.json",
+        }])
+        self.assertTrue(schemas.validate_repository_policy(valid).ok)
+        for couplings in (
+                [{"source": "../models.py", "generated": "schemas/model.json"}],
+                [{"source": "src/models.py", "generated": "/tmp/model.json"}],
+                [{"source": "src/models.py"}],
+                [{"source": "src/models.py", "generated": "schemas/model.json",
+                  "command": "generate"}],
+                [{"source": "", "generated": "schemas/model.json"}],
+                ["src/models.py"],
+                "src/models.py"):
+            with self.subTest(couplings=couplings):
+                report = schemas.validate_repository_policy(
+                    policy(generated_file_couplings=couplings))
+                self.assertFalse(report.ok)
 
     def test_openrouter_requires_pinned_models_and_data_policy(self):
         doc = policy(allowed_providers=["claude", "openrouter"])

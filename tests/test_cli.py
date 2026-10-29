@@ -30,7 +30,7 @@ class EntryPointTest(S.CliTestBase):
         proc = self.module("--help")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for name in ("create-run", "status", "dispatch", "verify", "review", "merge", "cleanup", "approvals",
-                     "events", "doctor", "review-plan"):
+                     "events", "doctor", "review-plan", "lint-plan"):
             self.assertIn(name, proc.stdout)
 
     def test_module_doctor_json(self):
@@ -101,6 +101,59 @@ class UsageAndConfigTest(S.CliTestBase):
         code, doc = self.cli("doctor")
         self.assertEqual(code, 1)
         self.assertIn("policy_valid", failed(doc))
+
+
+class PlanLintCliTest(S.CliTestBase):
+    def test_lint_plan_is_read_only_and_deterministic(self):
+        before = self.snapshot()
+        first = self.ok(self.cli("lint-plan", "--plan", self.plan_path))
+        second = self.ok(self.cli("lint-plan", "--plan", self.plan_path))
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(first["data"]["finding_digest"], second["data"]["finding_digest"])
+        self.assertEqual(first["data"]["findings"], [])
+        self.assertEqual(first["data"]["target_commit"], S.git(self.repo, "rev-parse", "main"))
+
+    def test_create_run_refuses_findings_without_reviewed_override(self):
+        self.plan["units"][0]["acceptance"]["paths"] = ["missing.txt"]
+        self.plan_path = self.write_json("bad-plan.json", self.plan)
+
+        code, lint_doc = self.cli("lint-plan", "--plan", self.plan_path)
+        self.assertEqual(code, 1)
+        self.assertFalse(lint_doc["ok"])
+        self.assertEqual(lint_doc["operation"], "lint-plan")
+        self.assertIn("plan_lint", failed(lint_doc))
+        self.assertEqual({finding["code"] for finding in lint_doc["data"]["findings"]},
+                         {"acceptance.path_missing"})
+
+        code, doc = self.cli("create-run", "--run-id", self.RUN_ID, "--plan", self.plan_path, "--dry-run")
+        self.assertEqual(code, 3)
+        self.assertIn("plan_lint", failed(doc))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "runs", self.RUN_ID)))
+
+        created = self.ok(self.reviewed("create-run", "--run-id", self.RUN_ID, "--plan", self.plan_path,
+                                        "--allow-lint-findings"))
+        self.assertEqual(created["data"]["plan"]["plan_lint"]["finding_count"], 1)
+        with open(os.path.join(self.state, "runs", self.RUN_ID, "run.json")) as fh:
+            run = json.load(fh)
+        self.assertEqual(run["metadata"]["plan_lint"]["finding_count"], 1)
+        self.assertTrue(run["metadata"]["plan_lint"]["override"])
+        self.assertEqual(run["metadata"]["plan_lint"]["finding_digest"],
+                         created["data"]["plan"]["plan_lint"]["finding_digest"])
+
+    def test_target_tree_preserves_leading_space_and_non_ascii_filename(self):
+        filename = " leading-ñame.py"
+        with open(os.path.join(self.repo, filename), "w") as fh:
+            fh.write("# literal target-tree filename\n")
+        S.git(self.repo, "add", "--", filename)
+        S.git(self.repo, "commit", "-m", "add unusual filename")
+        self.plan["units"][0]["acceptance"]["paths"] = [filename]
+        self.plan_path = self.write_json("literal-plan.json", self.plan)
+
+        lint_doc = self.ok(self.cli("lint-plan", "--plan", self.plan_path))
+        self.assertEqual(lint_doc["data"]["findings"], [])
+        create_doc = self.ok(self.cli("create-run", "--run-id", self.RUN_ID,
+                                      "--plan", self.plan_path, "--dry-run"))
+        self.assertEqual(create_doc["data"]["plan"]["plan_lint"]["finding_count"], 0)
 
 
 class DoctorTest(S.CliTestBase):

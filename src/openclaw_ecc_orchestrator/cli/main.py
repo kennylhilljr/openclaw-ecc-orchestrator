@@ -20,15 +20,16 @@ from ..plugin.approvals import plan_digest
 from ..plugin.summary import summarize_required_user_actions
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json, read_jsonl
+from ..runs.plan_lint import lint_plan
 from ..runs.store import iso
-from ..worktrees.git import git_out, toplevel
+from ..worktrees.git import git_out, run_git, toplevel
 from ..worktrees.manager import validate_root
 from ..plugin.inbox import probe_processor_lock, processor_lock_path
 from . import inbox_processor, output
-from .commands import GATED, load_run
+from .commands import GATED, branch_tip, load_run
 from .config import UsageError, checked_path, forbidden_location, load_config, valid_handle, valid_id
 from .reviews import ReviewStore
-from .runtime import CommandFailed, Runtime
+from .runtime import CommandFailed, Runtime, read_document
 
 PROG = "ecc-orchestrator"
 MIN_GIT = (2, 38)
@@ -132,7 +133,13 @@ def build_parser():
     p = sub.add_parser("create-run", help="validate a plan and create a run")
     p.add_argument("--run-id", dest="run_id", type=_id, required=True)
     p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
+    p.add_argument("--allow-lint-findings", dest="allow_lint_findings", action="store_true",
+                   help="create the run despite plan-lint findings (the reviewed plan records the override)")
     _common(p), _mutating(p)
+
+    p = sub.add_parser("lint-plan", help="lint a plan against the pinned target tree without changing state")
+    p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
+    _common(p)
 
     p = sub.add_parser("status", help="runs, units, budgets, pending approvals, required user actions")
     p.add_argument("--run-id", dest="run_id", type=_id)
@@ -731,6 +738,30 @@ def cmd_doctor(ctx):
     return env
 
 
+def cmd_lint_plan(ctx):
+    """Lint a plan using only the configured policy and target commit."""
+    op = "lint-plan"
+    path = checked_path(ctx.args.plan, "plan", ctx.cwd)
+    _, plan = read_document(path, "plan", op)
+    if isinstance(plan, list):
+        plan = {"units": plan}
+    repo = ctx.rt.repo_top(op)
+    policy, policy_path = ctx.rt.load_policy(op)
+    target = branch_tip(repo, ctx.cfg.target_branch)
+    if target is None:
+        detail = f"target branch {ctx.cfg.target_branch!r} does not exist"
+        return envelope(op, ok=False, checks=[check("target_branch_exists", False, detail)])
+    target_paths = run_git(["ls-tree", "-r", "-z", "--name-only", target], repo).stdout.split("\0")
+    result = lint_plan(plan, target_paths=target_paths, policy=policy)
+    count = len(result["findings"])
+    detail = f"{count} active finding{'s' if count != 1 else ''}; digest {result['finding_digest']}"
+    data = dict(result, plan_file=path, target_commit=target, target_branch=ctx.cfg.target_branch,
+                policy_file=policy_path)
+    env = envelope(op, ok=result["ok"], checks=[check("plan_lint", result["ok"], detail)], data=data)
+    env["_summary"] = [detail]
+    return env
+
+
 def cmd_review_plan(ctx, parser, make_ctx):
     a = ctx.args
     inner = list(a.inner or [])
@@ -856,6 +887,8 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
             elif op == "preflight":
                 from .preflight import cmd_preflight
                 result = cmd_preflight(ctx)
+            elif op == "lint-plan":
+                result = cmd_lint_plan(ctx)
             else:  # pragma: no cover - argparse restricts the choices
                 raise UsageError(f"unknown subcommand {op}")
     except UsageError as exc:

@@ -71,6 +71,14 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Repository-relative path or glob that must match the pinned target tree."
+          }
         }
       }
     },
@@ -192,6 +200,43 @@
           "minimum": 2,
           "maximum": 20,
           "default": 5
+        }
+      }
+    },
+    "provides": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Capability tokens used for transitive plan ordering checks."
+    },
+    "requires": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Capability tokens used for transitive plan ordering checks."
+    },
+    "lint_exemptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "reason"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     }

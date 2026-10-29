@@ -153,6 +153,8 @@ Pending units become ready automatically once all dependencies are merged.
   passes `schemas.validate_repository_policy`. The policy is stored with the
   run. Two concurrent `create_run` calls with the same run id produce one
   winner; the others get an envelope with a failed `run_id_unique` check.
+  The operator CLI first lints the plan against the pinned target tree and
+  persists the stable finding digest, exemptions and any reviewed override.
 * Runners receive `ECC_HANDOFF_PATH` and `ECC_UNIT_ID`. After the runner
   exits, `record_handoff` validates the handoff with
   `schemas.validate_handoff(handoff, unit)`; it must have status `succeeded`

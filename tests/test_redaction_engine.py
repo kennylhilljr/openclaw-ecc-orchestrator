@@ -85,6 +85,28 @@ class EnginePatternTests(unittest.TestCase):
                      "0123456789abcdef0123456789abcdef01234567"):
             self.assertEqual(r.redact(text), text)
 
+    def test_absolute_paths_untouched(self):
+        # A venv interpreter or macOS temp dir path used to be masked whole,
+        # because "/" is a token character and the path mixes case and digits.
+        r = Redactor()
+        for text in ("/var/folders/6j/8_5x46rs3db2852wd7wb16v40000gn/T/venv-oc/bin/python",
+                     "/Users/Dev1/Documents/GitHub/openclaw-ecc-orchestrator/.venv/bin/python3.11",
+                     "/Users/Dev1/Projects/Orchestrator2/build/tmpAb3xY9z/worktrees/unit-a"):
+            with self.subTest(text=text):
+                self.assertFalse(contains_secret(text))
+                self.assertEqual(r.redact(text), text)
+                self.assertEqual(r.redact(f"cwd={text} ok"), f"cwd={text} ok")
+
+    def test_secret_inside_path_or_with_slashes_still_redacted(self):
+        r = Redactor()
+        secret = SAMPLES["high_entropy"]
+        out = r.redact(f"/tmp/cache/{secret}/file")
+        self.assertNotIn(secret, out)
+        self.assertTrue(out.startswith("/tmp/cache/"))
+        aws_style = "Xq7Lp2Zr9Vt4/Mb8Nc1Kd6Hf3Jg5/Ws0YeR2uT8iO"
+        self.assertTrue(contains_secret(f"key {aws_style} end"))
+        self.assertNotIn(aws_style, r.redact(f"key {aws_style} end"))
+
     def test_literal_secret_registration(self):
         r = Redactor()
         r.add_secret("plain-looking-value")

@@ -110,7 +110,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
         "file": "work_unit.schema.json",
         "required": ["schema_version", "id", "title", "depends_on", "scope", "acceptance",
                      "risk", "capabilities", "routing", "budget", "rollback"],
-        "optional": ["traits", "description", "health"],
+        "optional": ["traits", "description", "health", "provides", "requires", "lint_exemptions"],
         "nested_required": {
             "scope": ["files"],
             "acceptance": ["commands"],
@@ -137,7 +137,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
                      "protected_commands", "allowed_providers", "budget"],
         "optional": ["author_providers", "model_preferences", "retired_model_ids", "cli_models", "runner_costs",
                      "cost_estimation", "circuit_breaker", "openrouter",
-                     "catalog_max_age_seconds", "health", "review_independence"],
+                     "catalog_max_age_seconds", "health", "review_independence", "generated_file_couplings"],
         "nested_required": {"budget": ["max_cost_usd_per_unit", "max_cost_usd_total",
                                        "max_minutes_per_unit"]},
         "enums": {"allowed_providers[]": list(KNOWN_PROVIDERS)},
@@ -309,6 +309,14 @@ def validate_work_unit(doc: Any) -> ValidationReport:
         if _check_str_list(cmds, "acceptance.commands", report):
             if any(not c.strip() for c in cmds):
                 report.error("acceptance.commands entries must be non-empty")
+    if "paths" in acceptance:
+        paths = acceptance.get("paths")
+        if _check_str_list(paths, "acceptance.paths", report):
+            for entry in paths:
+                reason = unsafe_path_reason(entry)
+                if reason:
+                    report.error("acceptance.paths entry rejected (%s): %s"
+                                 % (reason, _show(entry)))
 
     if "risk" in doc and doc.get("risk") not in RISKS:
         report.error("risk must be one of %s: %s" % (list(RISKS), _show(doc.get("risk"))))
@@ -354,6 +362,27 @@ def validate_work_unit(doc: Any) -> ValidationReport:
     if "health" in doc:
         for message in health_block_errors(doc["health"]):
             report.error(message)
+    for name in ("provides", "requires"):
+        if name in doc and _check_str_list(doc.get(name), name, report):
+            if any(not value.strip() for value in doc[name]):
+                report.error("%s entries must be non-empty" % name)
+    if "lint_exemptions" in doc:
+        exemptions = doc.get("lint_exemptions")
+        if not isinstance(exemptions, list):
+            report.error("lint_exemptions must be a list")
+        else:
+            for index, exemption in enumerate(exemptions):
+                label = "lint_exemptions[%d]" % index
+                if not isinstance(exemption, dict):
+                    report.error("%s must be an object" % label)
+                    continue
+                _require_keys(exemption, label, ["code", "reason"], report)
+                for key in exemption:
+                    if key not in ("code", "reason"):
+                        report.error("unknown field: %s.%s" % (label, _show(key)))
+                for key in ("code", "reason"):
+                    if key in exemption and not _nonempty_str(exemption.get(key)):
+                        report.error("%s.%s must be a non-empty string" % (label, key))
     for hit in scan_strings({k: v for k, v in doc.items() if k not in ("schema_version", "id")}):
         report.violation("secret_detected", field=hit)
     return report
@@ -471,6 +500,32 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
         if name in doc and _check_str_list(doc[name], name, report):
             if any(not v.strip() for v in doc[name]):
                 report.error("%s entries must be non-empty" % name)
+
+    couplings = doc.get("generated_file_couplings")
+    if "generated_file_couplings" in doc:
+        if not isinstance(couplings, list):
+            report.error("generated_file_couplings must be a list")
+        else:
+            for index, coupling in enumerate(couplings):
+                label = "generated_file_couplings[%d]" % index
+                if not isinstance(coupling, dict):
+                    report.error("%s must be an object" % label)
+                    continue
+                _require_keys(coupling, label, ["source", "generated"], report)
+                for key in coupling:
+                    if key not in ("source", "generated"):
+                        report.error("unknown field: %s.%s" % (label, _show(key)))
+                for key in ("source", "generated"):
+                    value = coupling.get(key)
+                    if key not in coupling:
+                        continue
+                    if not _nonempty_str(value):
+                        report.error("%s.%s must be a non-empty string" % (label, key))
+                        continue
+                    reason = unsafe_path_reason(value)
+                    if reason:
+                        report.error("%s.%s rejected (%s): %s"
+                                     % (label, key, reason, _show(value)))
 
     providers = doc.get("allowed_providers")
     allowed: list[str] = []
