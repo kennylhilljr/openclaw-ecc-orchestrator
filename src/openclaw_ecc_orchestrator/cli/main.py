@@ -144,6 +144,12 @@ def build_parser():
     p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
     _common(p)
 
+    p = sub.add_parser("plan-check", help="the architect's milestone-start plan check on a plan file, without a "
+                                          "run; cached by plan sha")
+    p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
+    p.add_argument("--refresh", action="store_true", help="check again even when this plan has a cached result")
+    _common(p)
+
     p = sub.add_parser("status", help="runs, units, budgets, pending approvals, required user actions")
     p.add_argument("--run-id", dest="run_id", type=_id)
     _common(p)
@@ -765,6 +771,53 @@ def cmd_lint_plan(ctx):
     return env
 
 
+def cmd_plan_check(ctx):
+    """The architect's milestone-start check on a plan file, before any run
+    exists (issue #8). An unchanged plan answers from the cache; findings fail
+    the command so the plan can be fixed and checked again in a loop."""
+    from ..process.supervisor import Supervisor
+    from ..runs.dag import PlanError, normalize_units, plan_sha256
+    from ..team import config as TC
+    from ..team import plan_check as PC
+    from ..team.review import TeamStep
+    op = "plan-check"
+    path = checked_path(ctx.args.plan, "plan", ctx.cwd)
+    _, plan = read_document(path, "plan", op)
+    try:
+        units = normalize_units(plan)
+        digest = plan_sha256(units)
+    except PlanError as exc:
+        return envelope(op, ok=False, checks=[check("plan_valid", False, str(exc))])
+    repo = ctx.rt.repo_top(op)
+    head = branch_tip(repo, ctx.cfg.target_branch)
+    if head is None:
+        detail = f"target branch {ctx.cfg.target_branch!r} does not exist"
+        return envelope(op, ok=False, checks=[check("target_branch_exists", False, detail)])
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        return envelope(op, ok=False, checks=[check("team_config_valid", False, str(exc))])
+    policy, _ = ctx.rt.load_policy(op)
+    step = TeamStep(ctx.rt.conductor(policy, op), team, state_dir=ctx.cfg.state_dir,
+                    worktree_root=ctx.cfg.worktree_root, logs_dir=ctx.cfg.logs_dir,
+                    supervisor=Supervisor(clock=ctx.clock), clock=ctx.clock)
+    res, hit = PC.run_check(step, repo, units, digest, head, refresh=bool(ctx.args.refresh))
+    findings = res.get("findings") or []
+    ok = PC.passed(res)
+    if res.get("verdict") is None:
+        detail = f"no architect produced a verdict: {res.get('problem') or res.get('skipped')}"
+    else:
+        detail = (f"{res['verdict']} with {len(findings)} finding{'s' if len(findings) != 1 else ''}"
+                  f"{' (cached)' if hit else ''}; plan {digest[:12]}")
+    data = {"plan_file": path, "plan_sha256": digest, "target_commit": head, "cached": hit,
+            "verdict": res.get("verdict"), "findings": findings, "provider": res.get("provider"),
+            "cost_usd": 0.0 if hit else res.get("cost_usd"), "cache_file": PC.cache_path(ctx.cfg.state_dir, digest)}
+    env = envelope(op, ok=ok, checks=[check("plan_check", ok, detail)], data=data)
+    env["_summary"] = [detail] + [f"{f.get('severity')}: {f.get('where') or '-'}: {f.get('what')}"
+                                  for f in findings if isinstance(f, dict)]
+    return env
+
+
 def cmd_review_plan(ctx, parser, make_ctx):
     a = ctx.args
     inner = list(a.inner or [])
@@ -892,6 +945,8 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
                 result = cmd_preflight(ctx)
             elif op == "lint-plan":
                 result = cmd_lint_plan(ctx)
+            elif op == "plan-check":
+                result = cmd_plan_check(ctx)
             else:  # pragma: no cover - argparse restricts the choices
                 raise UsageError(f"unknown subcommand {op}")
     except UsageError as exc:

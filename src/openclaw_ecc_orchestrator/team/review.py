@@ -129,6 +129,18 @@ class TeamStep:
             verdict, problem = P.parse_verdict(turn.get("text"), mark, head)
         return verdict, problem, turn
 
+    def consult(self, role, mark, prompt_fn, head, *, run_id, exclude=(), require_kind=None):
+        """One read-only milestone turn for `role` in the main repository (the
+        architect's plan check and drift check, the delivery lead, the product
+        owners). `run_id` keys the rotation state and the logs."""
+        cls = TC.role_class(self.cfg, role)
+        candidates = self.candidates(TC.CLASS_TIER[cls], "low", None, None, False)
+        repo = self.c.worktrees.repo
+        return self._play(role, mark, prompt_fn, run_id=run_id, unit_id="_milestone", rotation=self.rotation(run_id),
+                          panel=TC.panel_for(self.cfg, role, cls), candidates=candidates, exclude=set(exclude),
+                          pack_tokens=0, head=head, cwd_fn=lambda: (repo, lambda: None), writable=False,
+                          timeout=1800.0, require_kind=require_kind)
+
     def _play(self, role, mark, prompt_fn, *, run_id, unit_id, rotation, panel, candidates, exclude, pack_tokens,
               head, cwd_fn, writable, timeout, require_kind=None):
         """Rotate through eligible providers until one returns a usable verdict

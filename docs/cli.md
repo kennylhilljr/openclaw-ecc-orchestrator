@@ -26,6 +26,7 @@ option of any subcommand lists them in full.
 | :- | :- | :- |
 | `create-run` | gated | validate a plan (`plan`, `run-id`) and create a run pinned to the target branch tip |
 | `lint-plan` | read only | lint a plan against the pinned target tree and print stable findings and their digest |
+| `plan-check` | read only, paid | run the architect's milestone-start plan check on a plan file without creating a run; the verdict is cached by plan sha in `<state_dir>/plan-checks/`, findings exit 1, and `drive` skips its own check when the run's plan already passed |
 | `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, last runner health, pending approvals and `required_user_actions` |
 | `dispatch` | gated | route, assign, create the worktree, run the runner, validate the handoff and verify; the unit ends in `reviewing` on success |
 | `verify` | gated | re-run the gates in the unit worktree and check head, cleanliness and scope; changes no run state |
@@ -380,6 +381,14 @@ lives in `integrations/launchd/`.
   plan of the existing run `run-id` and keeps the id, as long as no unit has
   left `pending` or `ready`; once one has, create a new run instead. The
   replaced plan's sha is kept in `metadata.replaced`.
+* `plan-check plan <file>` runs the check `drive` runs at milestone start (the architect, rotating
+  across certified providers) against the target branch tip, with a prompt that asks for one
+  exhaustive pass over named categories: missing scope, missing `depends_on`, symbols or tables
+  used before any unit creates them, composition wiring nobody owns, shared harness or CI steps a
+  unit cannot change, and plan text that contradicts an approved design. The result is cached by
+  plan sha, so checking an unchanged plan again costs nothing; `refresh` asks again. Fix, check,
+  repeat, then `create-run`; a clean cached result for the run's plan sha replaces the drive's
+  own paid check.
 * `dispatch` works on a `ready` unit whose scope does not overlap an active
   unit. The plan predicts the routing the conductor will choose (classify,
   the escalation controller rebuilt from the persisted record,

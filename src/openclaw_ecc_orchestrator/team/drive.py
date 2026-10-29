@@ -21,6 +21,7 @@ from . import config as TC
 from . import evidence as E
 from . import learning as L
 from . import personas as P
+from . import plan_check as PC
 
 PRODUCT_MARK = "ECC_PRODUCT"
 MAX_STEPS = 500
@@ -48,17 +49,7 @@ def product_prompt(pack, head):
         "# Evidence\n\n" + pack])
 
 
-def plan_check_prompt(pack, head):
-    return "\n\n".join([
-        "You are the architect on an agent delivery team. Before any unit of this milestone runs, check the "
-        "plan against the design: every unit matches its design section, scopes do not overlap, dependencies "
-        "are complete and in the right order, and each shared contract has exactly one owning unit that runs "
-        "before its users. Report only problems that would make a unit fail or force rework.",
-        P._SEVERITY_RULES,
-        "End your reply with exactly one line of single-line JSON, nothing after it:\n"
-        f'{P.REVIEW_MARK} {{"verdict": "approved|changes_requested|rejected", "head": "{head}", '
-        '"findings": [{"severity": "blocker|major|minor", "where": "<unit or section>", "what": "<text>"}]}',
-        "# Evidence\n\n" + pack])
+plan_check_prompt = PC.prompt
 
 
 def drift_prompt(pack, head):
@@ -147,16 +138,8 @@ class Drive:
         return round(sum(float(u.get("cost_usd") or 0.0) for u in run["units"].values()), 6)
 
     def _consult(self, role, mark, prompt_fn, head, *, exclude=(), require_kind=None):
-        cls = TC.role_class(self.cfg, role)
-        tier = TC.CLASS_TIER[cls]
-        candidates = self.step.candidates(tier, "low", None, None, False)
-        rotation = self.step.rotation(self.run_id)
-        repo = self.c.worktrees.repo
-        return self.step._play(role, mark, prompt_fn, run_id=self.run_id, unit_id="_milestone", rotation=rotation,
-                               panel=TC.panel_for(self.cfg, role, cls), candidates=candidates,
-                               exclude=set(exclude), pack_tokens=0, head=head,
-                               cwd_fn=lambda: (repo, lambda: None), writable=False, timeout=1800.0,
-                               require_kind=require_kind)
+        return self.step.consult(role, mark, prompt_fn, head, run_id=self.run_id, exclude=exclude,
+                                 require_kind=require_kind)
 
     def _stop(self, reason, detail, extra=None, next_steps=None):
         data = {"stop": reason, "detail": detail, "summary": self.summary()}
@@ -299,14 +282,18 @@ class Drive:
         if self.state.get("plan_check") or "milestone_start" not in (self.cfg["roles"]["architect"].get("when") or []):
             return None
         run = self.run()
+        cached = PC.cached(self.step.state_dir, run["plan_sha256"])
+        if cached is not None and PC.passed(cached):
+            # `ecc plan-check` already passed this exact plan: no second paid turn.
+            self.progress(f"milestone start: plan check passed earlier for plan {run['plan_sha256'][:12]}")
+            self.state["plan_check"] = dict(cached, cached=True)
+            self._save()
+            return None
         base = self.base_commit(run)
-        units = [{k: u.get(k) for k in ("id", "title", "depends_on", "scope", "acceptance", "risk")}
-                 for u in run["plan"]["units"]]
-        refs = E.design_references(self.c.worktrees.repo, " ".join(str(u.get("description") or "")
-                                                                   for u in run["plan"]["units"]))
-        pack = ("## Plan\n\n```json\n" + json.dumps(units, indent=1) + "\n```\n\n## Design references\n\n" + refs)
+        pack = PC.pack(self.c.worktrees.repo, run["plan"]["units"])
         self.progress("milestone start: architect plan check")
         res = self._consult("architect", P.REVIEW_MARK, lambda: plan_check_prompt(pack, base), base)
+        PC.store(self.step.state_dir, run["plan_sha256"], res, base, self.clock())
         self.state["plan_check"] = res
         self._save()
         if res.get("verdict") in ("changes_requested", "rejected"):

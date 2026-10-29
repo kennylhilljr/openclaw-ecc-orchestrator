@@ -132,6 +132,42 @@ class DriveTests(DriveBase):
         self.assertEqual(res["data"]["stop"], "plan_check_failed")
         self.assertEqual(self.dispatched, [])
 
+    # Issue #8: check a plan without a run, once per plan sha.
+    def plan_check(self, **kw):
+        from openclaw_ecc_orchestrator.team import plan_check as PC
+        run = self.m.load("r1")
+        return PC.run_check(self.drive.step, self.repo, run["plan"]["units"], run["plan_sha256"], self.base, **kw)
+
+    def architect_turns(self):
+        return [r for r, _ in self.calls].count("plan_check")
+
+    def test_plan_check_is_cached_by_plan_sha(self):
+        self.replies["plan_check"] = ["changes_requested"]
+        self.drive = self.make(self.units2())
+        res, hit = self.plan_check()
+        self.assertEqual((res["verdict"], hit), ("changes_requested", False))
+        res, hit = self.plan_check()
+        self.assertEqual((res["verdict"], hit), ("changes_requested", True))
+        self.assertEqual(self.architect_turns(), 1)
+        self.replies["plan_check"] = ["approved"]
+        res, hit = self.plan_check(refresh=True)
+        self.assertEqual((res["verdict"], hit, self.architect_turns()), ("approved", False, 2))
+
+    def test_drive_skips_its_plan_check_when_plan_check_passed(self):
+        self.drive = self.make(self.units2())
+        self.assertEqual(self.plan_check()[0]["verdict"], "approved")
+        self.assertIsNone(self.drive.milestone_start())
+        self.assertEqual(self.architect_turns(), 1)
+        self.assertTrue(self.drive.state["plan_check"]["cached"])
+
+    def test_drive_checks_again_after_a_cached_failure(self):
+        self.replies["plan_check"] = ["changes_requested"]
+        self.drive = self.make(self.units2())
+        self.plan_check()
+        res = self.drive.milestone_start()
+        self.assertEqual(res["data"]["stop"], "plan_check_failed")
+        self.assertEqual(self.architect_turns(), 2)
+
     def test_at_td_11_and_21_product_pair_one_reject_rejects(self):
         """AT-TD-11, AT-TD-21: two product owners from different providers; one reject rejects."""
         self.replies["product_owner"] = ["accept", "reject"]
@@ -212,6 +248,23 @@ class DriveCliTests(CS.CliTestBase):
         self.assertNotEqual(new["plan_sha256"], old["plan_sha256"])
         self.assertEqual(new["metadata"]["replaced"][0]["plan_sha256"], old["plan_sha256"])
         self.assertEqual(self.cli("drive", "--run-id", self.RUN_ID, "--dry-run")[0], 0)
+
+    def test_plan_check_answers_from_the_cache_with_an_exit_code(self):
+        """Issue #8: no run is created, a cached verdict costs nothing, findings exit 1."""
+        from openclaw_ecc_orchestrator.runs.dag import plan_sha256
+        from openclaw_ecc_orchestrator.team import plan_check as PC
+        sha = plan_sha256(self.plan)
+        head = git(self.repo, "rev-parse", "main")
+        PC.store(self.state, sha, {"verdict": "changes_requested", "provider": "claude", "findings": [
+            {"severity": "blocker", "where": "alpha", "what": "missing depends_on"}]}, head)
+        code, doc = self.cli("plan-check", "--plan", self.plan_path)
+        self.assertEqual(code, 1, json.dumps(doc)[:2000])
+        self.assertEqual((doc["data"]["cached"], doc["data"]["plan_sha256"], doc["data"]["cost_usd"]),
+                         (True, sha, 0.0))
+        self.assertEqual(doc["data"]["findings"][0]["what"], "missing depends_on")
+        PC.store(self.state, sha, {"verdict": "approved", "provider": "claude", "findings": []}, head)
+        self.ok(self.cli("plan-check", "--plan", self.plan_path))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "runs", self.RUN_ID)))
 
     def test_create_run_on_an_existing_id_names_the_replace_command(self):
         self.create_run()
