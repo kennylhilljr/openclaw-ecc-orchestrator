@@ -376,6 +376,10 @@ lives in `integrations/launchd/`.
   findings. `allow-lint-findings` is an explicit override: its boolean,
   finding count and digest, plus applied exemptions, are included in the
   command plan reviewed by `review-plan` and persisted in run metadata.
+  The run also records the plan file's path and sha256. `replace` swaps the
+  plan of the existing run `run-id` and keeps the id, as long as no unit has
+  left `pending` or `ready`; once one has, create a new run instead. The
+  replaced plan's sha is kept in `metadata.replaced`.
 * `dispatch` works on a `ready` unit whose scope does not overlap an active
   unit. The plan predicts the routing the conductor will choose (classify,
   the escalation controller rebuilt from the persisted record,
@@ -418,6 +422,9 @@ lives in `integrations/launchd/`.
   merge conflict on its own. Every stop prints the exact commands to run as `next:` lines, ending with
   the command that continues the drive. Before each later attempt the unit's branch receives the target's
   current tip (TEAM-DELIVERY v5 4.4).
+* `drive` refuses a run whose plan file changed after `create-run` (same units in a new layout is not a
+  change), before the architect's plan check. The stop names the file's plan sha and the next command:
+  `create-run --replace` with the same run id while nothing was dispatched, otherwise a new run.
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.

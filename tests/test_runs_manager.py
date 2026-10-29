@@ -104,6 +104,39 @@ class ManagerBase(unittest.TestCase):
             self.assertTrue(res["ok"], res)
 
 
+class ReplacePlanTests(ManagerBase):
+    """Issue #10: a plan revised before any dispatch keeps its run id."""
+
+    def test_replace_before_dispatch_keeps_the_run_id(self):
+        run_id = self.create([unit("a"), unit("b", ["a"])])
+        old = self.mgr.load(run_id)
+        self.clock.advance(5)
+        res = self.mgr.create_run({"units": [unit("a"), unit("c", ["a"])]}, "c1", run_id=run_id, replace=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["data"]["replaced_plan_sha256"], old["plan_sha256"])
+        for run in (self.mgr.load(run_id), self.new_manager().load(run_id)):
+            self.assertEqual(sorted(run["units"]), ["a", "c"])
+            self.assertEqual(run["units"]["a"]["state"], "ready")
+            self.assertEqual(run["created_at"], old["created_at"])
+            self.assertEqual([r["plan_sha256"] for r in run["metadata"]["replaced"]], [old["plan_sha256"]])
+        # Replaying the event log alone rebuilds the replaced run.
+        os.remove(self.store.snapshot_path(run_id))
+        self.assertEqual(sorted(self.new_manager().load(run_id)["units"]), ["a", "c"])
+
+    def test_replace_is_refused_once_a_unit_was_dispatched(self):
+        run_id = self.create([unit("a"), unit("b", ["a"])])
+        self.drive(run_id, "a", ["assigned"])
+        res = self.mgr.create_run({"units": [unit("a")]}, "c1", run_id=run_id, replace=True)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["dispatched"], ["a"])
+        self.assertEqual(sorted(self.mgr.load(run_id)["units"]), ["a", "b"])
+
+    def test_replace_needs_an_existing_run(self):
+        res = self.mgr.create_run({"units": [unit("a")]}, "c1", run_id="nope", replace=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("run_exists", [c["name"] for c in res["checks"] if not c["ok"]])
+
+
 class CreateRunTests(ManagerBase):
     def test_create_marks_roots_ready(self):
         run_id = self.create([unit("a"), unit("b", ["a"])])

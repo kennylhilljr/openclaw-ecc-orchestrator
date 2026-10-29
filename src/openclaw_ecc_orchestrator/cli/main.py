@@ -135,6 +135,9 @@ def build_parser():
     p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
     p.add_argument("--allow-lint-findings", dest="allow_lint_findings", action="store_true",
                    help="create the run despite plan-lint findings (the reviewed plan records the override)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace the plan of the existing run --run-id, keeping the id; refused once any unit "
+                        "has been dispatched")
     _common(p), _mutating(p)
 
     p = sub.add_parser("lint-plan", help="lint a plan against the pinned target tree without changing state")

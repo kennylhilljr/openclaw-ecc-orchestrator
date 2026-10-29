@@ -69,7 +69,7 @@ def _new_unit_record(unit):
 
 def _apply_event(doc, event):
     data = event.get("data") or {}
-    if event.get("type") == "run.created":
+    if event.get("type") in ("run.created", "run.replanned"):
         doc = copy.deepcopy(data["run"])
     elif doc is None:
         raise RunError("event log does not start with run.created")
@@ -293,11 +293,14 @@ class RunManager:
         return None
 
     # == public API ==
-    def create_run(self, plan, conductor_id, run_id=None, dry_run=False, metadata=None, policy=None):
+    def create_run(self, plan, conductor_id, run_id=None, dry_run=False, metadata=None, policy=None, replace=False):
         """Validate and persist a plan. Every unit must pass
         `schemas.validate_work_unit`; `policy`, when given, must pass
         `schemas.validate_repository_policy` and is stored with the run so
-        classification uses it on every assignment."""
+        classification uses it on every assignment.
+
+        `replace=True` swaps the plan of the existing run `run_id`, keeping its
+        id, while no unit has been dispatched (see `_replace_run`)."""
         op = "run.create"
         analysis = analyze_plan(plan)
         if not analysis["ok"]:
@@ -345,6 +348,8 @@ class RunManager:
         }
         roots = [uid for uid in analysis["order"] if not doc["units"][uid]["depends_on"]]
         summary = {"run_id": run_id, "plan_sha256": doc["plan_sha256"], "layers": doc["layers"], "ready": roots}
+        if replace:
+            return self._replace_run(doc, summary, conductor_id, dry_run)
         if dry_run:
             return envelope(op, changed=False, checks=[check("plan_valid", True)], data=summary)
         with self.store.lock(run_id):
@@ -362,6 +367,47 @@ class RunManager:
         warnings = self._emit_external(run_id, [("run.created", {"run": doc, "conductor_id": conductor_id})] + tx.events)
         return envelope(op, changed=True, checks=[check("plan_valid", True), check("work_units_valid", True)],
                         warnings=warnings, data=summary, rollback_checkpoint={"run_id": run_id, "event_seq": 0})
+
+    def _replace_run(self, doc, summary, conductor_id, dry_run):
+        """Replace a run's plan in place. Refused once any unit has left
+        pending or ready (an attempt, a worktree): its work belongs to the old
+        plan. In research-mcp M1 every plan revision cost a new run id
+        (rm-m1a to rm-m1f), and a stale id could still be driven."""
+        op = "run.replace"
+        run_id = doc["run_id"]
+        with self.store.lock(run_id):
+            try:
+                old = self._load_unlocked(run_id)
+            except RunError as exc:
+                return envelope(op, ok=False, checks=[check("run_exists", False, str(exc))])
+            started = sorted(uid for uid, u in old["units"].items()
+                             if u["state"] not in (S.PENDING, S.READY) or u.get("attempts") or u.get("workspace"))
+            if started:
+                return envelope(op, ok=False, checks=[check(
+                    "no_unit_dispatched", False,
+                    f"units already dispatched: {', '.join(started)}; create a new run for the revised plan")],
+                    data={"dispatched": started})
+            holder = self._lease_blocker(old, conductor_id)
+            if holder:
+                return envelope(op, ok=False, checks=[check("lease_held", False, f"lease held by {holder!r}")])
+            doc["created_at"] = old["created_at"]
+            doc["metadata"]["replaced"] = list((old.get("metadata") or {}).get("replaced") or []) + [
+                {"plan_sha256": old["plan_sha256"], "at": iso(self.clock())}]
+            summary = dict(summary, replaced_plan_sha256=old["plan_sha256"])
+            checks = [check("plan_valid", True), check("no_unit_dispatched", True)]
+            if dry_run:
+                return envelope(op, changed=False, checks=checks, data=summary)
+            event = self.store.append_event(run_id, "run.replanned", {"run": copy.deepcopy(doc),
+                                                                      "conductor_id": conductor_id})
+            doc["last_event_seq"] = event["seq"]
+            tx = _Tx()
+            self._promote_ready(doc, tx, conductor_id)
+            for event_type, data in tx.events:
+                doc["last_event_seq"] = self.store.append_event(run_id, event_type, data)["seq"]
+            self.store.save(doc)
+        warnings = self._emit_external(run_id, [("run.created", {"run": doc, "conductor_id": conductor_id})] + tx.events)
+        return envelope(op, changed=True, checks=checks, warnings=warnings, data=summary,
+                        rollback_checkpoint={"run_id": run_id, "event_seq": old.get("last_event_seq", 0)})
 
     def acquire_lease(self, run_id, conductor_id, ttl=None, dry_run=False):
         def fn(run, tx):

@@ -188,6 +188,37 @@ class DriveCliTests(CS.CliTestBase):
         self.assertEqual(code, 1)
         self.assertIn("unit_reviewing", [c["name"] for c in doc["checks"] if not c["ok"]])
 
+    def run_doc(self):
+        with open(os.path.join(self.state, "runs", self.RUN_ID, "run.json")) as fh:
+            return json.load(fh)
+
+    def test_drive_refuses_a_run_whose_plan_file_changed_then_replace_keeps_the_id(self):
+        """Issue #10: rm-m1e was driven again after plan v6 existed."""
+        self.create_run()
+        old = self.run_doc()
+        self.assertEqual(old["metadata"]["plan_file"], self.plan_path)
+        with open(self.plan_path, "w") as fh:  # formatting only: still the same plan
+            json.dump(self.plan, fh, indent=2)
+        self.assertEqual(self.cli("drive", "--run-id", self.RUN_ID, "--dry-run")[0], 0)
+        self.plan["units"][0]["description"] = "revised after the plan check"
+        self.write_json(os.path.basename(self.plan_path), self.plan)
+        code, doc = self.cli("drive", "--run-id", self.RUN_ID, "--dry-run")
+        self.assertNotEqual(code, 0)
+        self.assertEqual([c["name"] for c in doc["checks"] if not c["ok"]], ["plan_file_unchanged"])
+        replace = f"ecc create-run --run-id {self.RUN_ID} --plan {self.plan_path} --replace"
+        self.assertEqual(doc["data"]["next_steps"], [replace])
+        self.ok(self.reviewed("create-run", "--run-id", self.RUN_ID, "--plan", self.plan_path, "--replace"))
+        new = self.run_doc()
+        self.assertNotEqual(new["plan_sha256"], old["plan_sha256"])
+        self.assertEqual(new["metadata"]["replaced"][0]["plan_sha256"], old["plan_sha256"])
+        self.assertEqual(self.cli("drive", "--run-id", self.RUN_ID, "--dry-run")[0], 0)
+
+    def test_create_run_on_an_existing_id_names_the_replace_command(self):
+        self.create_run()
+        code, doc = self.cli("create-run", "--run-id", self.RUN_ID, "--plan", self.plan_path, "--dry-run")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--replace", doc["required_user_actions"][0]["detail"])
+
 
 class ProductParserTests(unittest.TestCase):
     def test_accept_needs_every_criterion_met(self):

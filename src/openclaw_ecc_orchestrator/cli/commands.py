@@ -15,6 +15,7 @@ Each gated command is a `Spec`:
 
 import copy
 import hashlib
+import json
 import os
 import uuid
 
@@ -26,6 +27,7 @@ from ..routing.classify import classify
 from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import select_runner
 from ..runs import state as S
+from ..runs.dag import plan_sha256
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.manager import RunError
@@ -118,16 +120,23 @@ def plan_create_run(ctx):
              actions=[{"kind": "review_plan_lint", "run_id": a.run_id,
                        "detail": "resolve the findings or explicitly review --allow-lint-findings"}],
              data=dict(lint, plan_file=path, target_commit=tip))
-    if ctx.rt.store.exists(a.run_id):
-        fail(op, "run_id_unique", f"run {a.run_id} already exists")
+    replace = bool(getattr(a, "replace", False))
+    exists = ctx.rt.store.exists(a.run_id)
+    if exists and not replace:
+        fail(op, "run_id_unique", f"run {a.run_id} already exists",
+             actions=[{"kind": "replace_plan", "run_id": a.run_id,
+                       "detail": f"ecc create-run --run-id {a.run_id} --plan {path} --replace"}])
+    if replace and not exists:
+        fail(op, "run_exists", f"run {a.run_id} not found; drop --replace to create it")
+    file_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     res = ctx.rt.manager.create_run(plan, cfg.conductor_id, run_id=a.run_id, dry_run=True, policy=policy,
-                                    metadata={"base_commit": tip, "target_branch": cfg.target_branch})
+                                    metadata={"base_commit": tip, "target_branch": cfg.target_branch},
+                                    replace=replace)
     if not res["ok"]:
         res["operation"] = op
         raise CommandFailed(res)
     summary = res["data"]
-    doc = base_doc(op, run_id=a.run_id, plan_file=path,
-                   plan_file_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    doc = base_doc(op, run_id=a.run_id, plan_file=path, plan_file_sha256=file_sha, replace=replace,
                    plan_sha256=summary["plan_sha256"], layers=summary["layers"], ready=summary["ready"],
                    repo=repo, target_branch=cfg.target_branch, base_commit=tip, policy_file=policy_path,
                    policy_sha256=plan_digest(policy) if policy is not None else None,
@@ -140,8 +149,9 @@ def plan_create_run(ctx):
 
 def execute_create_run(ctx, plan):
     c = ctx.rt.conductor(plan.extra["policy"], "create-run")
-    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"],
-                        metadata={"plan_lint": plan.extra["lint"]})
+    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"], replace=plan.doc["replace"],
+                        metadata={"plan_lint": plan.extra["lint"], "plan_file": plan.doc["plan_file"],
+                                  "plan_file_sha256": plan.doc["plan_file_sha256"]})
 
 
 # == dispatch ==
@@ -770,10 +780,52 @@ def execute_team_review(ctx, plan):
 
 
 # == drive ==
+def plan_file_drift(run):
+    """The plan sha of the run's plan file when it no longer matches the run,
+    else None. A run created before the file was recorded, a file that is
+    gone, or a formatting-only edit (same units) is not drift."""
+    meta = run.get("metadata") or {}
+    path = meta.get("plan_file")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() == meta.get("plan_file_sha256"):
+        return None
+    try:
+        new_sha = plan_sha256(json.loads(text))
+    except (ValueError, TypeError, AttributeError):
+        new_sha = "unparsable"
+    return None if new_sha == run["plan_sha256"] else new_sha
+
+
+def stale_plan_stop(op, run):
+    """Refuse to drive a run whose plan file changed after it was created (rm-m1e
+    was driven again after plan v6 existed and failed on findings v6 fixed)."""
+    new_sha = plan_file_drift(run)
+    if new_sha is None:
+        return
+    r, path = run["run_id"], run["metadata"]["plan_file"]
+    dispatched = any(u["state"] not in (S.PENDING, S.READY) or u.get("attempts") for u in run["units"].values())
+    command = (f"ecc create-run --run-id <new run id> --plan {path}" if dispatched
+               else f"ecc create-run --run-id {r} --plan {path} --replace")
+    fail(op, "plan_file_unchanged",
+         f"{path} changed since run {r} was created: run plan {run['plan_sha256'][:12]}, file plan {new_sha[:12]}",
+         actions=[{"kind": "replace_plan", "run_id": r, "command": command,
+                   "detail": "replace the run's plan, then drive again" if not dispatched
+                   else "units already ran on the old plan; create a new run"}],
+         data={"plan_file": path, "run_plan_sha256": run["plan_sha256"], "file_plan_sha256": new_sha,
+               "next_steps": [command]})
+
+
 def plan_drive(ctx):
     op = "drive"
     a = ctx.args
     run = load_run(ctx, op, a.run_id)
+    stale_plan_stop(op, run)
     from ..team import config as TC
     try:
         team = TC.load(ctx.rt.team(op))

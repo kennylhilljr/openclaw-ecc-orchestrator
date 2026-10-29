@@ -173,7 +173,7 @@ class Conductor:
         self._lock = threading.Lock()
 
     # == run level ==
-    def create_run(self, plan, run_id=None, dry_run=False, metadata=None):
+    def create_run(self, plan, run_id=None, dry_run=False, metadata=None, replace=False):
         repo = self.worktrees.repo
         if not rev_exists(repo, f"refs/heads/{self.target}"):
             return envelope("run.create", ok=False, checks=[check("target_branch_exists", False, self.target)])
@@ -181,7 +181,7 @@ class Conductor:
         run_metadata = copy.deepcopy(metadata or {})
         run_metadata.update({"base_commit": base, "target_branch": self.target})
         return self.manager.create_run(plan, self.id, run_id=run_id, dry_run=dry_run, policy=self.policy,
-                                       metadata=run_metadata)
+                                       metadata=run_metadata, replace=replace)
 
     def resume(self, run_id, dry_run=False):
         return self.manager.resume(run_id, self.id, dry_run=dry_run)
