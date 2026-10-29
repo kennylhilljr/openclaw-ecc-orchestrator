@@ -1,0 +1,20 @@
+#!/bin/sh
+# Approve or reject ECC orchestrator approval requests from a terminal.
+#
+#   bin/ecc-decide list                       pending requests (run, unit, head, plan, expiry)
+#   bin/ecc-decide approve [request_id]       approve (the only pending one if no id); asks to confirm
+#   bin/ecc-decide reject [request_id]        reject; asks to confirm
+#   add --yes to skip the confirmation
+#
+# Decides through the plugin's ecc-orchestrator.decide gateway method as an
+# operator UI client, so OpenClaw attests who decided (decided_by). This is the
+# path that works in OpenClaw 2026.9.6; /ecc-decide typed in the Control UI chat
+# is refused there because the chat gives plugin commands no sender identity.
+# Needs node 22 or newer and openclaw on PATH; ECC_GATEWAY_PORT overrides 18789.
+set -u
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+command -v node >/dev/null 2>&1 || { echo "ecc-decide: node not found on PATH" >&2; exit 1; }
+OC=$(command -v openclaw 2>/dev/null) || { echo "ecc-decide: openclaw not found on PATH" >&2; exit 1; }
+PKG=$(dirname "$(node -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "$OC")")
+[ -f "$PKG/dist/plugin-sdk/gateway-runtime.js" ] || PKG=$(dirname "$PKG")
+exec node "$REPO/integrations/openclaw-plugin/tools/ecc-decide.mjs" "$PKG" "$@"

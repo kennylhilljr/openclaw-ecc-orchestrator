@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
+from .. import __version__
 from ..handoffs.redaction import redact_text
 from ..schemas import CAPABILITY_CLASSES, KNOWN_PROVIDERS, SCHEMA_VERSION, is_retired
 
@@ -86,15 +87,36 @@ def tls_context(env: Mapping[str, str] | None = None,
     return ssl.create_default_context()
 
 
+# Some provider edges (Groq's, observed 2026-10-18) reject Python's default
+# "Python-urllib/x.y" agent with HTTP 403 before authentication happens.
+USER_AGENT = "openclaw-ecc-orchestrator/%s" % __version__
+ERROR_BODY_LIMIT = 4096
+
+
+def with_user_agent(headers: Mapping[str, str]) -> dict[str, str]:
+    """Request headers with a named User-Agent unless the caller set one."""
+    merged = {"User-Agent": USER_AGENT}
+    merged.update(dict(headers))
+    return merged
+
+
+def error_body(exc: urllib.error.HTTPError) -> str:
+    """A bounded slice of an HTTP error body, for diagnosis (redacted downstream)."""
+    try:
+        return (exc.read(ERROR_BODY_LIMIT) or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return ""
+
+
 def default_http_get(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
     """Real HTTP getter (not used by tests)."""
-    request = urllib.request.Request(url, headers=dict(headers), method="GET")
+    request = urllib.request.Request(url, headers=with_user_agent(headers), method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout,  # noqa: S310
                                     context=tls_context()) as resp:
             return HttpResponse(resp.status, resp.read(8 * 1024 * 1024).decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        return HttpResponse(exc.code, "")
+        return HttpResponse(exc.code, error_body(exc))
 
 
 def _iso(epoch: float) -> str:

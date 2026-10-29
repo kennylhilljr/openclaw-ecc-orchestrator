@@ -184,6 +184,25 @@
         ]
       }
     },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per unit override of the repository policy health block. Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+      "properties": {
+        "interval_seconds": {
+          "type": "number",
+          "minimum": 30,
+          "maximum": 1800,
+          "default": 120
+        },
+        "flat_checks_for_hang": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20,
+          "default": 5
+        }
+      }
+    },
     "provides": {
       "type": "array",
       "items": {

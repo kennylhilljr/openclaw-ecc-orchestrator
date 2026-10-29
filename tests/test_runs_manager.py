@@ -104,6 +104,39 @@ class ManagerBase(unittest.TestCase):
             self.assertTrue(res["ok"], res)
 
 
+class ReplacePlanTests(ManagerBase):
+    """Issue #10: a plan revised before any dispatch keeps its run id."""
+
+    def test_replace_before_dispatch_keeps_the_run_id(self):
+        run_id = self.create([unit("a"), unit("b", ["a"])])
+        old = self.mgr.load(run_id)
+        self.clock.advance(5)
+        res = self.mgr.create_run({"units": [unit("a"), unit("c", ["a"])]}, "c1", run_id=run_id, replace=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["data"]["replaced_plan_sha256"], old["plan_sha256"])
+        for run in (self.mgr.load(run_id), self.new_manager().load(run_id)):
+            self.assertEqual(sorted(run["units"]), ["a", "c"])
+            self.assertEqual(run["units"]["a"]["state"], "ready")
+            self.assertEqual(run["created_at"], old["created_at"])
+            self.assertEqual([r["plan_sha256"] for r in run["metadata"]["replaced"]], [old["plan_sha256"]])
+        # Replaying the event log alone rebuilds the replaced run.
+        os.remove(self.store.snapshot_path(run_id))
+        self.assertEqual(sorted(self.new_manager().load(run_id)["units"]), ["a", "c"])
+
+    def test_replace_is_refused_once_a_unit_was_dispatched(self):
+        run_id = self.create([unit("a"), unit("b", ["a"])])
+        self.drive(run_id, "a", ["assigned"])
+        res = self.mgr.create_run({"units": [unit("a")]}, "c1", run_id=run_id, replace=True)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["dispatched"], ["a"])
+        self.assertEqual(sorted(self.mgr.load(run_id)["units"]), ["a", "b"])
+
+    def test_replace_needs_an_existing_run(self):
+        res = self.mgr.create_run({"units": [unit("a")]}, "c1", run_id="nope", replace=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("run_exists", [c["name"] for c in res["checks"] if not c["ok"]])
+
+
 class CreateRunTests(ManagerBase):
     def test_create_marks_roots_ready(self):
         run_id = self.create([unit("a"), unit("b", ["a"])])
@@ -288,15 +321,27 @@ class BudgetTests(ManagerBase):
         self.assertEqual(self.mgr.load(run_id)["units"]["a"]["state"], "needs_user")
         self.assertEqual(res["required_user_actions"][0]["kind"], "budget_exhausted")
 
-    def test_minutes_budget(self):
+    def test_owner_grant_extends_attempt_budget(self):
+        run_id = self.create([unit("a", budget={"attempts": 1})])
+        self.drive(run_id, "a", ["assigned", "running", "failed", "ready"])
+        self.mgr.annotate_unit(run_id, "c1", "a", "budget_grant", {"attempts": 1})
+        res = self.mgr.assign_unit(run_id, "c1", "a", "w1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.mgr.load(run_id)["units"]["a"]["attempts"], 2)
+
+    def test_minutes_budget_is_advisory(self):
         run_id = self.create([unit("a", budget={"minutes": 10})])
         self.drive(run_id, "a", ["assigned", "running"])
-        self.assertTrue(self.mgr.record_usage(run_id, "c1", "a", minutes=6)["ok"])
+        self.assertFalse(self.mgr.record_usage(run_id, "c1", "a", minutes=6)["data"]["over_minutes_budget"])
         res = self.mgr.record_usage(run_id, "c1", "a", minutes=6)
-        self.assertFalse(res["ok"])
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["data"]["over_minutes_budget"])
         u = self.mgr.load(run_id)["units"]["a"]
-        self.assertEqual(u["state"], "needs_user")
+        self.assertEqual(u["state"], "running")
         self.assertEqual(u["minutes_used"], 12)
+        # Nor does it block the next assignment.
+        self.drive(run_id, "a", ["failed", "ready"])
+        self.assertTrue(self.mgr.assign_unit(run_id, "c1", "a", "w1")["ok"])
 
 
 class ResumeScopeTests(ManagerBase):

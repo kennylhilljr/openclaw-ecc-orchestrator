@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.openclaw-ecc-orchestrator.inbox-processor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>__REPO__/bin/inbox-processor</string>
+  </array>
+  <!-- Start at login and restart if it stops for any reason other than a
+       clean exit; wait 60 seconds between restarts (for example while another
+       processor holds the lock, exit code 3). -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/openclaw-ecc-orchestrator/inbox-processor.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/openclaw-ecc-orchestrator/inbox-processor.log</string>
+</dict>
+</plist>

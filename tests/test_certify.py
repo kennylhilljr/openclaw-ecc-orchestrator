@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from openclaw_ecc_orchestrator.runners import certify
 from openclaw_ecc_orchestrator.runners.base import CancelResult, CommandResult
@@ -60,12 +60,12 @@ class Harness(unittest.TestCase):
     def deps(self, commands=None, env=None, cancel=None):
         return certify.Deps(
             run_command=commands or FakeCommands([]), http_get=groq_catalog, http_post=chat_ok,
-            cancel_command=cancel, env=env if env is not None else {"HOME": "/Users/probe"},
+            cancel_command=cancel or getattr(commands, "cancel", None), env=env if env is not None else {"HOME": "/Users/probe"},
             clock=lambda: NOW, log=self.logs.append, write_file=lambda p, c: None)
 
     def opts(self, runners, **kw):
         return certify.Options(runners=tuple(runners), out=self.out, work_root=self.work,
-                               step_timeout=2.0, cancel_after=0.1, **kw)
+                               step_timeout=2.0, **kw)
 
 
 class ModelSelectionTests(unittest.TestCase):
@@ -124,7 +124,8 @@ class RunTests(Harness):
         rules = [r for r in codex_rules() + claude_rules() if r[0] != "-m unittest"]
         commands = FakeCommands([rules[0], tests] + rules[1:] + [
             ("codex debug models", ok(CODEX_CATALOG))])
-        cancel = lambda argv, after, cwd=None: CancelResult(True, False, -9, True, 2, 0.1)
+        cancel = lambda argv, max_wait, cwd=None: CancelResult(True, False, -15, True, 2, 0.1, "{}\n", "",
+                                                               True, "event", 0.05)
         summary = certify.run(self.opts(["claude", "codex"]), self.deps(commands, cancel=cancel))
         by = {r["runner"]: r for r in summary["results"]}
         self.assertEqual(by["claude"]["record"]["status"], "certified", by["claude"])
@@ -155,7 +156,7 @@ class RunTests(Harness):
 
     def test_workdirs_are_created_and_removed_under_work_root(self):
         opts = certify.Options(runners=("claude",), out=self.out, work_root=self.work,
-                               step_timeout=2.0, cancel_after=0.1)
+                               step_timeout=2.0)
         deps = self.deps(FakeCommands(claude_rules()))
         deps.write_file = None
         seen = []
@@ -195,6 +196,10 @@ class DryRunTests(Harness):
         self.assertNotIn("--effort", plans["claude"]["inference_argv"])
         self.assertIn('model_reasoning_effort="low"', plans["codex"]["inference_argv"])
         self.assertTrue(plans["groq"]["key_present"])
+        self.assertEqual(plans["claude"]["cancel_trigger"], "first stream event on stdout")
+        self.assertEqual(plans["claude"]["cancel_argv"][:4], ["claude", "-p", "--output-format", "stream-json"])
+        self.assertIn("--verbose", plans["claude"]["cancel_argv"])
+        self.assertNotIn("cancel_after", plans["claude"])
         self.assertFalse(plans["openrouter"]["policy_approved"])
         text = read(os.path.join(self.out, "plan.json"))
         self.assertNotIn(GROQ_KEY, text)
@@ -208,6 +213,8 @@ class DryRunTests(Harness):
         self.assertIn('"kimi"', buf.getvalue())
         with self.assertRaises(SystemExit):
             certify.main(["--out", self.out, "--dry-run", "--step-timeout", "600"])
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            certify.main(["--out", self.out, "--dry-run", "--cancel-after", "30"])  # removed timer option
 
 
 class WorkRootTests(unittest.TestCase):

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Standing decision-inbox processor for openclaw-ecc-orchestrator (macOS).
+#
+# Applies approval decisions that the OpenClaw plugin writes into the runtime's
+# decision inbox, through the same validation as `approvals approve`. Meant for
+# a launchd user agent (integrations/launchd/README.md); runs until SIGTERM.
+# Extra arguments are passed through, for example --dry-run (once, no changes).
+# Exit codes: 0 stopped cleanly, 1 error, 2 usage, 3 another processor running.
+# No provider keys are needed or read.
+set -u
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+PY=""
+for cand in ${ECC_PYTHON:-} /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+            /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PY=$(command -v "$cand"); break
+  fi
+done
+[ -n "$PY" ] || { echo "inbox-processor: no python3 3.11 or newer found (set ECC_PYTHON)" >&2; exit 1; }
+
+cd "$REPO" || exit 1
+PYTHONPATH="$REPO/src"
+export PYTHONPATH
+if [ $# -gt 0 ]; then
+  exec "$PY" -m openclaw_ecc_orchestrator approvals process-inbox "$@"
+fi
+exec "$PY" -m openclaw_ecc_orchestrator approvals process-inbox --watch --interval 2 --json

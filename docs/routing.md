@@ -71,6 +71,8 @@ select_runner(tier, certified_runners, catalog, policy, exclude_providers=(), *,
 
 A candidate must be: not retired, a known profile, allowed by `policy.allowed_providers`, not excluded, not behind an open breaker, permitted in the role, serving the class, allowed for the risk (Groq never for high risk), satisfying its condition (Kimi only with `large_context`), and resolvable to a model. API runners resolve from the live catalog using `policy.model_preferences` glob patterns, dropping deprecated, absent and `retired_model_ids` entries and refusing a stale catalog (`catalog_max_age_seconds`). OpenRouter additionally requires the model to be in `openrouter.approved_models`. CLI runners resolve an alias from `policy.cli_models` (Claude defaults to the haiku, sonnet and opus aliases).
 
+Serving the class: Claude authors and reviews the standard and advanced classes only, because economical work goes to the cheap API workers. A single-provider team has none, so with `review_independence: persona` a runner also serves any class for which `policy.cli_models` names its model. Live finding (rm-m0f, 2026-10-23): research-mcp is Claude-only, and its low-risk units M0-17 and M0-18 routed to tier 0, found no author and stopped the drive with `no_progress: no eligible certified runner for tier 0 (economical) as author`. The fix (commit `93cc541`) is in `select_runner` in `src/openclaw_ecc_orchestrator/routing/selection.py`; regression test `SelectRunnerTests.test_single_provider_team_authors_tier0_with_its_economical_model` in `tests/test_routing_select.py`. Repositories with the default `provider` independence route as before.
+
 Cost per attempt comes from catalog pricing times `policy.cost_estimation` tokens, else `policy.runner_costs[runner][class]`, else unknown. Today only OpenRouter listings publish prices, so configure `runner_costs` for Gemini, Groq, Kimi and the CLI runners. Candidates sort by known cost, unknown last, then runner name, then model. OpenRouter is fallback only for authoring: it is chosen only when no primary candidate exists, and the result role becomes `fallback`.
 
 `Selection` fields: `ok`, `tier`, `role`, `runner`, `provider`, `family`, `model`, `capability_class`, `estimated_cost_usd`, `cost_source`, `independent_family`, `blocking`, `reasons`, `warnings`, `rejected` (each `{runner, reason}`), `candidates`.
@@ -84,6 +86,8 @@ select_reviewer(author, classification, certified_runners, catalog, policy, *,
 
 The review tier is `classification.review_tier`, raised to 2 when the author worked at Tier 2. A forged low author tier cannot lower it. The author runner is excluded when independence is required. A reviewer from a different model family is tried first. For Tier 2 or high risk reviews a different family is mandatory; otherwise the same family is accepted with a warning. When no qualified reviewer exists for Tier 2 or high risk work, `blocking` is true and the unit cannot complete. Families come from the runner profile, or for hosting providers (Groq, OpenRouter) from the model id; an unrecognised id yields a unique `unknown:` family.
 
+A repository that uses one provider sets `review_independence: persona` in its policy (`config.yaml`; the default is `provider`). Independence then comes from a distinct reviewer persona in its own session (TEAM-DELIVERY v3), so the reviewer may use the author's runner and model family. The tier, certification and risk rules still apply, and `review_satisfies` accepts such a review in the conductor and the merge queue.
+
 ## Escalation
 
 ```python
@@ -93,7 +97,7 @@ controller.record(AttemptOutcome(passed, objective_failure, cost_usd, ...)) -> n
 controller.to_record() -> dict
 ```
 
-Actions are `attempt`, `repair`, `escalate`, `stop` and `done`. The controller starts at `chosen_tier` and allows `budget.attempts` per tier (capped at 2: one implementation plus one repair). It escalates one tier only after an objective failure, and never past `maximum_tier`. When another attempt at the current tier would push that tier's spend above one attempt at the next tier, it escalates instead of retrying cheaply. It stops when the cost or time budget (the tighter of the unit budget and the policy ceilings) is spent, or when the next attempt's projected cost does not fit. Escalation records carry `from_tier`, `to_tier`, `reason`, `attempts`, `elapsed_seconds`, `spent_usd`, aggregated `usage`, `target_runner` and `target_model` (filled from the first attempt at the new tier).
+Actions are `attempt`, `repair`, `escalate`, `stop` and `done`. The controller starts at `chosen_tier` and allows `budget.attempts` per tier (capped at 2: one implementation plus one repair). It escalates one tier only after an objective failure, and never past `maximum_tier`. When another attempt at the current tier would push that tier's spend above one attempt at the next tier, it escalates instead of retrying cheaply. It stops when the cost budget (the tighter of the unit budget and the policy ceiling) is spent, or when the next attempt's projected cost does not fit. The time budget (`budget.minutes`, tightened by the policy's `max_minutes_per_unit`) is advisory: an attempt past it is marked `over_time_budget` in the history and never stops the unit; while a runner works past it the conductor emits `long_running` attention events instead (see [runtime.md](runtime.md#health-monitoring-instead-of-wall-clock-kills)). Escalation records carry `from_tier`, `to_tier`, `reason`, `attempts`, `elapsed_seconds`, `spent_usd`, aggregated `usage`, `target_runner` and `target_model` (filled from the first attempt at the new tier).
 
 ## Circuit breaker
 
@@ -111,4 +115,4 @@ Actions are `attempt`, `repair`, `escalate`, `stop` and `done`. The controller s
 | merge queue enqueue | `classify` with the actual diff at the branch tip and `review_satisfies` again, so a review that no longer meets the review tier blocks the merge |
 | after each attempt | `EscalationController.record`; its record is persisted and replayed after a restart |
 
-A high risk unit therefore reaches the merge queue only with a Tier 2 review from a runner outside the author's model family.
+A high risk unit therefore reaches the merge queue only with a Tier 2 review from a runner outside the author's model family, unless the policy sets `review_independence: persona`.

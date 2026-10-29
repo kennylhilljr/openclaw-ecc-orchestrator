@@ -109,6 +109,10 @@ class Runtime:
             return self._cache["certified"]
         _, doc = read_document(path, "certifications", operation)
         records = doc.get("records") if isinstance(doc, dict) else doc
+        if records is None and isinstance(doc, dict) and isinstance(doc.get("results"), list):
+            # A certification run summary (runners.certify --out .../summary.json,
+            # also bin/recertify-weekly's cert-latest.json): one record per result.
+            records = [r.get("record", r) if isinstance(r, dict) else r for r in doc["results"]]
         if not isinstance(records, list):
             fail(operation, "certifications_valid", "expected a list of certification records")
         from ..runners.registry import certified_runners
@@ -192,6 +196,21 @@ class Runtime:
                 return None
         return None
 
+    def team(self, operation):
+        """The repository's `.orchestration/team.json` (TEAM-DELIVERY-v2 section 8),
+        or {} when absent. A malformed file fails the command."""
+        path = os.path.join(self.repo_top(operation), ".orchestration", "team.json")
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as exc:
+            fail(operation, "team_config_valid", f"{path}: {exc}")
+        if not isinstance(doc, dict):
+            fail(operation, "team_config_valid", f"{path}: not an object")
+        return doc
+
     def conductor(self, policy, operation, runner_env_allow=()):
         """A conductor for one invocation. `policy` is the run's stored policy
         (or, for create-run, the policy file), never re-read for a run."""
@@ -215,6 +234,9 @@ class Runtime:
                       runner_env_allow=tuple(runner_env_allow), protected_globs=tuple(
                           (policy or {}).get("protected_commands") or ()),
                       clock=self.clock, policy=policy, certified_runners=certified, catalog=catalog,
-                      tier_costs=self.tier_costs())
+                      tier_costs=self.tier_costs(), auto_retry=True,
+                      handoff_repair_turns=self.team(operation).get("handoff_repair_turns", 1),
+                      skills_pass=self.team(operation).get("skills_pass"),
+                      lessons_state_dir=self.cfg.state_dir)
         holder["c"] = c
         return c

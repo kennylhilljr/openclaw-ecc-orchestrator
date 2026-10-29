@@ -17,6 +17,13 @@ from .discovery import PROVIDER_ENDPOINTS
 from .registry import get_profile
 
 
+
+# Output budget for the one line probe. Reasoning models (Groq's gpt-oss-20b,
+# observed 2026-10-18) spend tokens thinking before they answer; 8 tokens left
+# them with an empty reply. 512 is still a fraction of a cent. No temperature is
+# sent: kimi-k3 accepts only 1 (HTTP 400 otherwise) and a one word reply needs none.
+PROBE_MAX_TOKENS = 512
+
 class ApiAdapter:
     name = ""
     base_url = ""
@@ -57,7 +64,7 @@ class ApiAdapter:
 
     def inference_request(self, ctx: ProbeContext) -> tuple[str, dict]:
         return (self.base_url + "/chat/completions",
-                {"model": ctx.model, "max_tokens": 8, "temperature": 0,
+                {"model": ctx.model, "max_tokens": PROBE_MAX_TOKENS,
                  "messages": [{"role": "user", "content": PROBE_PROMPT}]})
 
     def parse_inference(self, data: dict, ctx: ProbeContext) -> dict[str, Any]:
@@ -65,6 +72,7 @@ class ApiAdapter:
         message = (choices[0] or {}).get("message") or {}
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         return {"text": message.get("content") or "", "model": data.get("model") or ctx.model,
+                "finish_reason": (choices[0] or {}).get("finish_reason"),
                 "cost_usd": usage.get("cost"),
                 "input_tokens": usage.get("prompt_tokens"),
                 "output_tokens": usage.get("completion_tokens")}
@@ -84,7 +92,10 @@ class ApiAdapter:
             return StepOutcome("fail", "inference returned an unexpected shape")
         parsed = self.parse_inference(data, ctx)
         if not isinstance(parsed.get("text"), str) or not parsed["text"].strip():
-            return StepOutcome("fail", "inference returned no text")
+            reason = "inference returned no text"
+            if parsed.get("finish_reason") in ("length", "MAX_TOKENS"):
+                reason += " (output budget exhausted, finish_reason length)"
+            return StepOutcome("fail", reason)
         metadata = {k: parsed.get(k) for k in ("model", "cost_usd", "input_tokens",
                                                "output_tokens")}
         return StepOutcome("pass", "inference ok", parsed["text"][:200], metadata)
@@ -134,7 +145,7 @@ class GeminiAdapter(ApiAdapter):
         model = urllib.parse.quote(str(ctx.model), safe="")
         return ("%s/models/%s:generateContent" % (self.base_url, model),
                 {"contents": [{"parts": [{"text": PROBE_PROMPT}]}],
-                 "generationConfig": {"maxOutputTokens": 8, "temperature": 0}})
+                 "generationConfig": {"maxOutputTokens": PROBE_MAX_TOKENS, "temperature": 0}})
 
     def parse_inference(self, data: dict, ctx: ProbeContext) -> dict[str, Any]:
         text = ""
@@ -144,5 +155,6 @@ class GeminiAdapter(ApiAdapter):
                     text += part["text"]
         usage = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
         return {"text": text, "model": data.get("modelVersion") or ctx.model, "cost_usd": None,
+                "finish_reason": ((data.get("candidates") or [{}])[0] or {}).get("finishReason"),
                 "input_tokens": usage.get("promptTokenCount"),
                 "output_tokens": usage.get("candidatesTokenCount")}

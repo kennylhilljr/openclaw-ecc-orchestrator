@@ -31,7 +31,9 @@ class LeaseError(RunError):
 ATTENTION_STATES = {S.NEEDS_USER, S.INTERRUPTED, S.BLOCKED}
 # "handoff" is deliberately absent: only record_handoff may write it, after
 # validating the document, because the verifying transition trusts it.
-ANNOTATION_KEYS = {"verification", "review", "merge", "conflicts", "notes", "escalation"}
+ANNOTATION_KEYS = {"verification", "review", "merge", "conflicts", "notes", "escalation", "health",
+                   "last_failure", "handoff_repair", "team", "budget_grant",
+                   "skills_pass"}
 
 
 class _Tx:
@@ -67,7 +69,7 @@ def _new_unit_record(unit):
 
 def _apply_event(doc, event):
     data = event.get("data") or {}
-    if event.get("type") == "run.created":
+    if event.get("type") in ("run.created", "run.replanned"):
         doc = copy.deepcopy(data["run"])
     elif doc is None:
         raise RunError("event log does not start with run.created")
@@ -276,24 +278,29 @@ class RunManager:
         return per_tier, total, minutes, cost
 
     def _budget_exhausted(self, unit, tier=None):
-        per_tier, total, minutes, cost = self._budget_limits(unit)
+        """Attempts and cost are hard limits. `minutes` is advisory: a long
+        running unit gets `long_running` attention events, never a stop."""
+        per_tier, total, _minutes, cost = self._budget_limits(unit)
+        grant = max(0, int((((unit.get("annotations") or {}).get("budget_grant") or {})
+                            .get("attempts") or 0)))
         used = int((unit.get("attempts_by_tier") or {}).get(str(tier), 0)) if tier is not None else unit["attempts"]
-        if per_tier is not None and used >= int(per_tier):
-            return f"attempts {used}/{per_tier} at tier {tier}"
-        if total is not None and unit["attempts"] >= int(total):
-            return f"attempts {unit['attempts']}/{total}"
-        if minutes is not None and float(unit.get("minutes_used", 0.0)) > float(minutes):
-            return f"minutes {unit['minutes_used']}/{minutes}"
+        if per_tier is not None and used >= int(per_tier) + grant:
+            return f"attempts {used}/{int(per_tier) + grant} at tier {tier}"
+        if total is not None and unit["attempts"] >= int(total) + grant:
+            return f"attempts {unit['attempts']}/{int(total) + grant}"
         if cost is not None and float(unit.get("cost_usd", 0.0)) >= float(cost):
             return f"cost {unit.get('cost_usd', 0.0)}/{cost} USD"
         return None
 
     # == public API ==
-    def create_run(self, plan, conductor_id, run_id=None, dry_run=False, metadata=None, policy=None):
+    def create_run(self, plan, conductor_id, run_id=None, dry_run=False, metadata=None, policy=None, replace=False):
         """Validate and persist a plan. Every unit must pass
         `schemas.validate_work_unit`; `policy`, when given, must pass
         `schemas.validate_repository_policy` and is stored with the run so
-        classification uses it on every assignment."""
+        classification uses it on every assignment.
+
+        `replace=True` swaps the plan of the existing run `run_id`, keeping its
+        id, while no unit has been dispatched (see `_replace_run`)."""
         op = "run.create"
         analysis = analyze_plan(plan)
         if not analysis["ok"]:
@@ -341,6 +348,8 @@ class RunManager:
         }
         roots = [uid for uid in analysis["order"] if not doc["units"][uid]["depends_on"]]
         summary = {"run_id": run_id, "plan_sha256": doc["plan_sha256"], "layers": doc["layers"], "ready": roots}
+        if replace:
+            return self._replace_run(doc, summary, conductor_id, dry_run)
         if dry_run:
             return envelope(op, changed=False, checks=[check("plan_valid", True)], data=summary)
         with self.store.lock(run_id):
@@ -358,6 +367,47 @@ class RunManager:
         warnings = self._emit_external(run_id, [("run.created", {"run": doc, "conductor_id": conductor_id})] + tx.events)
         return envelope(op, changed=True, checks=[check("plan_valid", True), check("work_units_valid", True)],
                         warnings=warnings, data=summary, rollback_checkpoint={"run_id": run_id, "event_seq": 0})
+
+    def _replace_run(self, doc, summary, conductor_id, dry_run):
+        """Replace a run's plan in place. Refused once any unit has left
+        pending or ready (an attempt, a worktree): its work belongs to the old
+        plan. In research-mcp M1 every plan revision cost a new run id
+        (rm-m1a to rm-m1f), and a stale id could still be driven."""
+        op = "run.replace"
+        run_id = doc["run_id"]
+        with self.store.lock(run_id):
+            try:
+                old = self._load_unlocked(run_id)
+            except RunError as exc:
+                return envelope(op, ok=False, checks=[check("run_exists", False, str(exc))])
+            started = sorted(uid for uid, u in old["units"].items()
+                             if u["state"] not in (S.PENDING, S.READY) or u.get("attempts") or u.get("workspace"))
+            if started:
+                return envelope(op, ok=False, checks=[check(
+                    "no_unit_dispatched", False,
+                    f"units already dispatched: {', '.join(started)}; create a new run for the revised plan")],
+                    data={"dispatched": started})
+            holder = self._lease_blocker(old, conductor_id)
+            if holder:
+                return envelope(op, ok=False, checks=[check("lease_held", False, f"lease held by {holder!r}")])
+            doc["created_at"] = old["created_at"]
+            doc["metadata"]["replaced"] = list((old.get("metadata") or {}).get("replaced") or []) + [
+                {"plan_sha256": old["plan_sha256"], "at": iso(self.clock())}]
+            summary = dict(summary, replaced_plan_sha256=old["plan_sha256"])
+            checks = [check("plan_valid", True), check("no_unit_dispatched", True)]
+            if dry_run:
+                return envelope(op, changed=False, checks=checks, data=summary)
+            event = self.store.append_event(run_id, "run.replanned", {"run": copy.deepcopy(doc),
+                                                                      "conductor_id": conductor_id})
+            doc["last_event_seq"] = event["seq"]
+            tx = _Tx()
+            self._promote_ready(doc, tx, conductor_id)
+            for event_type, data in tx.events:
+                doc["last_event_seq"] = self.store.append_event(run_id, event_type, data)["seq"]
+            self.store.save(doc)
+        warnings = self._emit_external(run_id, [("run.created", {"run": doc, "conductor_id": conductor_id})] + tx.events)
+        return envelope(op, changed=True, checks=checks, warnings=warnings, data=summary,
+                        rollback_checkpoint={"run_id": run_id, "event_seq": old.get("last_event_seq", 0)})
 
     def acquire_lease(self, run_id, conductor_id, ttl=None, dry_run=False):
         def fn(run, tx):
@@ -617,16 +667,18 @@ class RunManager:
             self._touch(run, tx, unit_id)
             _, _, limit, cost_limit = self._budget_limits(unit)
             detail = None
-            if limit is not None and unit["minutes_used"] > float(limit):
-                detail = f"minutes {unit['minutes_used']}/{limit}"
-            elif cost_limit is not None and unit["cost_usd"] > float(cost_limit):
+            # Minutes are advisory (long_running attention while it runs); only
+            # the cost budget is a hard limit here.
+            over_minutes = limit is not None and unit["minutes_used"] > float(limit)
+            if cost_limit is not None and unit["cost_usd"] > float(cost_limit):
                 detail = f"cost {unit['cost_usd']}/{cost_limit} USD"
             if detail:
                 if S.NEEDS_USER in S.TRANSITIONS[unit["state"]]:
                     self._set_state(run, tx, unit_id, S.NEEDS_USER, conductor_id, reason="budget_exhausted")
                 return {"ok": False, "checks": [check("budget_available", False, detail)],
                         "required_user_actions": [_action("budget_exhausted", run_id, unit_id, detail)]}
-            return {"data": {"minutes_used": unit["minutes_used"], "cost_usd": unit["cost_usd"]}}
+            return {"data": {"minutes_used": unit["minutes_used"], "cost_usd": unit["cost_usd"],
+                             "over_minutes_budget": over_minutes}}
         return self._mutate(run_id, "unit.record_usage", conductor_id, fn)
 
     def resume(self, run_id, conductor_id, dry_run=False, ttl=None):

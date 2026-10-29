@@ -97,3 +97,35 @@ test("expired approvals are not pending", () => {
   assert.equal(snapshot(s, 2_100_000_000).pending_approvals.length, 0);
   assert.match(renderPendingText(s, 2_100_000_000), /No pending/);
 });
+
+test("health, completion and long running events render; unknown types stay ignored", () => {
+  const s = emptyState();
+  applyEvent(s, ev("run.created", { seq: 1, unit: null, data: { plan_sha256: PLAN, unit_ids: ["alpha"] } }));
+  applyEvent(s, ev("unit.state_changed", { seq: 2, data: { from: "assigned", to: "running", owner: "codex" } }));
+  applyEvent(s, ev("unit.health", { seq: 3, data: { state: "suspected_hang", previous: "healthy", process: "runner", flat_checks: 1, flat_checks_for_hang: 5, interval_seconds: 120 } }));
+  applyEvent(s, ev("attention.required", { seq: 4, data: { reason: "suspected_hang", detail: { process: "runner", evidence: { flat_checks: 1, flat_checks_for_hang: 5 } } } }));
+  applyEvent(s, ev("attention.required", { seq: 5, data: { reason: "long_running", detail: { elapsed_minutes: 95.5, budget_minutes: 45, multiple: 2 } } }));
+  let summary = renderSummaryText(s, 1_900_000_000);
+  assert.match(summary, /alpha: running \[health suspected_hang\]/);
+  assert.match(summary, /long_running \(running 95.5 min, budget 45 min; not stopped\)/);
+  assert.match(summary, /suspected_hang \(no progress for 1 of 5 checks\)/);
+  applyEvent(s, ev("unit.completed", { seq: 6, data: { exit_code: 0, duration_seconds: 5400, attempts: 1, tier: 1, runner: "codex" } }));
+  applyEvent(s, ev("unit.state_changed", { seq: 7, data: { from: "running", to: "verifying" } }));
+  applyEvent(s, ev("attention.required", { seq: 8, unit: "alpha", data: { reason: "hung_cancelled", detail: { process: "gate", gate: "unit-tests", evidence: { flat_checks: 5 } } } }));
+  summary = renderSummaryText(s, 1_900_000_000);
+  assert.match(summary, /Recent completions:\n  run1\/alpha: exited 0 after 1h 30m, attempt 1, tier 1, runner codex/);
+  assert.match(summary, /hung_cancelled \(cancelled after 5 checks without progress, gate unit-tests\)/);
+  assert.equal(s.runs.run1.units.alpha.completed.duration_seconds, 5400);
+  const snap = snapshot(s, 1_900_000_000);
+  assert.equal(snap.completions.length, 1);
+  assert.equal(snap.runs[0].units[0].health.state, "suspected_hang");
+  const html = renderPanelHtml(s, 1_900_000_000);
+  assert.ok(html.includes("Completions (1)"));
+  assert.ok(html.includes("exited 0 after 1h 30m"));
+  assert.ok(!html.includes("<script"));
+  const before = s.counters.ignored;
+  applyEvent(s, ev("unit.something_new", { seq: 9, data: {} }));
+  assert.equal(s.counters.ignored, before + 1);
+  applyEvent(s, ev("unit.completed", { seq: 10, unit: "../bad", data: { exit_code: 1 } }));
+  assert.equal(s.counters.ignored, before + 2);
+});

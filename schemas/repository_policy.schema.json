@@ -54,6 +54,31 @@
         ]
       }
     },
+    "author_providers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "description": "Providers that may author units (default: every allowed provider whose runner can author). Lets API providers review without authoring while dispatch launches coding CLIs only."
+    },
+    "review_independence": {
+      "type": "string",
+      "enum": [
+        "provider",
+        "persona"
+      ],
+      "default": "provider",
+      "description": "How a review shows independence from its author. provider (default): a different runner, and for strict reviews a different model family. persona: a distinct reviewer persona in its own session, so a single-provider repository can review and merge."
+    },
     "budget": {
       "type": "object",
       "required": [
@@ -225,6 +250,25 @@
     "catalog_max_age_seconds": {
       "type": "number",
       "exclusiveMinimum": 0
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+      "properties": {
+        "interval_seconds": {
+          "type": "number",
+          "minimum": 30,
+          "maximum": 1800,
+          "default": 120
+        },
+        "flat_checks_for_hang": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20,
+          "default": 5
+        }
+      }
     },
     "generated_file_couplings": {
       "type": "array",

@@ -10,6 +10,7 @@ certification; they are constructor overridable.
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any
 
@@ -23,8 +24,11 @@ EXERCISE_PROMPT = (
     "Run: python3 -m unittest -q   Read calc.py and fix the bug in calc.py only; do not "
     "modify test_calc.py. Run the tests again to confirm they pass, then commit your fix "
     "with: git commit -am \"probe: fix add\"   Do not touch anything else.")
-CANCEL_PROMPT = ("Cancellation probe: run the shell command `sleep 120` and wait for it to "
-                 "finish, then reply done.")
+# The cancellation check starts the ordinary probe prompt in streaming output
+# mode and cancels on the first stream event: it never asks the model to run
+# anything. An exit before any event is inconclusive and retried; after
+# CANCEL_ATTEMPTS inconclusive runs the check fails with ``no_stream_event``.
+CANCEL_ATTEMPTS = 3
 
 # The disposable project for ``repo_exercise``: one failing unittest.
 EXERCISE_FILES = {
@@ -39,6 +43,15 @@ EXERCISE_TEST_ARGV = ["python3", "-B", "-m", "unittest", "-q"]  # -B: no stale b
 
 _GIT_IDENTITY = ["-c", "user.name=runner-probe", "-c", "user.email=runner-probe@example.invalid"]
 _ERROR_LIMIT = 160
+_DETAIL_LIMIT = 480
+
+
+def _parse_version(text: str | None) -> tuple[int, ...] | None:
+    """The first dotted version number in ``text`` (e.g. "2.1.281 (Claude Code)")."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def _first_line(text: str) -> str:
@@ -82,9 +95,16 @@ class CliAdapter:
         # Reasoning effort for the CLI (e.g. "low"); None keeps the CLI default.
         self.effort = effort
 
+    # Not secrets, but needed at run time: Claude Code on macOS looks up its
+    # keychain login by account name and reports "Not logged in" without USER
+    # (seen 2026-10-19; certification passed because probes keep USER).
+    # uv's cache and offline switches travel with the runner so a sandboxed agent
+    # can reuse the owner's warm cache (live finding, rmcp-m0f).
+    runtime_env: tuple[str, ...] = ("USER", "LOGNAME", "UV_CACHE_DIR", "UV_OFFLINE", "UV_PYTHON_INSTALL_DIR")
+
     def env_allow(self) -> tuple[str, ...]:
         """Names to allowlist when this CLI runs as a unit runner under the supervisor."""
-        return tuple(self.credential_env)
+        return tuple(dict.fromkeys(tuple(self.runtime_env) + tuple(self.credential_env)))
 
     # interface
     def build_invocation(self, prompt: str, model: str | None = None, cwd: str | None = None,
@@ -93,8 +113,8 @@ class CliAdapter:
 
     def build_cancel_invocation(self, model: str | None = None,
                                 cwd: str | None = None) -> list[str]:
-        """A long running task that starts a child process (``sleep``)."""
-        return self.build_invocation(CANCEL_PROMPT, model, cwd=cwd)
+        """The short probe prompt in the CLI's streaming (JSON lines) output mode."""
+        return self.build_invocation(PROBE_PROMPT, model, cwd=cwd)
 
     def parse_output(self, stdout: str) -> dict[str, Any]:
         """``{"text", "model", "cost_usd", "input_tokens", "output_tokens", "error"}``;
@@ -130,12 +150,23 @@ class CliAdapter:
                                "exit %d" % result.returncode)
         return self._failed(result, what)
 
+    # Oldest CLI version whose flags this adapter uses; None means no floor.
+    min_version: tuple[int, ...] | None = None
+
     def installed(self, ctx: ProbeContext) -> StepOutcome:
         result = ctx.run_command(list(self.version_argv), ctx.step_timeout)
         failed = self._failed(result, "version check")
         if failed:
             return failed
         version = _first_line(result.stdout)
+        found = _parse_version(version)
+        if self.min_version and found and found < self.min_version:
+            want = ".".join(str(n) for n in self.min_version)
+            have = ".".join(str(n) for n in found)
+            return StepOutcome(
+                "fail", "%s %s is older than the minimum %s; check which %s is first on PATH"
+                % (self.name, have, want, self.version_argv[0]), version,
+                {"version": version or None})
         return StepOutcome("pass", "installed", version, {"version": version or None})
 
     def authentication(self, ctx: ProbeContext) -> StepOutcome:
@@ -232,35 +263,45 @@ class CliAdapter:
             ctx.cleanup_workdir(workdir)
 
     def cancellation(self, ctx: ProbeContext) -> StepOutcome:
-        workdir = ctx.make_workdir()
-        try:
-            argv = self.build_cancel_invocation(ctx.model, cwd=workdir)
-            if ctx.cancel_command is not None:
-                return self._cancel_with_group_check(ctx, argv, workdir)
-            result = ctx.run_command(argv, ctx.cancel_timeout, workdir)
-        finally:
-            ctx.cleanup_workdir(workdir)
-        if result.timed_out:
-            return StepOutcome("pass", "terminated after cancel timeout")
-        return StepOutcome("fail", "exited before the cancel point (exit %d)" % result.returncode,
-                           _first_line(result.stderr))
-
-    def _cancel_with_group_check(self, ctx: ProbeContext, argv: list[str],
-                                 workdir: str) -> StepOutcome:
-        res: CancelResult = ctx.cancel_command(argv, ctx.cancel_timeout, workdir)
-        meta = {"members_before": res.members_before, "elapsed_seconds": res.elapsed_seconds}
-        if not res.started:
-            return StepOutcome("fail", "could not start the cancellation task", "", meta)
-        if res.exited_early:
+        """Event triggered cancellation: start the probe prompt in streaming
+        mode, cancel the process group as soon as the first stream event
+        arrives on stdout, and prove the whole group is gone. Independent of
+        the model agreeing to do anything: the event precedes the answer."""
+        if ctx.cancel_command is None:
+            return StepOutcome("fail", "no event aware cancel runner",
+                               "a finished command cannot be cancelled; inject ctx.cancel_command")
+        inconclusive: list[str] = []
+        for attempt in range(1, CANCEL_ATTEMPTS + 1):
+            workdir = ctx.make_workdir()
+            try:
+                argv = self.build_cancel_invocation(ctx.model, cwd=workdir)
+                res: CancelResult = ctx.cancel_command(argv, ctx.step_timeout, workdir)
+            finally:
+                ctx.cleanup_workdir(workdir)
+            meta = {"attempts": attempt, "members_before": res.members_before,
+                    "elapsed_seconds": res.elapsed_seconds, "first_event": res.first_event or None,
+                    "event_seconds": res.event_seconds}
+            if not res.started:
+                return StepOutcome("fail", "could not start the cancellation task", "", meta)
+            if res.event_seen and not res.exited_early:
+                if not res.group_gone:
+                    return StepOutcome("fail", "process group survived cancellation",
+                                       "%d process(es) in the group at cancel" % res.members_before, meta)
+                return StepOutcome("pass", "cancelled on the first stream event; whole process group gone",
+                                   "first event %s after %ss; %d process(es) in the group at cancel, "
+                                   "0 after; attempt %d" % (res.first_event, res.event_seconds,
+                                                            res.members_before, attempt), meta)
+            if not res.exited_early:
+                return StepOutcome("fail", "no_stream_event",
+                                   "no stream event within %ss; group killed (%s)"
+                                   % (int(ctx.step_timeout), "gone" if res.group_gone else "survivors"),
+                                   meta)
             parsed = self.parse_output(res.stdout)
-            why = parsed.get("error") or _first_line(res.stderr)
-            return StepOutcome("fail", "exited before the cancel point (exit %s)"
-                               % res.returncode, (why or "")[:_ERROR_LIMIT], meta)
-        if not res.group_gone:
-            return StepOutcome("fail", "process group survived cancellation", "", meta)
-        return StepOutcome("pass", "cancelled; whole process group gone",
-                           "%d process(es) in the group at cancel, 0 after"
-                           % res.members_before, meta)
+            why = parsed.get("error") or _first_line(res.stderr) or ("exit %s" % res.returncode)
+            inconclusive.append("attempt %d: exited before %s (%s)" % (
+                attempt, "the cancel" if res.event_seen else "any stream event", why[:_ERROR_LIMIT]))
+        return StepOutcome("fail", "no_stream_event", "; ".join(inconclusive)[:_DETAIL_LIMIT],
+                           {"attempts": CANCEL_ATTEMPTS})
 
 
 class ClaudeAdapter(CliAdapter):
@@ -272,15 +313,25 @@ class ClaudeAdapter(CliAdapter):
     ``--json`` pins that.
     """
     name = "claude"
+    # 2.1.112 lacks --permission-prompts (seen 2026-10-18); 2.1.281 is verified.
+    min_version = (2, 1, 281)
     version_argv = ["claude", "--version"]
     auth_argv = ["claude", "auth", "status", "--json"]
     credential_env = ("HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
-    edit_tools = "Read,Edit,Write,Bash(git *),Bash(python3 *)"
-    cancel_tools = "Bash(sleep *)"
+    # uv and the repo CI script: units must lock, sync and run their own gates
+    # (uv run executes arbitrary code, as python3 already can, so this adds no
+    # new capability).
+    # Skill: the repository's skills (.claude/skills) and Claude Code's bundled ones
+    # (/simplify, /verify, /code-review) are part of every unit's definition of done.
+    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),"
+                  "Bash(tools/ci.sh),Bash(tools/ci.sh *),Bash(./tools/ci.sh),Bash(./tools/ci.sh *)")
 
-    def _base(self, model):
-        argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence",
+    def _base(self, model, output_format="json"):
+        argv = ["claude", "-p", "--output-format", output_format, "--no-session-persistence",
                 "--permission-prompts", "none"]
+        if output_format == "stream-json":
+            # Claude Code 2.1.281: print mode refuses stream-json without --verbose.
+            argv.append("--verbose")
         if model:
             argv += ["--model", model]
         if self.effort:
@@ -290,11 +341,15 @@ class ClaudeAdapter(CliAdapter):
     def build_invocation(self, prompt, model=None, cwd=None, writable=False):
         argv = self._base(model)
         if writable:
-            argv += ["--permission-mode", "acceptEdits", "--allowedTools", self.edit_tools]
+            # Project and local settings only: the owner's user-level plugins and hooks
+            # (for example a guardrail that refuses edits to any file named secrets.py)
+            # must not decide what an ECC unit may write (live finding, rmcp-m0f M0-05).
+            argv += ["--setting-sources", "project,local",
+                     "--permission-mode", "acceptEdits", "--allowedTools", self.edit_tools]
         return argv + ["--", prompt]
 
     def build_cancel_invocation(self, model=None, cwd=None):
-        return self._base(model) + ["--allowedTools", self.cancel_tools, "--", CANCEL_PROMPT]
+        return self._base(model, "stream-json") + ["--", PROBE_PROMPT]
 
     def parse_auth(self, result):
         try:
@@ -340,6 +395,42 @@ class ClaudeAdapter(CliAdapter):
                 "error": error}
 
 
+def uv_cache_dir():
+    """uv's cache folder when it exists (UV_CACHE_DIR, else uv's macOS and Linux
+    default). Granted to Codex's sandbox so `uv sync` and `uv run` work offline."""
+    path = os.environ.get("UV_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "uv")
+    return path if os.path.isdir(path) else None
+
+
+def git_write_dir(cwd):
+    """The directory git writes when committing from ``cwd``.
+
+    A normal checkout writes ``<cwd>/.git``. In a linked worktree ``.git`` is a
+    file ("gitdir: <common>/worktrees/<name>"); a commit there writes that
+    worktree's index under the common directory plus the shared objects and
+    refs, so the common git directory is what must be writable."""
+    dotgit = os.path.join(cwd, ".git")
+    if not os.path.isfile(dotgit):
+        return dotgit
+    try:
+        with open(dotgit, encoding="utf-8") as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return dotgit
+    if not first.startswith("gitdir:"):
+        return dotgit
+    gitdir = first[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.normpath(os.path.join(cwd, gitdir))
+    try:
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as fh:
+            common = fh.readline().strip()
+    except OSError:
+        return gitdir
+    return os.path.normpath(common if os.path.isabs(common) else os.path.join(gitdir, common))
+
+
 class CodexAdapter(CliAdapter):
     """Codex exec mode (flags confirmed against codex-cli 0.158.0-alpha.7).
 
@@ -362,12 +453,21 @@ class CodexAdapter(CliAdapter):
             if writable:
                 # workspace-write keeps <root>/.git read only, so the agent
                 # cannot commit (live finding: ".git/index.lock" denied).
-                # Grant exactly this repository's git directory.
-                argv += ["--add-dir", os.path.join(cwd, ".git")]
+                # Grant exactly this repository's git directory; for a linked
+                # worktree that is the common .git, not the ".git" pointer
+                # file (live finding, preflight 2026-10-19).
+                argv += ["--add-dir", git_write_dir(cwd)]
+                cache = uv_cache_dir()
+                if cache:
+                    argv += ["--add-dir", cache]
         if model:
             argv += ["-m", model]
         if self.effort:
             argv += ["-c", 'model_reasoning_effort="%s"' % self.effort]
+        # Both sandboxes block the network, so uv must build from the shared
+        # cache: a fresh checkout's `uv run` otherwise fetches its build
+        # backend from PyPI and fails (live finding, rm-m0b M0-02 verifier).
+        argv += ["-c", 'shell_environment_policy.set.UV_OFFLINE="1"']
         return argv + ["--", prompt]
 
     def parse_auth(self, result):

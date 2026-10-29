@@ -13,7 +13,9 @@ Each gated command is a `Spec`:
 * `lease_run(plan)` names the run whose conductor lease must be held.
 """
 
+import copy
 import hashlib
+import json
 import os
 import uuid
 
@@ -22,19 +24,22 @@ from ..merge_queue.dispatch import ConflictError, assert_parallel_safe
 from ..plugin.approvals import plan_digest
 from ..plugin.inbox import DecisionInbox
 from ..routing.classify import classify
-from ..routing.escalation import AttemptOutcome, EscalationController
+from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import select_runner
 from ..runs import state as S
+from ..runs.dag import plan_sha256
 from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.manager import RunError
 from ..runs.plan_lint import lint_plan
-from ..runs.store import StoreError
+from ..runs.repair import HANDOFF_RULES, HANDOFF_TEMPLATE, REPAIR_PROMPT_TOKEN, failure_brief
+from ..runs.store import StoreError, iso
 from ..worktrees.git import git_out, run_git
 from .config import UsageError, checked_path
 from .runtime import CommandFailed, fail, read_document
 
 _HEX = set("0123456789abcdef")
+DECISION_WAIT_SECONDS = 30.0
 
 
 class Plan:
@@ -115,16 +120,23 @@ def plan_create_run(ctx):
              actions=[{"kind": "review_plan_lint", "run_id": a.run_id,
                        "detail": "resolve the findings or explicitly review --allow-lint-findings"}],
              data=dict(lint, plan_file=path, target_commit=tip))
-    if ctx.rt.store.exists(a.run_id):
-        fail(op, "run_id_unique", f"run {a.run_id} already exists")
+    replace = bool(getattr(a, "replace", False))
+    exists = ctx.rt.store.exists(a.run_id)
+    if exists and not replace:
+        fail(op, "run_id_unique", f"run {a.run_id} already exists",
+             actions=[{"kind": "replace_plan", "run_id": a.run_id,
+                       "detail": f"ecc create-run --run-id {a.run_id} --plan {path} --replace"}])
+    if replace and not exists:
+        fail(op, "run_exists", f"run {a.run_id} not found; drop --replace to create it")
+    file_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     res = ctx.rt.manager.create_run(plan, cfg.conductor_id, run_id=a.run_id, dry_run=True, policy=policy,
-                                    metadata={"base_commit": tip, "target_branch": cfg.target_branch})
+                                    metadata={"base_commit": tip, "target_branch": cfg.target_branch},
+                                    replace=replace)
     if not res["ok"]:
         res["operation"] = op
         raise CommandFailed(res)
     summary = res["data"]
-    doc = base_doc(op, run_id=a.run_id, plan_file=path,
-                   plan_file_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    doc = base_doc(op, run_id=a.run_id, plan_file=path, plan_file_sha256=file_sha, replace=replace,
                    plan_sha256=summary["plan_sha256"], layers=summary["layers"], ready=summary["ready"],
                    repo=repo, target_branch=cfg.target_branch, base_commit=tip, policy_file=policy_path,
                    policy_sha256=plan_digest(policy) if policy is not None else None,
@@ -137,8 +149,9 @@ def plan_create_run(ctx):
 
 def execute_create_run(ctx, plan):
     c = ctx.rt.conductor(plan.extra["policy"], "create-run")
-    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"],
-                        metadata={"plan_lint": plan.extra["lint"]})
+    return c.create_run(plan.extra["plan"], run_id=plan.doc["run_id"], replace=plan.doc["replace"],
+                        metadata={"plan_lint": plan.extra["lint"], "plan_file": plan.doc["plan_file"],
+                                  "plan_file_sha256": plan.doc["plan_file_sha256"]})
 
 
 # == dispatch ==
@@ -154,14 +167,7 @@ def predict_routing(ctx, op, run, unit_id):
                        "detail": "fix the unit's routing or policy"}])
     ctrl = EscalationController(punit, classification, tier_costs=ctx.rt.tier_costs(), clock=ctx.clock, policy=policy)
     record = (run["units"][unit_id].get("annotations") or {}).get("escalation") or {}
-    for attempt in record.get("attempts") or []:
-        if ctrl.finished:
-            break
-        ctrl.record(AttemptOutcome(
-            passed=bool(attempt.get("passed")), objective_failure=bool(attempt.get("objective_failure")),
-            cost_usd=float(attempt.get("cost_usd") or 0.0), elapsed_seconds=attempt.get("elapsed_seconds"),
-            runner=attempt.get("runner"), model=attempt.get("model"), usage=attempt.get("usage"),
-            reason=attempt.get("reason") or ""))
+    replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]))
     action = ctrl.next_action()
     if action["action"] in ("stop", "done"):
         fail(op, "escalation_allows_attempt", action["reason"],
@@ -179,8 +185,9 @@ def predict_routing(ctx, op, run, unit_id):
             "estimated_cost_usd": selection.estimated_cost_usd, "escalation": action["action"]}
 
 
-def runner_prompt(punit):
-    """Deterministic instructions for a coding CLI runner."""
+def runner_prompt(punit, brief=None, persona=None):
+    """Deterministic instructions for a coding CLI runner. `persona` is an
+    optional (name, text) pair from the repository's persona files."""
     lines = [f"You are implementing work unit {punit['id']}: {punit.get('title', '')}."]
     if punit.get("description"):
         lines.append(str(punit["description"]))
@@ -190,14 +197,39 @@ def runner_prompt(punit):
     if commands:
         lines.append("Acceptance commands that must pass: " + "; ".join(commands) + ".")
     lines.append("Commit your work on the current branch. Never push, never change other branches.")
-    lines.append("Finally write a JSON handoff document (schema_version 1.0: unit_id, status, outcome, "
-                 "files_changed, behavior, commands, unresolved_failures, assumptions, risks, next_action, "
-                 "commit {sha, branch, worktree}, usage, user_input_required) to the file named by the "
-                 "ECC_HANDOFF_PATH environment variable.")
-    return "\n".join(lines)
+    lines.append("Finally write a JSON handoff document to this exact file: "
+                 "{ECC_HANDOFF_PATH} (the same path is in the ECC_HANDOFF_PATH environment variable). "
+                 "It is outside the repository, and its folder is writable for you: if your file-editing tool "
+                 "refuses a path outside the repository, write it from the shell instead, for example "
+                 "cat > \"$ECC_HANDOFF_PATH\" <<'JSON' ... JSON. Never write it anywhere else and do not "
+                 "commit it. ECC validates it against its handoff schema (not in this repository): no keys other "
+                 "than the template's, and these types. Template (replace every <...>):")
+    lines.append(HANDOFF_TEMPLATE.replace("<UNIT_ID>", str(punit["id"])))
+    lines.append(HANDOFF_RULES)
+    if brief:
+        lines.append(brief)
+    text = "\n".join(lines)
+    if persona and persona[1]:
+        from ..team.personas import with_persona
+        text = with_persona(text, persona[0], persona[1])
+    return text
 
 
-def runner_command(ctx, op, punit, routing, worktree_path):
+def coder_persona(ctx, op):
+    """(name, text) of the persona team.json assigns to the coder, or None.
+    A persona that is assigned but missing fails the command."""
+    from ..team import personas as TP
+    name = TP.persona_for(ctx.rt.team(op), "coder")
+    if not name:
+        return None
+    text = TP.load_persona(ctx.rt.repo_top(op), name)
+    if text is None:
+        fail(op, "team_personas_present", f"team.json assigns persona {name!r} to the coder, but "
+             f"{os.path.join(*TP.PERSONA_DIR, name + '.md')} is missing or empty")
+    return name, text
+
+
+def runner_command(ctx, op, punit, routing, worktree_path, brief=None):
     a = ctx.args
     if a.runner_command_argv is not None:
         return {"source": "test_override", "argv": list(a.runner_command_argv), "env_allow": []}
@@ -212,10 +244,38 @@ def runner_command(ctx, op, punit, routing, worktree_path):
              f"runner {routing['runner']} is an API runner; CLI dispatch launches coding CLI runners only",
              actions=[{"kind": "resolve_needs_user", "run_id": ctx.args.run_id, "unit_id": punit["id"],
                        "detail": "certify a coding CLI runner for this tier or drive the unit from Python"}])
-    argv = adapter.build_invocation(runner_prompt(punit), model=routing.get("model"), cwd=worktree_path,
-                                    writable=True)
+    argv = _with_handoff_dir(adapter.build_invocation(runner_prompt(punit, brief, coder_persona(ctx, op)),
+                                                      model=routing.get("model"),
+                                                      cwd=worktree_path, writable=True))
+    # Same runner and permissions, prompt filled in by the conductor: the
+    # handoff-only repair turn (TEAM-DELIVERY-v2 5.2).
+    repair = _with_handoff_dir(adapter.build_invocation(REPAIR_PROMPT_TOKEN, model=routing.get("model"),
+                                                        cwd=worktree_path, writable=True))
     env_allow = list(adapter.env_allow()) if hasattr(adapter, "env_allow") else []
-    return {"source": "registry", "argv": list(argv), "env_allow": env_allow}
+    return {"source": "registry", "argv": list(argv), "repair_argv": list(repair), "env_allow": env_allow}
+
+
+def _with_handoff_dir(argv):
+    """Grant the handoff folder (filled in by Conductor.start_unit) before the
+    "--" that ends the options; both coding CLIs accept --add-dir."""
+    if "--" not in argv:
+        return list(argv)
+    from ..runs.conductor import HANDOFF_DIR_TOKEN
+    cut = argv.index("--")
+    return argv[:cut] + ["--add-dir", HANDOFF_DIR_TOKEN] + argv[cut:]
+
+
+def retry_brief(run, unit_id, punit):
+    """The failure brief for a unit returning from a failed attempt, or None."""
+    unit = run["units"][unit_id]
+    last = (unit.get("annotations") or {}).get("last_failure")
+    if not last or not unit.get("attempts"):
+        return None
+    reason = str(unit.get("last_reason") or "")
+    if not reason.startswith("retry:") and not reason.startswith("review:"):
+        return None
+    budget = (punit.get("budget") or {}).get("attempts") or "?"
+    return failure_brief(unit_id, unit["attempts"] + 1, budget, last.get("evidence") or {"reason": last.get("reason")})
 
 
 def plan_dispatch(ctx):
@@ -234,7 +294,7 @@ def plan_dispatch(ctx):
         fail(op, "no_parallel_overlap", str(exc))
     routing = predict_routing(ctx, op, run, a.unit)
     paths = ctx.rt.worktrees(op).paths(a.run_id, a.unit)
-    command = runner_command(ctx, op, punit, routing, paths["path"])
+    command = runner_command(ctx, op, punit, routing, paths["path"], brief=retry_brief(run, a.unit, punit))
     worker = a.worker or unit.get("owner") or routing["runner"]
     doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], attempt=unit["attempts"] + 1,
                    owner=unit.get("owner"), worker=worker, routing=routing, runner_command=command,
@@ -278,6 +338,7 @@ def execute_dispatch(ctx, plan):
                                                 "detail": "routing changed after the plan was reviewed"}])
     checks.append(check("routing_matches_plan", True))
     started = c.start_unit(run_id, unit_id, doc["runner_command"]["argv"],
+                           repair_argv=doc["runner_command"].get("repair_argv"),
                            on_line=lambda stream, line: ctx.progress(f"[{unit_id} {stream}] {line}"))
     checks += started["checks"]
     if not started["ok"]:
@@ -415,12 +476,23 @@ def execute_decision(ctx, plan):
     inbox_dir = ctx.cfg.decision_inbox
     name = f"{int(ctx.clock() * 1000):013d}-{doc['request_id']}-{uuid.uuid4().hex[:8]}.json"
     atomic_write_json(os.path.join(inbox_dir, name), decision)
-    results = DecisionInbox(inbox_dir, ctx.rt.broker).process()
+    inbox = DecisionInbox(inbox_dir, ctx.rt.broker)
+    results = inbox.process()
     mine = next((r for r in results if r.get("source_file") == name), None)
+    by_processor = False
+    if mine is None:
+        # The standing processor (`approvals process-inbox`) may hold or have
+        # taken this file: wait for its claim, then read the recorded result.
+        mine = inbox.process_one(name, wait=DECISION_WAIT_SECONDS)
+        if mine is None:
+            mine = inbox.read_result(name)
+            by_processor = mine is not None
     if mine is None:
         return envelope(op, ok=False, changed=True, checks=[check("decision_processed", False, name)])
-    others = [r.get("source_file") for r in results if r is not mine]
+    others = [r.get("source_file") for r in results if r.get("source_file") != name]
     warnings = list(mine.get("warnings") or [])
+    if by_processor:
+        warnings.append("the decision was processed by the standing inbox processor")
     if others:
         warnings.append(f"also processed {len(others)} other decision file(s) waiting in the inbox")
     data = {"decision": {"request_id": doc["request_id"], "decision": doc["decision"],
@@ -598,6 +670,215 @@ def execute_cleanup(ctx, plan):
     return res
 
 
+# == resume ==
+REVIEW_STALLS = ("no_qualified_reviewer", "no_qualified_verifier", "verifier_inconclusive")
+
+
+def plan_resume(ctx):
+    """Send a stopped unit (needs_user or failed) back to ready. Its worktree,
+    attempt history and last failure (for example a reviewer's findings) are
+    kept, so the next dispatch repairs exactly what stopped it. Refused when the
+    unit's escalation budget has no attempt left under the current policy."""
+    op = "resume"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    unit = load_unit(op, run, a.unit)
+    extra = int(getattr(a, "extra_attempts", 0) or 0)
+    if extra < 0 or extra > 3:
+        fail(op, "extra_attempts_valid", "extra attempts must be between 0 and 3")
+    granted = int(((unit.get("annotations") or {}).get("budget_grant") or {}).get("attempts") or 0)
+    if extra and unit["state"] in (S.MERGED, S.CANCELLED):
+        fail(op, "unit_open", f"unit {a.unit} is {unit['state']}")
+    if extra and unit["state"] not in (S.NEEDS_USER, S.FAILED):
+        # Grant only: the unit keeps running; the next failure finds the extra attempt.
+        doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], target=None,
+                       budget_grant=granted + extra)
+        return Plan(doc, checks=[check("extra_attempts_valid", True, f"{granted} + {extra}")],
+                    extra={"policy": run.get("policy")})
+    if unit["state"] not in (S.NEEDS_USER, S.FAILED):
+        fail(op, "unit_stopped", f"unit {a.unit} is {unit['state']}; resume takes a unit in needs_user or failed")
+    ann = unit.get("annotations") or {}
+    head = (ann.get("verification") or {}).get("head")
+    if unit.get("last_reason") in REVIEW_STALLS and head and unit["state"] == S.NEEDS_USER:
+        # The code passed its gates; only the team review stalled (no provider answered).
+        doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"],
+                       last_reason=unit.get("last_reason"), target=S.REVIEWING, verified_head=head)
+        return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
+                                 check("verified_head", True, head)], extra={"policy": run.get("policy")})
+    if extra:
+        run = copy.deepcopy(run)
+        run["units"][a.unit].setdefault("annotations", {})["budget_grant"] = {"attempts": granted + extra}
+    ctrl = ctx.rt.conductor(run.get("policy"), op)._controller(run, a.unit)
+    if ctrl is None:
+        fail(op, "routing_valid", f"unit {a.unit} does not classify under the current policy")
+    if ctrl.finished:
+        fail(op, "attempts_left", f"unit {a.unit} has used its attempt budget ({len(ctrl.history)} attempts); "
+                                  "raise budget.attempts in the plan and create a new run")
+    last = ((unit.get("annotations") or {}).get("last_failure") or {}).get("reason")
+    doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], last_reason=unit.get("last_reason"),
+                   last_failure=last, attempts=len(ctrl.history), next_action=ctrl.next_action(), target=S.READY,
+                   budget_grant=granted + extra if extra else None)
+    return Plan(doc, checks=[check("unit_stopped", True, unit["state"]),
+                             check("attempts_left", True, f"{len(ctrl.history)} used; next: "
+                                   f"{ctrl.next_action().get('action')} at tier {ctrl.tier}")],
+                extra={"policy": run.get("policy")})
+
+
+def execute_resume(ctx, plan):
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "resume")
+    if doc.get("budget_grant"):
+        res = c.manager.annotate_unit(doc["run_id"], c.id, doc["unit_id"], "budget_grant",
+                                      {"attempts": doc["budget_grant"], "by": "owner", "at": iso(ctx.clock())})
+        if not res.get("ok", True) or doc["target"] is None:
+            res["operation"] = "resume"
+            return res
+    reason = "retry:owner_resume" if doc["target"] == S.READY else "owner_resume"
+    res = c.manager.transition(doc["run_id"], c.id, doc["unit_id"], doc["target"], reason=reason)
+    res["operation"] = "resume"
+    return res
+
+
+# == team-review ==
+def plan_team_review(ctx):
+    op = "team-review"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    unit = load_unit(op, run, a.unit)
+    if unit["state"] != S.REVIEWING:
+        fail(op, "unit_reviewing", f"unit {a.unit} is {unit['state']}; team-review needs a unit in reviewing")
+    from ..team import config as TC
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        fail(op, "team_config_valid", str(exc))
+    from ..team.personas import PERSONA_DIR, missing_personas
+    missing = missing_personas(ctx.rt.repo_top(op), team)
+    if missing:
+        fail(op, "team_personas_present", "team.json assigns personas the repository does not define: "
+             + ", ".join(os.path.join(*PERSONA_DIR, n + ".md") for n in missing))
+    head = ((unit.get("annotations") or {}).get("verification") or {}).get("head")
+    doc = base_doc(op, run_id=a.run_id, unit_id=a.unit, unit_state=unit["state"], verified_head=head,
+                   author=(unit.get("routing") or {}).get("runner"), merge_approval=team["merge_approval"],
+                   roles={r: {k: v for k, v in spec.items() if k in ("class", "panel", "panels", "when",
+                                                                      "contract_paths", "when_paths")}
+                          for r, spec in team["roles"].items()},
+                   run_plan_sha256=run["plan_sha256"], push=False)
+    return Plan(doc, extra={"policy": run.get("policy"), "team": team})
+
+
+def execute_team_review(ctx, plan):
+    from ..process.supervisor import Supervisor
+    from ..team.review import TeamStep
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "team-review")
+    step = TeamStep(c, plan.extra["team"], state_dir=ctx.cfg.state_dir, worktree_root=ctx.cfg.worktree_root,
+                    logs_dir=ctx.cfg.logs_dir, supervisor=Supervisor(clock=ctx.clock), clock=ctx.clock)
+    res = step.run(doc["run_id"], doc["unit_id"])
+    res["operation"] = "team-review"
+    return res
+
+
+# == drive ==
+def plan_file_drift(run):
+    """The plan sha of the run's plan file when it no longer matches the run,
+    else None. A run created before the file was recorded, a file that is
+    gone, or a formatting-only edit (same units) is not drift."""
+    meta = run.get("metadata") or {}
+    path = meta.get("plan_file")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() == meta.get("plan_file_sha256"):
+        return None
+    try:
+        new_sha = plan_sha256(json.loads(text))
+    except (ValueError, TypeError, AttributeError):
+        new_sha = "unparsable"
+    return None if new_sha == run["plan_sha256"] else new_sha
+
+
+def stale_plan_stop(op, run):
+    """Refuse to drive a run whose plan file changed after it was created (rm-m1e
+    was driven again after plan v6 existed and failed on findings v6 fixed)."""
+    new_sha = plan_file_drift(run)
+    if new_sha is None:
+        return
+    r, path = run["run_id"], run["metadata"]["plan_file"]
+    dispatched = any(u["state"] not in (S.PENDING, S.READY) or u.get("attempts") for u in run["units"].values())
+    command = (f"ecc create-run --run-id <new run id> --plan {path}" if dispatched
+               else f"ecc create-run --run-id {r} --plan {path} --replace")
+    fail(op, "plan_file_unchanged",
+         f"{path} changed since run {r} was created: run plan {run['plan_sha256'][:12]}, file plan {new_sha[:12]}",
+         actions=[{"kind": "replace_plan", "run_id": r, "command": command,
+                   "detail": "replace the run's plan, then drive again" if not dispatched
+                   else "units already ran on the old plan; create a new run"}],
+         data={"plan_file": path, "run_plan_sha256": run["plan_sha256"], "file_plan_sha256": new_sha,
+               "next_steps": [command]})
+
+
+def plan_drive(ctx):
+    op = "drive"
+    a = ctx.args
+    run = load_run(ctx, op, a.run_id)
+    stale_plan_stop(op, run)
+    from ..team import config as TC
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        fail(op, "team_config_valid", str(exc))
+    from ..team.personas import PERSONA_DIR, missing_personas
+    missing = missing_personas(ctx.rt.repo_top(op), team)
+    if missing:
+        fail(op, "team_personas_present", "team.json assigns personas the repository does not define: "
+             + ", ".join(os.path.join(*PERSONA_DIR, n + ".md") for n in missing))
+    budget = ((run.get("policy") or {}).get("budget") or {})
+    max_cost = a.max_cost_usd if a.max_cost_usd is not None else budget.get("max_cost_usd_total")
+    states = {}
+    for u in run["units"].values():
+        states[u["state"]] = states.get(u["state"], 0) + 1
+    doc = base_doc(op, run_id=a.run_id, unit_states=states, merge_approval=team["merge_approval"],
+                   milestone=(team.get("milestone") or {}).get("name"), max_cost_usd=max_cost,
+                   max_hours=a.max_hours, run_plan_sha256=run["plan_sha256"], push=False,
+                   test_runner=bool(a.runner_command_argv))
+    return Plan(doc, extra={"policy": run.get("policy"), "team": team})
+
+
+def execute_drive(ctx, plan):
+    import argparse
+    from ..process.supervisor import Supervisor
+    from ..team.drive import Drive, shell_gate_runner
+    from ..team.review import TeamStep
+    doc = plan.doc
+    c = ctx.rt.conductor(plan.extra["policy"], "drive")
+    supervisor = Supervisor(clock=ctx.clock)
+    step = TeamStep(c, plan.extra["team"], state_dir=ctx.cfg.state_dir, worktree_root=ctx.cfg.worktree_root,
+                    logs_dir=ctx.cfg.logs_dir, supervisor=supervisor, clock=ctx.clock)
+    saved = ctx.args
+
+    def dispatch(unit_id):
+        ns = argparse.Namespace(**vars(saved))
+        ns.unit, ns.worker = unit_id, None
+        ctx.args = ns
+        try:
+            return execute_dispatch(ctx, plan_dispatch(ctx))
+        except CommandFailed as exc:
+            return exc.envelope
+        finally:
+            ctx.args = saved
+
+    drive = Drive(c, step, plan.extra["team"], doc["run_id"], dispatch=dispatch, clock=ctx.clock,
+                  max_cost_usd=doc["max_cost_usd"], max_hours=doc["max_hours"], progress=ctx.progress,
+                  reports_dir=os.path.join(ctx.cfg.state_dir, "reports"), gate_runner=shell_gate_runner(supervisor))
+    res = drive.go()
+    res["operation"] = "drive"
+    return res
+
+
 class Spec:
     def __init__(self, plan, execute, authorize=None, lease=False):
         self.plan = plan
@@ -614,8 +895,11 @@ GATED = {
     "dispatch": Spec(plan_dispatch, execute_dispatch, lease=True),
     "verify": Spec(plan_verify, execute_verify),
     "review": Spec(plan_review, execute_review, lease=True),
+    "team-review": Spec(plan_team_review, execute_team_review, lease=True),
+    "drive": Spec(plan_drive, execute_drive, lease=True),
     "merge": Spec(plan_merge, execute_merge, authorize=authorize_merge, lease=True),
     "cleanup": Spec(plan_cleanup, execute_cleanup, authorize=authorize_cleanup),
+    "resume": Spec(plan_resume, execute_resume, lease=True),
     "approvals.approve": Spec(plan_decision, execute_decision),
     "approvals.reject": Spec(plan_decision, execute_decision),
 }

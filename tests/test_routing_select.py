@@ -146,6 +146,21 @@ class SelectRunnerTests(unittest.TestCase):
         self.assertTrue(coord.ok)
         self.assertEqual(coord.model, "haiku")
 
+    def test_single_provider_team_authors_tier0_with_its_economical_model(self):
+        """Live finding (rm-m0f, 2026-10-23): a Claude-only repository (review_independence persona,
+        cli_models naming haiku for economical) had no tier 0 author, so the low-risk units M0-17 and
+        M0-18 stopped the drive with no_progress."""
+        policy = copy.deepcopy(POLICY)
+        policy.update(allowed_providers=["claude"], author_providers=["claude"], review_independence="persona")
+        policy["cli_models"]["claude"] = {"economical": "haiku", "standard": "sonnet", "advanced": "opus"}
+        for role in ("author", "review"):
+            with self.subTest(role=role):
+                result = select_runner(0, ["claude"], CATALOG, policy, role=role, now=NOW)
+                self.assertTrue(result.ok, result.reasons)
+                self.assertEqual((result.runner, result.model), ("claude", "haiku"))
+        del policy["cli_models"]["claude"]["economical"]
+        self.assertFalse(select_runner(0, ["claude"], CATALOG, policy, now=NOW).ok)
+
     def test_stale_catalog_excludes_api_runners(self):
         result = sel(0, now=NOW + 10 * 86400)
         self.assertEqual(result.runner, "codex")

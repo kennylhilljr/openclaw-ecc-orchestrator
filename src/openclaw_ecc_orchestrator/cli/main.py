@@ -24,7 +24,8 @@ from ..runs.plan_lint import lint_plan
 from ..runs.store import iso
 from ..worktrees.git import git_out, run_git, toplevel
 from ..worktrees.manager import validate_root
-from . import output
+from ..plugin.inbox import probe_processor_lock, processor_lock_path
+from . import inbox_processor, output
 from .commands import GATED, branch_tip, load_run
 from .config import UsageError, checked_path, forbidden_location, load_config, valid_handle, valid_id
 from .reviews import ReviewStore
@@ -79,6 +80,21 @@ def _nonneg_float(value):
     return number
 
 
+def _positive_int(value):
+    number = _nonneg_int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be one or more")
+    return number
+
+
+def _interval(value):
+    number = _nonneg_float(value)
+    if not inbox_processor.MIN_INTERVAL <= number <= inbox_processor.MAX_INTERVAL:
+        raise argparse.ArgumentTypeError(
+            f"must be between {inbox_processor.MIN_INTERVAL:g} and {inbox_processor.MAX_INTERVAL:g} seconds")
+    return number
+
+
 def _common(parser):
     g = parser.add_argument_group("configuration")
     g.add_argument("--config", help="JSON config file (paths inside resolve relative to it)")
@@ -119,10 +135,19 @@ def build_parser():
     p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
     p.add_argument("--allow-lint-findings", dest="allow_lint_findings", action="store_true",
                    help="create the run despite plan-lint findings (the reviewed plan records the override)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace the plan of the existing run --run-id, keeping the id; refused once any unit "
+                        "has been dispatched")
     _common(p), _mutating(p)
 
     p = sub.add_parser("lint-plan", help="lint a plan against the pinned target tree without changing state")
     p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
+    _common(p)
+
+    p = sub.add_parser("plan-check", help="the architect's milestone-start plan check on a plan file, without a "
+                                          "run; cached by plan sha")
+    p.add_argument("--plan", required=True, help="plan JSON: {\"units\": [...]} or a list of work units")
+    p.add_argument("--refresh", action="store_true", help="check again even when this plan has a cached result")
     _common(p)
 
     p = sub.add_parser("status", help="runs, units, budgets, pending approvals, required user actions")
@@ -154,8 +179,30 @@ def build_parser():
     p.add_argument("--notes", default="")
     _common(p), _mutating(p)
 
+    p = sub.add_parser("team-review", help="run the agent team on a unit in reviewing: reviewers, QA verifier, "
+                                           "then the merge (agents approve it when team.json says so)")
+    _unit(p)
+    _common(p), _mutating(p)
+
+    p = sub.add_parser("drive", help="deliver a milestone with the agent team: plan check, dispatch, repair, "
+                                     "review, verify and merge every unit, then the milestone review")
+    p.add_argument("--run-id", dest="run_id", type=_id, required=True)
+    p.add_argument("--max-cost-usd", dest="max_cost_usd", type=_nonneg_float,
+                   help="stop when the drive has spent this much (default: the policy's max_cost_usd_total)")
+    p.add_argument("--max-hours", dest="max_hours", type=_nonneg_float, help="stop after this many hours")
+    p.add_argument("--runner-command-json", dest="runner_command_json",
+                   help="TEST ONLY: JSON argv replacing every coder command; needs --allow-test-runner")
+    p.add_argument("--allow-test-runner", dest="allow_test_runner", action="store_true")
+    _common(p), _mutating(p)
+
     p = sub.add_parser("merge", help="enqueue and merge a reviewed unit (destructive)")
     _unit(p)
+    _common(p), _mutating(p)
+
+    p = sub.add_parser("resume", help="send a stopped unit back to ready, keeping its worktree and findings")
+    _unit(p)
+    p.add_argument("--extra-attempts", dest="extra_attempts", type=int, default=0,
+                   help="owner grant of 1 to 3 more attempts for this unit (recorded on the unit)")
     _common(p), _mutating(p)
 
     p = sub.add_parser("cleanup", help="remove a stopped unit's worktree and branch")
@@ -177,6 +224,14 @@ def build_parser():
         q.add_argument("--operator", type=_handle, required=True, help="your operator handle (never inferred)")
         q.add_argument("--session", type=_handle, required=True, help="your session id (must match the request)")
         _common(q), _mutating(q)
+    q = asub.add_parser("process-inbox", help="validate and apply the decision files waiting in the inbox")
+    q.add_argument("--watch", action="store_true", help="keep processing until SIGTERM or SIGINT")
+    q.add_argument("--interval", type=_interval,
+                   help="with --watch: poll interval in seconds, 0.5 to 60 (default 2)")
+    q.add_argument("--max-passes", dest="max_passes", type=_positive_int,
+                   help="with --watch: stop after N passes over the inbox")
+    q.add_argument("--dry-run", action="store_true", help="list pending files and what would happen; change nothing")
+    _common(q)
 
     p = sub.add_parser("events", help="read the OpenClaw event log")
     esub = p.add_subparsers(dest="events_command", required=True, metavar="<action>")
@@ -190,6 +245,22 @@ def build_parser():
     _common(q)
 
     p = sub.add_parser("doctor", help="local self checks")
+    _common(p)
+
+    p = sub.add_parser("catalog-refresh", help="fetch the live model catalogs of the API providers (Gemini, Groq, "
+                                               "Kimi) into a snapshot; run through bin/with-keychain-secrets")
+    p.add_argument("--out", help="snapshot path (default: the configured catalog, else <state_dir>/catalog-latest.json)")
+    p.add_argument("--providers", default="gemini,groq,kimi", help="comma separated providers")
+    _common(p)
+
+    p = sub.add_parser("preflight", help="round trip through every certified coding runner (write, commit, "
+                                         "handoff, gates) in a throwaway worktree")
+    p.add_argument("--runner", type=_id, help="check only this runner")
+    p.add_argument("--keep", action="store_true", help="keep the throwaway worktree and branch for inspection")
+    p.add_argument("--timeout", type=_positive_int, default=600, help="seconds per runner (default 600)")
+    p.add_argument("--runner-command-json", dest="runner_command_json",
+                   help="TEST ONLY: JSON argv template ({ECC_PROMPT} is the prompt); needs --allow-test-runner")
+    p.add_argument("--allow-test-runner", dest="allow_test_runner", action="store_true")
     _common(p)
 
     p = sub.add_parser("review-plan", help="print a plan and its hash; --approve writes a review record")
@@ -439,10 +510,21 @@ def _unit_view(run, uid):
                    "maximum_cost_usd": budget.get("maximum_cost_usd")},
         "used": {"minutes": round(float(unit.get("minutes_used") or 0.0), 4),
                  "cost_usd": round(float(unit.get("cost_usd") or 0.0), 6)},
+        "health": _health_view(annotations.get("health")),
         "verified_head": (annotations.get("verification") or {}).get("head"),
         "approval_request_id": (annotations.get("review") or {}).get("approval_request_id"),
         "depends_on": unit.get("depends_on") or [],
+        "last_failure": ({k: (annotations.get("last_failure") or {}).get(k) for k in ("reason", "attempt", "fix")}
+                         if annotations.get("last_failure") else None),
     }
+
+
+def _health_view(health):
+    """Last recorded runner health state (changes only; see process.health)."""
+    if not isinstance(health, dict):
+        return None
+    return {k: health.get(k) for k in ("state", "attempt", "flat_checks", "flat_checks_for_hang",
+                                       "interval_seconds", "checked_at")}
 
 
 def _approval_view(req):
@@ -487,8 +569,9 @@ def cmd_status(ctx):
     for u in units:
         cost = f"{u['used']['cost_usd']:.2f}/{u['budget']['maximum_cost_usd']}"
         minutes = f"{u['used']['minutes']:.1f}/{u['budget']['minutes']}"
+        health = f" health {u['health']['state']}" if u["health"] and u["state"] == "running" else ""
         lines.append(f"{u['unit_id']:<16} {u['state']:<17} tier {u['tier'] if u['tier'] is not None else '-'} "
-                     f"runner {u['runner'] or '-'} attempts {u['attempts']} cost {cost} minutes {minutes}")
+                     f"runner {u['runner'] or '-'} attempts {u['attempts']} cost {cost} minutes {minutes}{health}")
     for p in data["pending_approvals"]:
         lines.append(f"pending approval {p['request_id']} {p['action']} {p['unit_id']}")
     env["_summary"] = lines
@@ -549,6 +632,28 @@ def cmd_events_tail(ctx):
     except KeyboardInterrupt:
         pass
     return None
+
+
+def cmd_catalog_refresh(ctx):
+    """Write a live catalog snapshot the router and the team panels read
+    (API runners resolve models only from a snapshot). Keys come from the
+    environment and only travel in request headers."""
+    from ..runners import discovery
+    op = "catalog-refresh"
+    a = ctx.args
+    out = a.out or ctx.cfg.catalog or os.path.join(ctx.cfg.state_dir, "catalog-latest.json")
+    providers = [p.strip() for p in (a.providers or "").split(",") if p.strip()]
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    snapshot = discovery.fetch_catalog(providers, env=ctx.env)
+    discovery.save_snapshot(snapshot, out)
+    checks = []
+    for name in providers:
+        entry = snapshot["providers"].get(name) or {}
+        n = len(entry.get("models") or [])
+        checks.append(check(f"catalog_{name}", entry.get("status") == "ok", f"{entry.get('status')}: {n} models"))
+    return envelope(op, ok=all(c["ok"] for c in checks), changed=True, checks=checks,
+                    data={"path": out, "providers": {k: {"status": v.get("status"), "models": len(v.get("models") or [])}
+                                                      for k, v in snapshot["providers"].items()}})
 
 
 def _git_version():
@@ -627,8 +732,16 @@ def cmd_doctor(ctx):
         except CommandFailed as exc:
             checks.append(check("certifications_loaded", False,
                                 "; ".join(c["detail"] for c in exc.envelope["checks"] if not c["ok"])))
+    lock = probe_processor_lock(processor_lock_path(cfg.state_dir, cfg.decision_inbox))
+    if lock["held"]:
+        lock_detail = f"running: pid {lock['pid']} holds {lock['path']}"
+    elif lock["held"] is None:
+        lock_detail = f"unknown: cannot probe {lock['path']} ({lock.get('error')})"
+    else:
+        lock_detail = f"not running: no processor holds {lock['path']}"
+    checks.append(check("inbox_processor", True, lock_detail))  # informational
     data = {"config": dict(cfg.public(), policy_file=ctx.rt.policy_path()), "python": ".".join(map(str, py)),
-            "git": text}
+            "git": text, "inbox_processor": lock}
     env = envelope("doctor", ok=all(c["ok"] for c in checks), checks=checks, data=data)
     env["_summary"] = [f"[{'pass' if c['ok'] else 'FAIL'}] {c['name']}: {c['detail']}" for c in checks]
     return env
@@ -655,6 +768,53 @@ def cmd_lint_plan(ctx):
                 policy_file=policy_path)
     env = envelope(op, ok=result["ok"], checks=[check("plan_lint", result["ok"], detail)], data=data)
     env["_summary"] = [detail]
+    return env
+
+
+def cmd_plan_check(ctx):
+    """The architect's milestone-start check on a plan file, before any run
+    exists (issue #8). An unchanged plan answers from the cache; findings fail
+    the command so the plan can be fixed and checked again in a loop."""
+    from ..process.supervisor import Supervisor
+    from ..runs.dag import PlanError, normalize_units, plan_sha256
+    from ..team import config as TC
+    from ..team import plan_check as PC
+    from ..team.review import TeamStep
+    op = "plan-check"
+    path = checked_path(ctx.args.plan, "plan", ctx.cwd)
+    _, plan = read_document(path, "plan", op)
+    try:
+        units = normalize_units(plan)
+        digest = plan_sha256(units)
+    except PlanError as exc:
+        return envelope(op, ok=False, checks=[check("plan_valid", False, str(exc))])
+    repo = ctx.rt.repo_top(op)
+    head = branch_tip(repo, ctx.cfg.target_branch)
+    if head is None:
+        detail = f"target branch {ctx.cfg.target_branch!r} does not exist"
+        return envelope(op, ok=False, checks=[check("target_branch_exists", False, detail)])
+    try:
+        team = TC.load(ctx.rt.team(op))
+    except TC.TeamConfigError as exc:
+        return envelope(op, ok=False, checks=[check("team_config_valid", False, str(exc))])
+    policy, _ = ctx.rt.load_policy(op)
+    step = TeamStep(ctx.rt.conductor(policy, op), team, state_dir=ctx.cfg.state_dir,
+                    worktree_root=ctx.cfg.worktree_root, logs_dir=ctx.cfg.logs_dir,
+                    supervisor=Supervisor(clock=ctx.clock), clock=ctx.clock)
+    res, hit = PC.run_check(step, repo, units, digest, head, refresh=bool(ctx.args.refresh))
+    findings = res.get("findings") or []
+    ok = PC.passed(res)
+    if res.get("verdict") is None:
+        detail = f"no architect produced a verdict: {res.get('problem') or res.get('skipped')}"
+    else:
+        detail = (f"{res['verdict']} with {len(findings)} finding{'s' if len(findings) != 1 else ''}"
+                  f"{' (cached)' if hit else ''}; plan {digest[:12]}")
+    data = {"plan_file": path, "plan_sha256": digest, "target_commit": head, "cached": hit,
+            "verdict": res.get("verdict"), "findings": findings, "provider": res.get("provider"),
+            "cost_usd": 0.0 if hit else res.get("cost_usd"), "cache_file": PC.cache_path(ctx.cfg.state_dir, digest)}
+    env = envelope(op, ok=ok, checks=[check("plan_check", ok, detail)], data=data)
+    env["_summary"] = [detail] + [f"{f.get('severity')}: {f.get('where') or '-'}: {f.get('what')}"
+                                  for f in findings if isinstance(f, dict)]
     return env
 
 
@@ -773,10 +933,20 @@ def main(argv=None, *, stdin=None, stdout=None, stderr=None, env=None, is_tty=No
                 result = cmd_status(ctx)
             elif op == "approvals.list":
                 result = cmd_approvals_list(ctx)
+            elif op == "approvals.process-inbox":
+                inbox_processor.validate_args(args)
+                result = inbox_processor.cmd_process_inbox(ctx)
             elif op == "events.tail":
                 result = cmd_events_tail(ctx)
+            elif op == "catalog-refresh":
+                result = cmd_catalog_refresh(ctx)
+            elif op == "preflight":
+                from .preflight import cmd_preflight
+                result = cmd_preflight(ctx)
             elif op == "lint-plan":
                 result = cmd_lint_plan(ctx)
+            elif op == "plan-check":
+                result = cmd_plan_check(ctx)
             else:  # pragma: no cover - argparse restricts the choices
                 raise UsageError(f"unknown subcommand {op}")
     except UsageError as exc:

@@ -26,17 +26,24 @@ option of any subcommand lists them in full.
 | :- | :- | :- |
 | `create-run` | gated | validate a plan (`plan`, `run-id`) and create a run pinned to the target branch tip |
 | `lint-plan` | read only | lint a plan against the pinned target tree and print stable findings and their digest |
-| `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, pending approvals and `required_user_actions` |
+| `plan-check` | read only, paid | run the architect's milestone-start plan check on a plan file without creating a run; the verdict is cached by plan sha in `<state_dir>/plan-checks/`, findings exit 1, and `drive` skips its own check when the run's plan already passed |
+| `status` | read only | runs, or one run's units with state, tier, runner, attempts, budget use, last runner health, pending approvals and `required_user_actions` |
 | `dispatch` | gated | route, assign, create the worktree, run the runner, validate the handoff and verify; the unit ends in `reviewing` on success |
 | `verify` | gated | re-run the gates in the unit worktree and check head, cleanliness and scope; changes no run state |
 | `review` | gated | record an independent review; an approving review requests a merge approval bound to the verified head |
+| `drive` | gated | deliver a milestone with the agent team (TEAM-DELIVERY-v2): the architect checks the plan first; then until every unit is merged it dispatches ready units (failed ones come back through the repair loop), runs `team-review` on units in review and processes the merge queue; at the end the architect's drift check, the delivery lead's retrospective and a pair of product owners from different providers decide; the product report goes to `<state_dir>/reports/`. It stops only when a unit needs the owner (with the delivery lead's diagnosis), when no step makes progress, at `max-cost-usd` (default the policy's total budget) or `max-hours`, or on a product rejection; run it again to continue |
+| `team-review` | gated | run the agent team on a unit in `reviewing` (TEAM-DELIVERY-v2): the PR reviewer, plus the security reviewer, architect or designer when the diff calls for them, then the QA verifier in a throwaway checkout; each role rotates across the certified providers. Changes requested or a failed verification return the unit to the coder (`ready`); with `merge_approval` `agents` in `.orchestration/team.json` the agents approve the merge and the queue merges it after re-running the gates; with `human` the approval waits for the owner as before. A top-level `personas` map in `team.json` (role to name, for example `{"pr_reviewer": "verifier", "coder": "implementer"}`) puts the repository's persona file `.claude/agents/<name>.md` (read from the main repository, front matter removed) at the head of that role's prompt; `coder` and `steward` are accepted besides the team roles, and `drive`, `team-review` and dispatch fail when an assigned persona file is missing |
 | `merge` | gated, destructive | enqueue the reviewed unit (consuming its merge approval) and process the queue until it is merged |
 | `cleanup` | gated, destructive when it archives unique work | remove a stopped unit's worktree and branch |
+| `resume` | gated | send a unit in `needs_user` or `failed` back to `ready`, keeping its worktree, attempt history and last failure |
 | `approvals list` | read only | pending approval requests |
 | `approvals approve` | gated | approve a request through the decision inbox |
 | `approvals reject` | gated | reject a request through the decision inbox |
+| `approvals process-inbox` | consumer | validate and apply the decision files OpenClaw wrote into the inbox, once or as a standing processor (`watch`); `dry-run` changes nothing |
 | `events tail` | read only | print the event log; `since-seq`, `run-id`, `limit`, `follow` with `interval` and `max-polls` |
 | `doctor` | read only | local self checks |
+| `catalog-refresh` | writes the catalog snapshot | fetch the live model catalogs of the API providers (`providers`, default Gemini, Groq and Kimi) into the configured `catalog` file (or `out`); run it through `bin/with-keychain-secrets` so the keys come from the Keychain |
+| `preflight` | throwaway worktrees only | round trip through every certified coding runner: the real unit prompt, command line, environment and permissions must write a file, commit, run the gate commands (the uv version and a short git status), and write a schema valid handoff to the real handoff path; the orchestrator then runs a gate command; worktrees and branches are removed (`keep` keeps them); `runner` checks one |
 | `review-plan` | writes review records only | print a plan and its hash; with `approve` write a review record |
 
 Gated subcommands are the mutating ones. Each accepts `dry-run`, `json`,
@@ -63,14 +70,15 @@ Without `json` a concise human summary is printed: a status line,
 operation specific lines, failed checks, warnings, required user actions and
 the rollback checkpoint. `verbose` adds every check and the data, and streams
 runner output lines to stderr during `dispatch`. `events tail` with `follow`
-and `json` prints one event per line instead of an envelope.
+and `json` prints one event per line instead of an envelope, and so does
+`approvals process-inbox` with `watch` (one envelope per line, see below).
 
 | Exit code | Meaning |
 | :- | :- |
 | 0 | ok |
 | 1 | the operation failed (a check failed, a plan changed, the operator declined) |
 | 2 | usage error: bad options, invalid identifiers, path traversal, a bad config file, `yes` without `review-id` |
-| 3 | an approval or another user action is required; `required_user_actions` says which |
+| 3 | an approval or another user action is required; `required_user_actions` says which. `approvals process-inbox` also exits 3 when another processor already holds the inbox lock |
 
 A read only command that succeeds exits 0 even when it reports required user
 actions (for example `status` listing a pending approval).
@@ -103,7 +111,8 @@ file's directory; paths given as options relative to the working directory.
 | `catalog` | | none (API runners then cannot resolve a model) |
 | `repo_checks` | | none: `{"required": [...], "commands": {"name": "command"}}` |
 | `conductor_id` | | `ecc-cli` |
-| `lease_ttl`, `runner_timeout`, `gate_timeout` | | 300, 3600, 600 seconds |
+| `lease_ttl` | | 300 seconds |
+| `runner_timeout`, `gate_timeout` | | none: no wall clock limit. Optional hard ceilings in seconds; discouraged, because health monitoring (`health` in the repository policy) already stops hung processes and a ceiling kills work that is still progressing |
 | `approval_ttl`, `review_ttl` | | 3600 seconds each (merge or cleanup approvals; review records) |
 | `tier_costs` | | none: `{"0": 0.05, "1": 0.5, "2": 2.0}` for the escalation controller |
 
@@ -136,7 +145,10 @@ cannot drop a policy check; a required check without a configured command
 fails the gates.
 
 **Certifications.** `certifications` names a JSON list (or
-`{"records": [...]}`) of runner certification records. Only valid,
+`{"records": [...]}`) of runner certification records, or a certification
+run summary (`{"results": [{"record": ...}]}`, as written by
+`runners.certify` (its out option) and copied to `cert-latest.json` by
+`bin/recertify-weekly`). Only valid,
 unexpired, `certified` records for known runners survive
 (`runners.registry.certified_runners`).
 
@@ -247,12 +259,112 @@ with `request_pending`), not expired, and run, unit, action, plan hash and
 session equal to the request (a different session fails with
 `binding_matches`, is audited and does not consume the request). The head
 sha is bound by the runtime when the request is created and checked when the
-approval is used. Other decision files waiting in the inbox are processed in
+approval is used; a decision that names a different `head_sha` is refused
+(`head_sha_matches`). Other decision files waiting in the inbox are processed in
 the same pass and reported as a warning. `approval.resolved` is emitted with
 `decided_by`.
 
+## Standing inbox processor
+
+`approvals process-inbox` is the runtime's consumer of the decision inbox.
+The OpenClaw plugin writes one decision file per approval into the inbox
+(`decision_inbox`); this subcommand validates and applies them. It decides
+nothing and never approves on its own: every file goes through
+`DecisionInbox` and `ApprovalBroker.resolve`, the same path as `approvals
+approve` and `approvals reject`. All broker checks apply: known request,
+still pending (single use), not expired, run, unit, action, plan hash and
+session equal to the request, a `head_sha` (when the decision names one)
+equal to the head bound to the request, a valid `decision` and a non blank
+`decided_by`. There is no `operator` option: the identity is the decision
+file's `decided_by`, written by OpenClaw, and a file without it is refused.
+A refused decision is audited and does not consume the request. Each
+applied decision emits `approval.resolved`, emitted by the broker exactly as
+for `approvals approve`.
+
+| Mode | Options | Behavior |
+| :- | :- | :- |
+| once | (none) | process every pending file once, print one envelope, exit |
+| watch | `watch`, `interval <seconds>` (0.5 to 60, default 2), `max-passes <n>` | poll the inbox every interval until SIGTERM or SIGINT (or after `max-passes` passes); the file in progress is finished before exiting 0 |
+| dry run | `dry-run` | list the pending files and what would happen to each (`would`: `apply` or `refuse`, with the failed checks); takes no lock and changes nothing |
+
+`interval` and `max-passes` without `watch`, and `dry-run` together with
+`watch`, are usage errors (exit 2).
+
+**Output.** Once and dry run print the standard envelope; `data` holds
+`files` (one summary per file: `file`, `ok`, `outcome` or `would`,
+`request_id`, `decision`, `decided_by`, `failed`), the counts `applied`,
+`refused` and `errors`, the `inbox` and the lock. With `watch` and `json`
+the processor prints one envelope per line: `data.event` is `started`,
+`file` (one per processed file), `error` or `stopped` (with the reason, for
+example `SIGTERM`, and the totals). Without `json` it prints one concise
+line per event. Everything printed passes through the redaction engine, so
+a secret planted in a decision file is never echoed.
+
+**Exit codes.** 0 when the pass completed (refused decisions are reported,
+they are not a processor failure) and after a clean stop in watch mode; 1
+when processing a file raised an error in once mode; 2 for usage errors; 3
+when another processor holds the lock.
+
+**One processor per inbox.** The processor holds an advisory `flock` on
+`<state_dir>/inbox-processor-<digest>.lock` (the digest is derived from the
+inbox's real path; the lock is never inside the inbox) for as long as it
+runs. A second processor for the same inbox exits 3 at once with
+`processor_lock_acquired` failed and an `inbox_processor_running` action
+naming the holder's pid; in watch mode it exits immediately too. `doctor`
+reports whether the lock is held (`inbox_processor`), without creating
+anything. `approvals approve` and `approvals reject` may run while the
+processor does: each file is claimed with its own `flock` while it is
+processed, so exactly one consumer handles it, and the command reads the
+recorded result when the processor took its file first.
+
+**Crash safety and robustness.** A file moves into `processed/` only after
+the broker has persisted its state and the `<name>.result.json` envelope is
+written. After a crash between the broker resolve and the move, the next
+pass resolves the file again; the broker refuses it as already resolved
+(`request_pending`), that refusal is recorded and the file moves, so a
+decision is never applied twice. Malformed JSON, files over 64 KiB, non
+objects and symlinks are refused into `processed/` with a reason; files that
+vanish or appear mid scan are skipped or picked up by the next pass. An
+exception while processing one file is reported (redacted) and the loop
+continues; in watch mode a file that fails 3 times is set aside into
+`processed/` with `processing_error`, without being resolved.
+
+**Running it as a standing service.** The standing processor is
+`approvals process-inbox` with `watch`, `interval 2` and `json`, plus
+`state-dir` and `decision-inbox` (or a `config` file) naming the same
+directories the plugin uses. With the defaults these are
+`$HOME/.local/state/openclaw-ecc-orchestrator` (or the XDG state home) and
+its `decisions` subdirectory; the options may be omitted when the defaults
+apply, but the processor must consume the directory the plugin's `inbox`
+names. On macOS it typically runs as a launchd agent; the agent's plist
+lives in `integrations/launchd/`.
+
 ## Subcommand notes
 
+* **Repair loop** (TEAM-DELIVERY-v2 section 5). A failed attempt records
+  `last_failure` (reason, evidence the orchestrator saw: gate output tails,
+  handoff errors, files, the runner's final message) and, when the unit's
+  escalation controller allows another attempt, returns the unit to `ready`
+  with reason `retry:<reason>`. The next `dispatch` reuses the worktree and
+  branch, so earlier commits stay, and appends a failure brief (at most 6,000
+  characters) to the prompt. A runner that exits cleanly with a missing or
+  malformed handoff first gets one handoff only repair turn (not an attempt;
+  `handoff_repair_turns` in `.orchestration/team.json`, default 1); a handoff
+  whose problem is the work itself (claimed success with a failing command,
+  files outside the scope) never gets one. A runner that is not signed in,
+  missing or older than certified, or denied a tool goes to `needs_user`
+  with the exact fix and does not charge the budget. `status` shows each
+  unit's `last_failure`.
+* **Team roles on API providers.** Gemini, Kimi and Groq personas read
+  their keys from the environment (`GEMINI_API_KEY`, `MOONSHOT_API_KEY`,
+  `GROQ_API_KEY`); run `team-review` through `bin/with-keychain-secrets` so
+  the keys come from the Keychain. The repository policy needs
+  `model_preferences` for those providers and the catalog for model ids. The
+  per turn cost cap applies only to per token prices from the catalog;
+  configured `runner_costs` for the subscription CLIs are routing weights.
+  Rotation state and per role turn counts live in
+  `<state_dir>/team/<run_id>.json`; each unit's verdicts are in its `team`
+  annotation.
 * `lint-plan plan <file>` is read only. It checks DAG relationships,
   unordered overlapping scopes, acceptance paths against the pinned target
   tree, configured generated-file couplings, transitive capability
@@ -265,6 +377,18 @@ the same pass and reported as a warning. `approval.resolved` is emitted with
   findings. `allow-lint-findings` is an explicit override: its boolean,
   finding count and digest, plus applied exemptions, are included in the
   command plan reviewed by `review-plan` and persisted in run metadata.
+  The run also records the plan file's path and sha256. `replace` swaps the
+  plan of the existing run `run-id` and keeps the id, as long as no unit has
+  left `pending` or `ready`; once one has, create a new run instead. The
+  replaced plan's sha is kept in `metadata.replaced`.
+* `plan-check plan <file>` runs the check `drive` runs at milestone start (the architect, rotating
+  across certified providers) against the target branch tip, with a prompt that asks for one
+  exhaustive pass over named categories: missing scope, missing `depends_on`, symbols or tables
+  used before any unit creates them, composition wiring nobody owns, shared harness or CI steps a
+  unit cannot change, and plan text that contradicts an approved design. The result is cached by
+  plan sha, so checking an unchanged plan again costs nothing; `refresh` asks again. Fix, check,
+  repeat, then `create-run`; a clean cached result for the run's plan sha replaces the drive's
+  own paid check.
 * `dispatch` works on a `ready` unit whose scope does not overlap an active
   unit. The plan predicts the routing the conductor will choose (classify,
   the escalation controller rebuilt from the persisted record,
@@ -295,15 +419,60 @@ the same pass and reported as a warning. `approval.resolved` is emitted with
   when enqueued) and reports them in `processed_before`. Nothing is pushed.
   The rollback checkpoint carries the previous target commit and the
   `update-ref` command that restores it.
+* `resume` replays the unit's attempts through the escalation controller under the
+  current policy and refuses when no attempt is left; the next dispatch then
+  repairs with the last failure (for example a reviewer's findings) in its brief.
+  A unit whose code passed but whose team review stalled goes back to `reviewing`.
+  With the extra attempts option (1 to 3) the owner grants more attempts: they are
+  recorded on the unit as `budget_grant`, held in reserve and spent where the unit
+  would otherwise stop. The plan and its hash stay as approved.
+* `drive` heals before it stops (TEAM-DELIVERY v5 7.1): it sets aside a unit it cannot act on and continues
+  with the rest, and the delivery lead grants bounded extra attempts, restarts a stalled review or retries a
+  merge conflict on its own. Every stop prints the exact commands to run as `next:` lines, ending with
+  the command that continues the drive. Before each later attempt the unit's branch receives the target's
+  current tip (TEAM-DELIVERY v5 4.4).
+* `drive` refuses a run whose plan file changed after `create-run` (same units in a new layout is not a
+  change), before the architect's plan check. The stop names the file's plan sha and the next command:
+  `create-run` with `replace` and the same run id while nothing was dispatched, otherwise a new run.
+* `drive` runs the delivery lead's close step before the milestone review when `.orchestration/team.json`
+  has a `milestone.close` block. Every check reads the target branch, so the drift check, the gates and
+  the product owners start only from a target that holds the close step's commits:
+  * `commands`: run in a detached checkout of the target (the plan-status generator that sets merged rows
+    to done, trace-check with every merged unit due). `{units}` (merged unit ids, comma separated) and
+    `{milestone}` are filled in. A non-zero exit stops with `close_command_failed`; a command that
+    changes files stops with `close_changes_pending` until those changes are committed to the target.
+  * `plan` and `test_plan`: the test plan must name the plan's file (for example `M1-plan-v6`), else
+    `test_plan_stale`.
+  * `handoff` (default `docs/build/{milestone}-handoff-v1.md`) must be on the target. When it is missing
+    the drive drafts it under `<state_dir>/reports/` from `handoff_template` (read from the target) with
+    the close evidence and stops with `handoff_missing`.
+  * `owner_checks`: a list of `{"id", "title", "steps"}`. Each needs a line in the handoff on the target
+    that names its id and a result (Passed or Failed); otherwise the drive stops with
+    `owner_checks_pending` and prints every pending check's steps, instead of a product rejection.
+
+  ```json
+  {"milestone": {"name": "M1", "close": {
+    "commands": ["tools/milestone-close.sh {units}"],
+    "plan": "docs/build/M1-plan-v6.md", "test_plan": "docs/test/test-plan-v5.md",
+    "handoff_template": "docs/sdd/templates/handoff.md",
+    "owner_checks": [{"id": "OC-01", "title": "install and doctor", "steps": ["research-mcp install", "research-mcp doctor"]}]}}}
+  ```
 * `cleanup` refuses units that still occupy a checkout (`assigned` through
   `queued_for_merge`). `archive` bundles unique work first and the rollback
   checkpoint names the bundle and the restore command.
-* `status` without `run-id` lists runs with unit state counts.
+* `status` without `run-id` lists runs with unit state counts. With
+  `run-id`, each unit carries `health`: the runner's last recorded health
+  state (`healthy`, `suspected_hang` or `hung`, with the attempt, flat check
+  streak, threshold, interval and check time), or null before any change was
+  recorded. The human summary adds `health <state>` to running units.
 * `doctor` checks the Python version (at least 3.11), git (at least 2.38,
   needed for merge-tree in write-tree mode), the repository, the state dir
   location and writability (without creating it), the worktree root, the
   policy file and the certification records. Bad locations are reported as
-  failed checks (exit 1) instead of usage errors.
+  failed checks (exit 1) instead of usage errors. The informational
+  `inbox_processor` check (always passing) says whether a standing
+  `approvals process-inbox` holds the inbox lock, with its pid; `data`
+  carries the same as `inbox_processor`. The probe creates no file.
 
 ## Backups
 
@@ -347,10 +516,14 @@ holding an unexpired lease blocks the CLI (exit 1, `lease_held`).
 
 ## Limitations
 
-* No `resume`, `retry` or `reassign` subcommand yet: a unit left `running`
-  by a crashed `dispatch`, or a `failed` unit, needs the Python API
-  (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
-* `dispatch` blocks until the runner exits and verification finishes.
+* No `resume` or `reassign` subcommand yet: a unit left `running` by a
+  crashed `dispatch`, or a unit in `needs_user` after its fix, needs the
+  Python API (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
+  Failed units within budget return to `ready` on their own (repair loop).
+* `dispatch` blocks until the runner exits and verification finishes. There
+  is no wall clock limit; a runner is cancelled only when health checks find
+  it hung (see [runtime.md](runtime.md#health-monitoring-instead-of-wall-clock-kills)).
+  `unit.completed` in the event log marks the runner's exit.
 * Review records are files in the state dir; anyone who can write there can
   forge one. They guard against accidental execution of an unreviewed plan,
   not against a local attacker, and they never admit destructive plans.

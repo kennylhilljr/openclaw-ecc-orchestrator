@@ -30,6 +30,8 @@ PY = sys.executable
 #   forged SPEC...         commit files, handoff claims success with a failing command
 #   nohandoff SPEC...      commit files, write no handoff
 #   claim=PATHS SPEC...    commit files, handoff lists PATHS (comma separated) as changed
+#   slow:N SPEC...        print progress for N seconds, then behave like write
+#   blocked                write a handoff with status blocked, commit nothing
 #   fail | block | sleep:N
 RUNNER = r'''
 import json, os, signal, subprocess, sys, time
@@ -45,6 +47,23 @@ if mode == "block":
         time.sleep(0.05)
 if mode.startswith("sleep:"):
     time.sleep(float(mode.split(":", 1)[1]))
+    sys.exit(0)
+if mode.startswith("slow:"):
+    # Long but active: prints progress for N seconds, then does the "write" work.
+    end = time.time() + float(mode.split(":", 1)[1])
+    while time.time() < end:
+        print("working", flush=True)
+        time.sleep(0.1)
+    mode = "write"
+if mode == "blocked":
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    with open(os.environ["ECC_HANDOFF_PATH"], "w") as fh:
+        json.dump({"schema_version": "1.0", "unit_id": os.environ["ECC_UNIT_ID"], "status": "blocked",
+                   "outcome": "a dependency file is missing", "files_changed": [], "behavior": "nothing yet",
+                   "commands": [], "unresolved_failures": ["needs a file another unit owns"],
+                   "assumptions": [], "risks": [], "next_action": "re-run after the dependency merges",
+                   "commit": {"sha": head, "branch": "unit", "worktree": "."}, "usage": None,
+                   "user_input_required": True}, fh)
     sys.exit(0)
 specs = sys.argv[2:]
 names = []
@@ -135,7 +154,8 @@ class IntegrationBase(unittest.TestCase):
                            os.path.join(self.tmp, "merge-scratch"),
                            gate_runner=lambda unit, path: holder["c"].gate(unit, path),
                            emitter=emitter, clock=self.clock, broker=broker, policy=self.policy,
-                           certified_runners=kw.get("certified_runners", self.CERTIFIED))
+                           certified_runners=kw.get("certified_runners", self.CERTIFIED),
+                           catalog=kw.get("catalog"))
         options = dict(policy=self.policy, certified_runners=self.CERTIFIED)
         options.update(kw)
         c = Conductor(cid, manager=manager, worktrees=worktrees, supervisor=supervisor, queue=queue, broker=broker,

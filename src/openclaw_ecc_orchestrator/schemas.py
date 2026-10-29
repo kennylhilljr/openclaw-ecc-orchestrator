@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .handoffs.redaction import contains_secret, redact_text, scan_strings
+from .process.health import health_block_errors
 from .tasks.scope import path_in_scope, unsafe_path_reason
 
 SCHEMA_VERSION = "1.0"
@@ -109,7 +110,7 @@ DOCUMENT_SPECS: dict[str, dict] = {
         "file": "work_unit.schema.json",
         "required": ["schema_version", "id", "title", "depends_on", "scope", "acceptance",
                      "risk", "capabilities", "routing", "budget", "rollback"],
-        "optional": ["traits", "description", "provides", "requires", "lint_exemptions"],
+        "optional": ["traits", "description", "health", "provides", "requires", "lint_exemptions"],
         "nested_required": {
             "scope": ["files"],
             "acceptance": ["commands"],
@@ -134,9 +135,9 @@ DOCUMENT_SPECS: dict[str, dict] = {
         "file": "repository_policy.schema.json",
         "required": ["schema_version", "high_risk_paths", "required_checks",
                      "protected_commands", "allowed_providers", "budget"],
-        "optional": ["model_preferences", "retired_model_ids", "cli_models", "runner_costs",
+        "optional": ["author_providers", "model_preferences", "retired_model_ids", "cli_models", "runner_costs",
                      "cost_estimation", "circuit_breaker", "openrouter",
-                     "catalog_max_age_seconds", "generated_file_couplings"],
+                     "catalog_max_age_seconds", "health", "review_independence", "generated_file_couplings"],
         "nested_required": {"budget": ["max_cost_usd_per_unit", "max_cost_usd_total",
                                        "max_minutes_per_unit"]},
         "enums": {"allowed_providers[]": list(KNOWN_PROVIDERS)},
@@ -358,6 +359,9 @@ def validate_work_unit(doc: Any) -> ValidationReport:
                     report.error("unknown trait: %s" % _show(trait))
     if "description" in doc and not isinstance(doc.get("description"), str):
         report.error("description must be a string")
+    if "health" in doc:
+        for message in health_block_errors(doc["health"]):
+            report.error(message)
     for name in ("provides", "requires"):
         if name in doc and _check_str_list(doc.get(name), name, report):
             if any(not value.strip() for value in doc[name]):
@@ -536,6 +540,15 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
             else:
                 allowed.append(norm)
 
+    if "review_independence" in doc and doc["review_independence"] not in ("provider", "persona"):
+        report.error("review_independence must be provider or persona")
+
+    authors = doc.get("author_providers")
+    if "author_providers" in doc and _check_str_list(authors, "author_providers", report, allow_empty=False):
+        for name in authors:
+            if name not in allowed:
+                report.error("author_providers contains %s, which allowed_providers does not allow" % _show(name))
+
     budget = _obj(doc, "budget", report)
     _require_keys(budget, "budget", DOCUMENT_SPECS["repository_policy"]["nested_required"]
                   ["budget"], report)
@@ -605,6 +618,10 @@ def validate_repository_policy(doc: Any) -> ValidationReport:
             cool = breaker.get("cooldown_seconds")
             if not (_is_num(cool) and cool >= 0):
                 report.error("circuit_breaker.cooldown_seconds must be a non-negative number")
+
+    if "health" in doc:
+        for message in health_block_errors(doc["health"]):
+            report.error(message)
 
     age = doc.get("catalog_max_age_seconds")
     if "catalog_max_age_seconds" in doc and not (_is_num(age) and age > 0):

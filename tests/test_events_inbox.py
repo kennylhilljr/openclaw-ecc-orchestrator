@@ -1,7 +1,9 @@
+import fcntl
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from openclaw_ecc_orchestrator.plugin.approvals import ApprovalBroker
 from openclaw_ecc_orchestrator.plugin.inbox import DecisionInbox
@@ -55,6 +57,47 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(results[0]["data"]["files"], ["001.json"])
         self.assertTrue(os.path.exists(os.path.join(self.inbox_dir, "001.json")))
         self.assertEqual(self.broker.get(self.decision["request_id"])["status"], "pending")
+
+    def test_file_claimed_by_another_consumer_is_skipped(self):
+        self.drop("001.json", self.decision)
+        fd = os.open(os.path.join(self.inbox_dir, "001.json"), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertEqual(self.inbox.process(), [])
+            self.assertIsNone(self.inbox.process_one("001.json", wait=0.2))
+            self.assertEqual(self.broker.get(self.decision["request_id"])["status"], "pending")
+        finally:
+            os.close(fd)
+        self.assertEqual([r["ok"] for r in self.inbox.process()], [True])
+
+    def test_file_vanishing_mid_scan_is_skipped(self):
+        self.drop("001.json", self.decision)
+        with mock.patch.object(DecisionInbox, "pending_files", return_value=["000-gone.json", "001.json"]):
+            results = self.inbox.process()
+        self.assertEqual([r["source_file"] for r in results], ["001.json"])
+        self.assertIsNone(self.inbox.process_one("000-gone.json"))
+        self.assertIsNone(self.inbox.preview_one("000-gone.json"))
+
+    def test_symlink_refused_into_processed(self):
+        target = os.path.join(self._tmp.name, "target.json")
+        with open(target, "w") as fh:
+            json.dump(self.decision, fh)
+        os.makedirs(self.inbox_dir, exist_ok=True)
+        os.symlink(target, os.path.join(self.inbox_dir, "001.json"))
+        results = self.inbox.process()
+        self.assertEqual([r["ok"] for r in results], [False])
+        self.assertTrue(os.path.islink(os.path.join(self.inbox_dir, "processed", "001.json")))
+        self.assertEqual(self.broker.get(self.decision["request_id"])["status"], "pending")
+
+    def test_preview_matches_resolution_and_writes_nothing(self):
+        self.drop("001.json", self.decision)
+        self.drop("002.json", dict(self.decision, session_id="other"))
+        before = open(self.broker.state_path).read()
+        previews = self.inbox.preview()
+        self.assertEqual([p["ok"] for p in previews], [True, False])
+        self.assertEqual(open(self.broker.state_path).read(), before)
+        self.assertEqual(sorted(os.listdir(self.inbox_dir)), ["001.json", "002.json"])
+        self.assertEqual([r["ok"] for r in self.inbox.process()], [True, False])
 
 
 if __name__ == "__main__":

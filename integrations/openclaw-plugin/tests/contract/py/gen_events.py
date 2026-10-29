@@ -55,6 +55,15 @@ def main():
     sink.emit("unit.state_changed", "run1", unit_id="alpha", data={"from": "ready", "to": "running", "owner": "codex"})
     fake_token = "gh" + "p_" + "Zq8Wv7Ut6Sr5Qp4On3Ml2Kj1Ih0Gf9"
     sink.emit("unit.progress", "run1", unit_id="alpha", data={"message": f"pushing with {fake_token}", "stream": "stdout"})
+    sink.emit("unit.health", "run1", unit_id="alpha",
+              data={"state": "suspected_hang", "previous": "healthy", "process": "runner", "flat_checks": 1,
+                    "flat_checks_for_hang": 5, "interval_seconds": 120.0})
+    sink.emit("unit.health", "run1", unit_id="alpha",
+              data={"state": "healthy", "previous": "suspected_hang", "process": "runner", "flat_checks": 0,
+                    "flat_checks_for_hang": 5, "interval_seconds": 120.0})
+    sink.emit("unit.completed", "run1", unit_id="alpha",
+              data={"exit_code": 0, "duration_seconds": 5400.0, "attempts": 1, "tier": 1, "runner": "codex",
+                    "hung": False, "cancelled": False})
     sink.emit("unit.state_changed", "run1", unit_id="alpha", data={"from": "running", "to": "reviewing"})
     sink.emit("attention.required", "run1", unit_id="beta",
               data={"reason": "out_of_scope_changes", "state": "blocked", "files": ["other.py"]})

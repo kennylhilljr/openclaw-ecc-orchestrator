@@ -120,6 +120,37 @@ class ApprovalBroker:
                         required_user_actions=[{"kind": "approve", "run_id": run_id, "unit_id": unit_id,
                                                 "request_id": req["request_id"], "detail": summary}])
 
+    @staticmethod
+    def _decision_checks(st, decision, now):
+        """Every check a decision must pass against the state `st` (already
+        expired as of `now`). Shared by `resolve` and the read only `preview`."""
+        rid = decision.get("request_id")
+        req = st["requests"].get(rid) if isinstance(rid, str) else None
+        checks = [check("request_known", req is not None, str(rid))]
+        if req is not None:
+            checks.append(check("request_pending", req["status"] == "pending", req["status"]))
+            checks.append(check("not_expired", req["status"] != "expired" and now < req["expires_at"], ""))
+            mismatched = [f for f in BINDING_FIELDS if decision.get(f) != req[f]]
+            checks.append(check("binding_matches", not mismatched, ",".join(mismatched)))
+            # A decision never sets the head; when it names one, it must be the bound one.
+            if "head_sha" in decision:
+                checks.append(check("head_sha_matches", decision.get("head_sha") == req.get("head_sha"), ""))
+        checks.append(check("decision_valid", decision.get("decision") in DECISIONS, str(decision.get("decision"))))
+        decided_by = decision.get("decided_by")
+        checks.append(check("decided_by_present", isinstance(decided_by, str) and bool(decided_by.strip()), ""))
+        return req, checks
+
+    def preview(self, decision):
+        """Read only: the checks `resolve` would apply to `decision` now.
+        Takes no lock and writes nothing (used by dry runs)."""
+        op = "approval.preview"
+        if not isinstance(decision, dict):
+            return envelope(op, ok=False, checks=[check("decision_is_object", False)])
+        st = self.state()
+        self._expire(st)
+        _, checks = self._decision_checks(st, decision, self.clock())
+        return envelope(op, ok=all(c["ok"] for c in checks), checks=checks)
+
     def resolve(self, decision):
         op = "approval.resolve"
         if not isinstance(decision, dict):
@@ -128,16 +159,8 @@ class ApprovalBroker:
             st = self.state()
             expired_changed = self._expire(st)
             rid = decision.get("request_id")
-            req = st["requests"].get(rid) if isinstance(rid, str) else None
-            checks = [check("request_known", req is not None, str(rid))]
-            if req is not None:
-                checks.append(check("request_pending", req["status"] == "pending", req["status"]))
-                checks.append(check("not_expired", req["status"] != "expired" and self.clock() < req["expires_at"], ""))
-                mismatched = [f for f in BINDING_FIELDS if decision.get(f) != req[f]]
-                checks.append(check("binding_matches", not mismatched, ",".join(mismatched)))
-            checks.append(check("decision_valid", decision.get("decision") in DECISIONS, str(decision.get("decision"))))
+            req, checks = self._decision_checks(st, decision, self.clock())
             decided_by = decision.get("decided_by")
-            checks.append(check("decided_by_present", isinstance(decided_by, str) and bool(decided_by), ""))
             ok = all(c["ok"] for c in checks)
             if not ok:
                 st["rejected_attempts"].append({

@@ -1,0 +1,727 @@
+"""`ecc drive`: one command per milestone (TEAM-DELIVERY-v2 sections 4.2 and 7).
+
+Milestone start: the architect checks the plan. Then, until every unit is
+merged: dispatch ready units (the repair loop returns failed ones to ready),
+run the team step on units in review, process the merge queue. Milestone end:
+the architect's drift check, the delivery lead's retrospective, then the
+product owner pair. The drive stops only for section 7's conditions.
+"""
+
+import json
+import os
+import re
+import shlex
+
+from ..merge_queue.conflicts import diff_stats
+from ..runs import state as S
+from ..runs.envelope import check, envelope
+from ..runs.fsutil import atomic_write_json
+from ..runs.store import iso
+from ..worktrees.git import git_out, run_git
+from . import config as TC
+from . import evidence as E
+from . import learning as L
+from . import personas as P
+from . import plan_check as PC
+
+PRODUCT_MARK = "ECC_PRODUCT"
+MAX_STEPS = 500
+
+# Self-healing before the owner is interrupted (TEAM-DELIVERY v5 section 7.1). Each
+# kind has a per-unit cap that persists across drives of the same run.
+HEAL_CAPS = {"grant": 2, "review": 2, "conflict": 2, "blocked_handoff": 1, "git_state": 2}
+GRANTABLE = {"escalation_stopped", "budget_exhausted", "runner_needs_user"}
+REVIEW_STALLS = {"no_qualified_reviewer", "no_qualified_verifier", "verifier_inconclusive"}
+OWNER_ONLY = {"runner_auth", "runner_missing", "runner_permission_denied", "routing_invalid",
+              "routing_changed_since_plan", "liveness_unverified", "runner_needs_owner"}
+
+
+def product_prompt(pack, head):
+    return "\n\n".join([
+        "You are a product owner on an agent delivery team, accepting a milestone (program increment). Agents "
+        "built it; you did not. Judge the milestone as a whole against its exit criteria and the goals it "
+        "owns, from the evidence below: the requirement and test plan sections, the milestone gate output, the "
+        "architect's drift report and the delivery lead's retrospective.",
+        "For every exit criterion say whether it is met and cite the evidence (a command and its output, or a "
+        "file and line). A criterion with no evidence is not met. Accept only when every criterion is met.",
+        "End your reply with exactly one line of single-line JSON, nothing after it:\n"
+        f'{PRODUCT_MARK} {{"verdict": "accept|reject", "head": "{head}", "criteria": [{{"criterion": "<text>", '
+        '"met": true, "evidence": "<text>"}], "findings": [{"severity": "blocker|major|minor", "what": "<text>"}]}',
+        "# Evidence\n\n" + pack])
+
+
+plan_check_prompt = PC.prompt
+
+
+def drift_prompt(pack, head):
+    return "\n\n".join([
+        "You are the architect on an agent delivery team. The milestone's units are merged. Compare the code "
+        "on main with the design: module boundaries, the names the design owns, layering rules and recorded "
+        "decisions. List every drift with where it is and what the design says. Drift is a finding, not a "
+        "verdict on the milestone; the product owner reads your report.",
+        "End your reply with exactly one line of single-line JSON, nothing after it:\n"
+        f'{P.REVIEW_MARK} {{"verdict": "approved|changes_requested", "head": "{head}", '
+        '"findings": [{"severity": "blocker|major|minor", "where": "<path>", "what": "<text>"}]}',
+        "# Evidence\n\n" + pack])
+
+
+def retro_prompt(table, head):
+    return "\n\n".join([
+        "You are the delivery lead on an agent delivery team. Write the milestone retrospective from the "
+        "numbers below: where time, cost and attempts went, which failures repeated, which roles and providers "
+        "agreed or disagreed with later stages, and the two or three platform or plan changes that would help "
+        "most next milestone. Be specific and brief.",
+        "End your reply with exactly one line of single-line JSON, nothing after it:\n"
+        f'{P.REVIEW_MARK} {{"verdict": "approved", "head": "{head}", "findings": [{{"severity": "minor", '
+        '"what": "<recommendation>"}]}',
+        "# Numbers\n\n```json\n" + json.dumps(table, indent=1, default=str) + "\n```"])
+
+
+def parse_product(text, head):
+    lines = [ln for ln in (text or "").splitlines() if ln.strip().startswith(PRODUCT_MARK)]
+    if not lines:
+        return None, f"no {PRODUCT_MARK} line"
+    try:
+        doc = json.loads(lines[-1].strip()[len(PRODUCT_MARK):].strip())
+    except ValueError:
+        return None, f"{PRODUCT_MARK} line is not JSON"
+    if not isinstance(doc, dict) or doc.get("verdict") not in ("accept", "reject"):
+        return None, "verdict must be accept or reject"
+    if not isinstance(doc.get("head"), str) or len(doc["head"]) < 7 or not head.startswith(doc["head"]):
+        return None, "verdict names a different head"
+    criteria = [c for c in doc.get("criteria") or [] if isinstance(c, dict)]
+    doc["criteria"] = criteria
+    if doc["verdict"] == "accept" and (not criteria or any(c.get("met") is not True for c in criteria)):
+        doc["verdict"] = "reject"
+        doc["downgraded"] = "accept with an unmet or missing criterion"
+    return doc, None
+
+
+_RESULT_RE = re.compile(r"\b(?:passed|pass|failed|fail)\b", re.IGNORECASE)
+
+
+def _owner_check_recorded(text, check_id):
+    """True when a line of the handoff names `check_id` and a result (Passed
+    or Failed), as research-mcp's M0 handoff records OC-01 and OC-02."""
+    named = re.compile(r"(?<![\w-])" + re.escape(check_id) + r"(?![\w-])")
+    return any(named.search(line) and _RESULT_RE.search(named.sub("", line)) for line in text.splitlines())
+
+
+class Drive:
+    """`dispatch(unit_id) -> envelope` runs one unit through dispatch (the CLI
+    path, or a test seam); `step` is a team.review.TeamStep on conductor `c`."""
+
+    def __init__(self, c, step, team_cfg, run_id, *, dispatch, clock, max_cost_usd=None, max_hours=None,
+                 progress=None, reports_dir, gate_runner=None):
+        self.c = c
+        self.step = step
+        self.cfg = team_cfg
+        self.run_id = run_id
+        self.dispatch = dispatch
+        self.clock = clock
+        self.max_cost = max_cost_usd
+        self.max_seconds = None if max_hours is None else float(max_hours) * 3600
+        self.progress = progress or (lambda line: None)
+        self.reports_dir = reports_dir
+        self.gate_runner = gate_runner
+        self.state_path = os.path.join(step.state_dir, "team", f"{run_id}-drive.json")
+        self.state = self._load()
+        self.steward = L.Steward(self)
+
+    # == persistence ==
+    def _load(self):
+        try:
+            with open(self.state_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            return doc if isinstance(doc, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        atomic_write_json(self.state_path, self.state)
+
+    # == helpers ==
+    def run(self):
+        return self.c.manager.load(self.run_id)
+
+    def spent(self, run):
+        return round(sum(float(u.get("cost_usd") or 0.0) for u in run["units"].values()), 6)
+
+    def _consult(self, role, mark, prompt_fn, head, *, exclude=(), require_kind=None):
+        return self.step.consult(role, mark, prompt_fn, head, run_id=self.run_id, exclude=exclude,
+                                 require_kind=require_kind)
+
+    def _stop(self, reason, detail, extra=None, next_steps=None):
+        data = {"stop": reason, "detail": detail, "summary": self.summary()}
+        data.update(extra or {})
+        steps = list(next_steps or [])
+        steps.append({"kind": "continue", "run_id": self.run_id, "detail": "then continue the milestone",
+                      "command": f"ecc drive --run-id {self.run_id}"})
+        data["next_steps"] = [s.get("command") for s in steps if s.get("command")]
+        self.state["last_stop"] = {"reason": reason, "detail": detail, "at": iso(self.clock()),
+                                   "next_steps": data["next_steps"]}
+        self._save()
+        actions = [{"kind": "resolve_needs_user", "run_id": self.run_id, "detail": f"{reason}: {detail}"}] + steps
+        return envelope("drive", ok=False, changed=True, checks=[check("milestone_complete", False, reason)],
+                        required_user_actions=actions, data=data)
+
+    # == self-healing and next steps ==
+    def _heals(self, uid):
+        return self.state.setdefault("heals", {}).setdefault(uid, {})
+
+    def _heal_once(self, uid, kind):
+        used = self._heals(uid)
+        if used.get(kind, 0) >= HEAL_CAPS[kind]:
+            return False
+        used[kind] = used.get(kind, 0) + 1
+        self._save()
+        return True
+
+    def _latest_handoff(self, uid):
+        logs = os.path.join(self.step.logs_dir, self.run_id)
+        try:
+            names = sorted((n for n in os.listdir(logs) if n.startswith(f"{uid}-attempt") and n.endswith(".handoff.json")),
+                           key=lambda n: int(n[len(uid) + 8:].split(".")[0] or 0))
+        except (OSError, ValueError):
+            return {}
+        for name in reversed(names):
+            try:
+                with open(os.path.join(logs, name), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                return doc if isinstance(doc, dict) else {}
+            except (OSError, ValueError):
+                continue
+        return {}
+
+    def heal(self, units, order):
+        """Try the recoveries the delivery lead may apply on its own before the
+        owner is interrupted. Returns the units healed (empty when none)."""
+        healed = []
+        m = self.c.manager
+        for uid in order:
+            u = units[uid]
+            reason = str(u.get("last_reason") or "")
+            ann = u.get("annotations") or {}
+            if u["state"] == S.NEEDS_USER and reason in REVIEW_STALLS and (ann.get("verification") or {}).get("head"):
+                if self._heal_once(uid, "review"):
+                    m.transition(self.run_id, self.c.id, uid, S.REVIEWING, reason="heal_review_stall")
+                    healed.append((uid, "review stall: back to the team review"))
+            elif u["state"] == S.NEEDS_USER and reason == "shared_git_state_changed" \
+                    and (ann.get("notes") or {}).get("refs_only") and not (ann.get("notes") or {}).get("touches_scope"):
+                # Only refs moved and no commit touched an active scope (the owner's
+                # branch or tag, a pack-refs): retry without the owner (issue #11).
+                if self._heal_once(uid, "git_state"):
+                    m.transition(self.run_id, self.c.id, uid, S.READY, reason="retry:heal_shared_git_state")
+                    healed.append((uid, "shared git state: refs moved outside every scope, retried"))
+            elif u["state"] == S.BLOCKED and self._heal_once(uid, "conflict"):
+                m.annotate_unit(self.run_id, self.c.id, uid, "last_failure", {
+                    "reason": "merge_conflict", "at": iso(self.clock()),
+                    "evidence": {"reason": "merge_conflict", "handoff_problems": [
+                        "Your branch no longer merges cleanly into main. ECC merges main into your branch before "
+                        "this attempt; resolve the conflicts, keep both sides' intent, and make the unit pass."]}})
+                m.transition(self.run_id, self.c.id, uid, S.READY, reason="retry:merge_conflict")
+                healed.append((uid, "merge conflict: retry on top of main"))
+            elif u["state"] == S.NEEDS_USER and reason in GRANTABLE and reason not in OWNER_ONLY:
+                kind = "blocked_handoff" if reason == "runner_needs_user" else "grant"
+                if not (self._heal_once(uid, kind) and (kind == "grant" or self._heal_once(uid, "grant"))):
+                    continue
+                grant = ann.get("budget_grant") or {}
+                m.annotate_unit(self.run_id, self.c.id, uid, "budget_grant", {
+                    "attempts": int(grant.get("attempts") or 0) + 1, "by": "delivery_lead", "reason": reason,
+                    "at": iso(self.clock())})
+                if reason == "runner_needs_user":
+                    h = self._latest_handoff(uid)
+                    problems = [f"you reported: {x}" for x in (h.get("unresolved_failures") or [])
+                                if isinstance(x, str)][:8]
+                    if h.get("next_action"):
+                        problems.append(f"your suggested next step: {h['next_action']}")
+                    problems.append("Every dependency of this unit is merged and ECC merges main into your branch "
+                                    "before this attempt, so files other units own should now be present. Continue "
+                                    "the unit. If something only the owner can change still blocks you (credentials, "
+                                    "a tool or guardrail refusing an edit), stop and name it exactly.")
+                    m.annotate_unit(self.run_id, self.c.id, uid, "last_failure", {
+                        "reason": "blocked_handoff", "at": iso(self.clock()),
+                        "evidence": {"reason": "blocked_handoff", "handoff_problems": problems}})
+                self.c._controllers.pop((self.run_id, uid), None)
+                m.transition(self.run_id, self.c.id, uid, S.READY, reason=f"retry:heal_{reason}")
+                healed.append((uid, f"{reason}: delivery lead granted one more attempt"))
+        log = L.Lessons(self.step.state_dir, self.run_id)
+        for uid, what in healed:
+            self.progress(f"{uid}: {what}")
+            log.add(source="drive", role="delivery_lead", unit=uid, what=f"healed: {what}", at=iso(self.clock()))
+        self.state.setdefault("heal_log", []).extend(
+            {"unit": uid, "action": what, "at": iso(self.clock())} for uid, what in healed)
+        if healed:
+            self._save()
+        return healed
+
+    def next_steps(self, stuck, refused):
+        """Exact owner commands for every unit the drive could not move."""
+        steps = []
+        r = self.run_id
+        for uid, reason in stuck.items():
+            reason = str(reason or "")
+            if reason in ("runner_auth", "runner_missing"):
+                cmd = (f"sign the coding CLI back in (claude: run `claude` then /login; codex: `codex login`), "
+                       f"run `ecc preflight`, then `ecc resume --run-id {r} --unit {uid}`")
+            elif reason == "runner_permission_denied":
+                cmd = (f"allow the denied tool for ECC runs (see the unit log), then "
+                       f"`ecc resume --run-id {r} --unit {uid}`")
+            elif reason in REVIEW_STALLS:
+                cmd = f"ecc resume --run-id {r} --unit {uid}"
+            elif reason in GRANTABLE or reason.startswith("review"):
+                h = self._latest_handoff(uid) if reason == "runner_needs_user" else {}
+                hint = f" (the agent says: {h['next_action'][:300]})" if h.get("next_action") else ""
+                cmd = f"ecc resume --run-id {r} --unit {uid} --extra-attempts 1{hint}"
+            else:
+                cmd = f"ecc status --run-id {r}; then ecc resume --run-id {r} --unit {uid}"
+            steps.append({"kind": "resolve_needs_user", "run_id": r, "unit_id": uid, "detail": reason,
+                          "command": cmd})
+        for uid, why in refused.items():
+            steps.append({"kind": "inspect_refusal", "run_id": r, "unit_id": uid, "detail": why[:300],
+                          "command": f"ecc status --run-id {r}"})
+        return steps
+
+    def summary(self):
+        run = self.run()
+        return {uid: {"state": u["state"], "reason": u.get("last_reason"), "attempts": u.get("attempts"),
+                      "cost_usd": u.get("cost_usd")} for uid, u in run["units"].items()}
+
+    # == milestone start ==
+    def milestone_start(self):
+        if self.state.get("plan_check") or "milestone_start" not in (self.cfg["roles"]["architect"].get("when") or []):
+            return None
+        run = self.run()
+        cached = PC.cached(self.step.state_dir, run["plan_sha256"])
+        if cached is not None and PC.passed(cached):
+            # `ecc plan-check` already passed this exact plan: no second paid turn.
+            self.progress(f"milestone start: plan check passed earlier for plan {run['plan_sha256'][:12]}")
+            self.state["plan_check"] = dict(cached, cached=True)
+            self._save()
+            return None
+        base = self.base_commit(run)
+        pack = PC.pack(self.c.worktrees.repo, run["plan"]["units"])
+        self.progress("milestone start: architect plan check")
+        res = self._consult("architect", P.REVIEW_MARK, lambda: plan_check_prompt(pack, base), base)
+        PC.store(self.step.state_dir, run["plan_sha256"], res, base, self.clock())
+        self.state["plan_check"] = res
+        self._save()
+        if res.get("verdict") in ("changes_requested", "rejected"):
+            return self._stop("plan_check_failed", "; ".join(str(f.get("what")) for f in res.get("findings") or []),
+                              {"plan_check": res})
+        if res.get("verdict") is None:
+            return self._stop("no_architect", str(res.get("skipped")))
+        return None
+
+    # == loop ==
+    def loop(self):
+        started = self.clock()
+        baseline = self.spent(self.run())
+        refused = {}
+        for _ in range(MAX_STEPS):
+            run = self.run()
+            units = run["units"]
+            order = [u["id"] for u in run["plan"]["units"]]
+            if all(units[uid]["state"] == S.MERGED for uid in order):
+                return None
+            if self.max_cost is not None and self.spent(run) - baseline > float(self.max_cost):
+                return self._stop("drive_cost_ceiling", f"spent {self.spent(run) - baseline} USD")
+            if self.max_seconds is not None and self.clock() - started > self.max_seconds:
+                return self._stop("drive_time_ceiling", f"ran {int(self.clock() - started)} s")
+            # Take the lease back if a long step let it lapse; only another
+            # conductor's live lease is a reason to stop.
+            keep = getattr(self.c, "_keep_lease", None)
+            if keep is not None:
+                keep(self.run_id)
+            if self.steward.due():
+                self.steward.run()
+            acted = False
+            for uid in order:
+                if uid in refused:
+                    continue
+                state = units[uid]["state"]
+                before = self._fingerprint(uid)
+                if state == S.REVIEWING:
+                    self.progress(f"{uid}: team review")
+                    res = self.step.run(self.run_id, uid)
+                elif state == S.QUEUED_FOR_MERGE:
+                    self.progress(f"{uid}: merge queue")
+                    res = self.c.process_merge_queue()
+                elif state == S.INTERRUPTED:
+                    # The runner exited but its result was never processed (the
+                    # drive stopped or lost its lease). Its commits stay on the
+                    # branch; the next attempt starts from them.
+                    self.progress(f"{uid}: interrupted; retrying")
+                    res = self.c.manager.transition(self.run_id, self.c.id, uid, S.READY,
+                                                    reason="retry:interrupted")
+                elif state == S.READY:
+                    self.progress(f"{uid}: dispatch (attempt {int(units[uid].get('attempts') or 0) + 1})")
+                    res = self.dispatch(uid)
+                else:
+                    continue
+                if self._fingerprint(uid) == before:
+                    # Nothing moved: a plumbing refusal (plan check, lease, routing). Retrying the
+                    # same call would loop, so this unit is set aside for the rest of the drive and
+                    # the drive carries on with every unit that can still move.
+                    failed = [f"{c.get('name')}: {c.get('detail')}" for c in (res or {}).get("checks") or []
+                              if not c.get("ok")]
+                    refused[uid] = f"{state}: " + "; ".join(failed)[:2000]
+                    self.progress(f"{uid}: set aside ({refused[uid][:200]})")
+                    continue
+                acted = True
+                break
+            if not acted:
+                if self.heal(units, order):
+                    continue
+                stuck = {uid: units[uid].get("last_reason") for uid in order
+                         if units[uid]["state"] in (S.NEEDS_USER, S.BLOCKED, S.FAILED, S.CANCELLED)}
+                if not stuck and refused:
+                    return self._stop("no_progress", json.dumps(refused)[:2000],
+                                      next_steps=self.next_steps({}, refused))
+                return self._stop("needs_owner", json.dumps(stuck), {"diagnosis": self.triage(stuck),
+                                                                      "refused": refused},
+                                  next_steps=self.next_steps(stuck, refused))
+        return self._stop("drive_step_limit", f"{MAX_STEPS} steps without finishing")
+
+    def base_commit(self, run):
+        """The commit the run started from: recorded by create-run, else the
+        first unit worktree's base, else the target branch tip."""
+        base = (run.get("metadata") or {}).get("base_commit")
+        if not base:
+            base = next(((u.get("workspace") or {}).get("base_commit") for u in run["units"].values()
+                         if (u.get("workspace") or {}).get("base_commit")), None)
+        return base or git_out(["rev-parse", f"refs/heads/{self.c.target}"], self.c.worktrees.repo)
+
+    def _fingerprint(self, uid):
+        u = self.run()["units"][uid]
+        return (u["state"], u.get("attempts"), u.get("last_reason"), len(u.get("history") or []))
+
+    def triage(self, stuck):
+        """The delivery lead's one look before the owner is interrupted
+        (section 3). v2 of this platform reports the diagnosis; it does not
+        re-queue a unit past its budget."""
+        if not stuck or "budget_stop" not in (self.cfg["roles"]["delivery_lead"].get("when") or []):
+            return None
+        run = self.run()
+        table = {uid: {"reason": reason, "last_failure": (run["units"][uid].get("annotations") or {}).get(
+            "last_failure"), "escalation": ((run["units"][uid].get("annotations") or {}).get("escalation") or {})
+            .get("attempts")} for uid, reason in stuck.items()}
+        head = self.base_commit(run)
+        res = self._consult("delivery_lead", P.REVIEW_MARK, lambda: retro_prompt(table, head).replace(
+            "Write the milestone retrospective", "Diagnose why these units stopped and what the owner should "
+            "decide; then write the retrospective"), head)
+        return {"provider": res.get("provider"), "findings": res.get("findings")}
+
+    # == milestone end ==
+    def milestone_end(self):
+        repo = self.c.worktrees.repo
+        run = self.run()
+        base = self.base_commit(run)
+        head = git_out(["rev-parse", f"refs/heads/{self.c.target}"], repo)
+        milestone = self.cfg.get("milestone") or {}
+        if self.steward.due(final=True):
+            self.progress("milestone end: practices steward")
+            self.steward.run(final=True)
+            head = git_out(["rev-parse", f"refs/heads/{self.c.target}"], repo)
+        stop = self.milestone_close(run, head)
+        if stop is not None:
+            return stop
+        report = {"run_id": self.run_id, "milestone": milestone.get("name"), "head": head, "base": base,
+                  "at": iso(self.clock()), "practices": (self.state.get("learning") or {}).get("runs") or []}
+        if "milestone_end" in (self.cfg["roles"]["architect"].get("when") or []) and not self.state.get("drift"):
+            stat, diff = E.diff_text(repo, base, head)
+            refs = E.design_references(repo, " ".join(str(u.get("description") or "") for u in run["plan"]["units"]))
+            pack = f"## Diff stat {base[:12]}..{head[:12]}\n\n```\n{stat}\n```\n\n## Diff\n\n```diff\n{diff}\n```" \
+                   f"\n\n## Design references\n\n{refs}"
+            self.progress("milestone end: architect drift check")
+            self.state["drift"] = self._consult("architect", P.REVIEW_MARK, lambda: drift_prompt(pack, head), head)
+            self._save()
+        report["drift"] = self.state.get("drift")
+        table = self.retro_table(run)
+        if "milestone_end" in (self.cfg["roles"]["delivery_lead"].get("when") or []) and not self.state.get("retro"):
+            self.progress("milestone end: delivery lead retrospective")
+            self.state["retro"] = {"table": table, "narrative": self._consult(
+                "delivery_lead", P.REVIEW_MARK, lambda: retro_prompt(table, head), head)}
+            self._save()
+        report["retrospective"] = self.state.get("retro") or {"table": table}
+        report["gates"] = self.milestone_gates(head)
+        pack = self.product_pack(report)
+        verdicts, used = [], set()
+        for n in range(2 if self.cfg["roles"]["product_owner"].get("pair") else 1):
+            self.progress(f"milestone end: product owner {n + 1}")
+            res = self._consult_product(pack, head, exclude=used)
+            verdicts.append(res)
+            if res.get("provider"):
+                used.add(res["provider"])
+        report["product"] = verdicts
+        # Two product owner personas in separate sessions; different providers are
+        # preferred, not required (independence is the persona, owner decision 2026-10-19).
+        accepted = len(verdicts) >= 1 and all(v.get("verdict") == "accept" for v in verdicts)
+        report["verdict"] = "accept" if accepted else "reject"
+        path = self.write_report(report)
+        if not accepted:
+            return self._stop("product_rejected", f"report {path}", {"report": path})
+        return envelope("drive", changed=True, checks=[check("milestone_complete", True, path)],
+                        data={"report": path, "summary": self.summary(), "verdict": "accept"})
+
+    def _consult_product(self, pack, head, exclude):
+        """One product owner verdict. Providers not yet used are tried first; a
+        provider that errors is skipped, never counted as a reject; if no other
+        provider answers, a used one plays the persona again in a new session."""
+        role = "product_owner"
+        cls = TC.role_class(self.cfg, role)
+        candidates = self.step.candidates(TC.CLASS_TIER[cls], "low", None, None, False)
+        rotation = self.step.rotation(self.run_id)
+        panel = TC.panel_for(self.cfg, role, cls)
+        skipped_all = []
+        for avoid in (set(exclude), set()):
+            tried = set()
+            for _ in range(max(1, len(panel))):
+                pool = [c for c in candidates if c["runner"] not in tried]
+                choice, skipped = rotation.choose(role, panel, pool, exclude=avoid)
+                skipped_all += [{"provider": p, "reason": r} for p, r in skipped]
+                if choice is None:
+                    break
+                tried.add(choice["runner"])
+                turn = self.step._turn(role, choice, product_prompt(pack, head), self.c.worktrees.repo, False,
+                                       self.run_id, "_milestone", 1800.0)
+                if turn.get("error"):
+                    skipped_all.append({"provider": choice["runner"], "reason": f"runner error: {turn['error']}"})
+                    continue
+                doc, problem = parse_product(turn.get("text"), head)
+                if doc is None:
+                    again = (f"Your previous reply could not be used: {problem}. Reply again.\n\n"
+                             + product_prompt(pack, head))
+                    turn = self.step._turn(role, choice, again, self.c.worktrees.repo, False, self.run_id,
+                                           "_milestone", 1800.0)
+                    if turn.get("error"):
+                        skipped_all.append({"provider": choice["runner"],
+                                            "reason": f"runner error: {turn['error']}"})
+                        continue
+                    doc, problem = parse_product(turn.get("text"), head)
+                out = {"role": role, "provider": choice["runner"], "model": turn.get("model") or choice["model"],
+                       "skipped": skipped_all, "independence": "provider" if avoid or not exclude else "persona"}
+                if doc is None:
+                    out.update(verdict="reject", problem=problem)
+                else:
+                    out.update(verdict=doc["verdict"], criteria=doc["criteria"], findings=doc.get("findings"),
+                               downgraded=doc.get("downgraded"))
+                return out
+        return {"role": role, "provider": None, "verdict": None, "skipped": skipped_all}
+
+    def retro_table(self, run):
+        stops = {}
+        # Every stop and return, from the event log: a stop outside the
+        # escalation record (shared_git_state_changed, an owner resume) still
+        # has a cause (live finding, rm-m0f: four retries had none).
+        for event in self.c.manager.store.read_events(self.run_id):
+            data = event.get("data") or {}
+            if event.get("type") != "unit.state_changed":
+                continue
+            reason = str(data.get("reason") or "")
+            if data.get("to") in (S.NEEDS_USER, S.FAILED, S.BLOCKED) or reason.startswith("review:"):
+                uid = (data.get("unit") or {}).get("id")
+                stops.setdefault(uid, []).append(reason.removeprefix("review:") or data.get("to"))
+        units = {}
+        for uid, u in run["units"].items():
+            esc = (u.get("annotations") or {}).get("escalation") or {}
+            team = (u.get("annotations") or {}).get("team") or {}
+            units[uid] = {"attempts": u.get("attempts"), "minutes": round(float(u.get("minutes_used") or 0), 1),
+                          "cost_usd": u.get("cost_usd"), "tier": (u.get("routing") or {}).get("tier"),
+                          "author": (u.get("routing") or {}).get("runner"),
+                          "failures": stops.get(uid) or [a.get("reason") for a in esc.get("attempts") or []
+                                                         if not a.get("passed")],
+                          "reviews": [{"role": r.get("role"), "provider": r.get("provider"),
+                                       "verdict": r.get("verdict")} for r in team.get("reviews") or []],
+                          "verifier": {k: (team.get("verification") or {}).get(k) for k in ("provider", "verdict")}}
+        turns = self.step.rotation(self.run_id).state.get("turns")
+        return {"units": units, "role_turns_by_provider": turns}
+
+    def milestone_gates(self, head):
+        commands = (self.cfg.get("milestone") or {}).get("gate_commands") or []
+        if not commands or self.gate_runner is None:
+            return []
+        return self._on_head(head, lambda path: [self.gate_runner(cmd, path) for cmd in commands])
+
+    def _on_head(self, head, fn):
+        """Call fn(path) in a throwaway detached checkout of `head`."""
+        repo = self.c.worktrees.repo
+        path = os.path.join(self.step.worktree_root, "_milestone", f"{self.run_id}-{int(self.clock() * 1000)}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        run_git(["worktree", "add", "-q", "--detach", path, head], repo)
+        try:
+            return fn(path)
+        finally:
+            run_git(["worktree", "remove", "--force", path], repo, check=False)
+
+    def _read_at(self, head, path):
+        proc = run_git(["show", f"{head}:{path}"], self.c.worktrees.repo, check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    # == milestone close ==
+    def milestone_close(self, run, head):
+        """The delivery lead's close step before the product review (issue #12).
+        research-mcp M0 was rejected twice for bookkeeping: merged units still
+        `planned` in the plan, a test plan gate naming plan v1, and owner checks
+        with no recorded result, or recorded on a branch not yet merged. Every
+        check here reads the target branch, so the review starts only from a
+        target that holds the close step's commits. Configured in team.json
+        `milestone.close`; `{milestone}` and `{units}` (the merged unit ids,
+        comma separated) are filled into commands and paths."""
+        milestone = self.cfg.get("milestone") or {}
+        close = milestone.get("close") or {}
+        if not close:
+            return None
+        name = str(milestone.get("name") or "milestone")
+        target = self.c.target
+        merged = sorted(uid for uid, u in run["units"].items() if u["state"] == S.MERGED)
+
+        def fill(text):
+            return str(text).replace("{milestone}", name).replace("{units}", ",".join(merged))
+
+        commands = [fill(c) for c in close.get("commands") or []]
+        self.progress("milestone end: delivery lead close step")
+
+        def run_commands(path):
+            out = [self.gate_runner(cmd, path) for cmd in commands] if self.gate_runner else []
+            status = git_out(["status", "--porcelain", "--untracked-files=all"], path)
+            return out, [line[3:] for line in status.splitlines() if line.strip()]
+
+        results, changed = self._on_head(head, run_commands) if commands else ([], [])
+        problems, steps = [], []
+        for r in results:
+            if r.get("exit_code") != 0:
+                problems.append(("close_command_failed", f"`{r.get('command')}` exit {r.get('exit_code')}: "
+                                                         f"{str(r.get('output_tail') or '')[-600:]}"))
+        if changed:
+            problems.append(("close_changes_pending", f"the close commands change {', '.join(changed[:20])} on "
+                                                      f"{target} at {head[:12]}"))
+            steps.append(f"on {target}, run {'; '.join(commands)}, then commit the changes")
+        plan_doc, test_plan = close.get("plan"), close.get("test_plan")
+        if plan_doc and test_plan:
+            stem = os.path.splitext(os.path.basename(fill(plan_doc)))[0]
+            if stem not in (self._read_at(head, fill(test_plan)) or ""):
+                problems.append(("test_plan_stale", f"{fill(test_plan)} on {target} does not name {stem}"))
+                steps.append(f"point the milestone gate in {fill(test_plan)} at {stem} and commit it to {target}")
+        handoff = fill(close.get("handoff") or "docs/build/{milestone}-handoff-v1.md")
+        text = self._read_at(head, handoff)
+        checks = [c for c in close.get("owner_checks") or [] if isinstance(c, dict) and c.get("id")]
+        if text is None:
+            draft = self._draft_handoff(head, name, fill, close, results, checks, os.path.basename(handoff))
+            problems.append(("handoff_missing", f"{handoff} is not on {target}; a draft is at {draft}"))
+            steps.append(f"complete the draft {draft} and commit it to {target} as {handoff}")
+        pending = [c for c in checks if not _owner_check_recorded(text or "", c["id"])]
+        if pending:
+            problems.append(("owner_checks_pending", "owner checks pending: " + ", ".join(c["id"] for c in pending)))
+            for c in pending:
+                how = "; ".join(str(s) for s in c.get("steps") or []) or "see the test plan"
+                steps.append(f"owner check {c['id']} ({c.get('title') or ''}): {how}; record the result (Passed or "
+                             f"Failed, date, evidence) in a row naming {c['id']} in {handoff} on {target}")
+        self.state["close"] = {"head": head, "merged_units": merged, "commands": results, "changed": changed,
+                               "problems": [{"kind": k, "detail": d} for k, d in problems]}
+        self._save()
+        if not problems:
+            return None
+        return self._stop(problems[0][0], "; ".join(d for _, d in problems), {"close": self.state["close"]},
+                          next_steps=[{"kind": "milestone_close", "run_id": self.run_id, "detail": s, "command": s}
+                                      for s in steps])
+
+    def _draft_handoff(self, head, name, fill, close, results, checks, filename):
+        """The milestone handoff drafted from the repository's template (on the
+        target branch) with the close step's evidence; the owner completes and
+        commits it."""
+        template = close.get("handoff_template")
+        text = self._read_at(head, fill(template)) if template else None
+        lines = [fill(text).rstrip() if text else f"# {name} handoff (v1)", "",
+                 "## Gate evidence (drafted by ECC)", "", f"Target branch at `{head}`.", ""]
+        lines += [f"- `{r.get('command')}`: exit {r.get('exit_code')}" for r in results] or ["- (no close commands)"]
+        if checks:
+            lines += ["", "| Check | Result |", "| --- | --- |"]
+            lines += [f"| Owner check {c['id']} ({c.get('title') or ''}) | *pending: run the steps and record "
+                      f"Passed or Failed, the date and the evidence* |" for c in checks]
+        os.makedirs(self.reports_dir, exist_ok=True)
+        path = os.path.join(self.reports_dir, f"{self.run_id}-{filename}")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
+    def product_pack(self, report):
+        repo = self.c.worktrees.repo
+        parts = []
+        for doc in (self.cfg.get("milestone") or {}).get("docs") or []:
+            p = os.path.join(repo, doc.get("path", ""))
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    parts.append(f"### {doc['path']}\n\n" + E.extract_sections(fh.read(), doc.get("sections") or []))
+        gates = "\n".join(f"- `{g.get('command')}` exit {g.get('exit_code')}\n```\n{g.get('output_tail', '')}\n```"
+                          for g in report.get("gates") or [])
+        return "\n\n".join([
+            f"## Milestone {report.get('milestone')} on main at {report['head']}",
+            "## Exit criteria and goals\n\n" + ("\n\n".join(parts) or "(none configured)"),
+            "## Milestone gate commands (run by the orchestrator on main)\n\n" + (gates or "(none configured)"),
+            "## Architect drift report\n\n```json\n" + json.dumps(report.get("drift"), indent=1, default=str)[:20000]
+            + "\n```",
+            "## Delivery lead retrospective\n\n```json\n" + json.dumps(report.get("retrospective"), indent=1,
+                                                                       default=str)[:20000] + "\n```"])
+
+    def write_report(self, report):
+        os.makedirs(self.reports_dir, exist_ok=True)
+        name = f"{self.run_id}-{report.get('milestone') or 'milestone'}-product-v1"
+        path = os.path.join(self.reports_dir, name + ".md")
+        lines = [f"# Product report: {report.get('milestone')} ({self.run_id})", "",
+                 f"- Verdict: **{report['verdict']}**", f"- Main at `{report['head']}`, base `{report['base']}`", "",
+                 "## Product owners", ""]
+        for v in report["product"]:
+            lines.append(f"### {v.get('provider')} ({v.get('model')}): {v.get('verdict')}")
+            for c in v.get("criteria") or []:
+                lines.append(f"- {'met' if c.get('met') else 'NOT met'}: {c.get('criterion')} ({c.get('evidence')})")
+            for f in v.get("findings") or []:
+                lines.append(f"- finding ({f.get('severity')}): {f.get('what')}")
+            lines.append("")
+        lines += ["## Gates", ""] + [f"- `{g.get('command')}`: exit {g.get('exit_code')}" for g in report["gates"]]
+        drift = report.get("drift") or {}
+        lines += ["", "## Architect drift", ""] + [f"- ({f.get('severity')}) {f.get('where')}: {f.get('what')}"
+                                                    for f in drift.get("findings") or []]
+        retro = report.get("retrospective") or {}
+        lines += ["", "## Retrospective", ""] + [f"- {f.get('what')}" for f in
+                                                  ((retro.get("narrative") or {}).get("findings") or [])]
+        lines += ["", "```json", json.dumps(retro.get("table"), indent=1, default=str), "```", ""]
+        lines += ["## Practices learned during the milestone", ""]
+        practices = report.get("practices") or []
+        if not practices:
+            lines.append("- No practice changes.")
+        for r in practices:
+            lines.append(f"- Pass {r.get('n')}: {r.get('status')}; applied {', '.join(r.get('applied') or []) or 'none'}"
+                         f"; proposed for the owner {', '.join(r.get('proposed') or []) or 'none'}"
+                         + (f"; commit `{r['merged_commit'][:12]}`" if r.get("merged_commit") else ""))
+        ledger = L.settings(self.cfg)["ledger"]
+        lines += ["", f"Lessons log: `{L.Lessons(self.step.state_dir, self.run_id).path}`; ledger in the repository: "
+                      f"`{ledger}` (its \"Proposed for the owner\" section lists what needs your decision).", ""]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        atomic_write_json(path[:-3] + ".json", report)
+        return path
+
+    # == entry ==
+    def go(self):
+        stop = self.milestone_start()
+        if stop is not None:
+            return stop
+        stop = self.loop()
+        if stop is not None:
+            return stop
+        return self.milestone_end()
+
+
+def shell_gate_runner(supervisor, timeout=3600.0, tail_chars=4000):
+    """Run a milestone gate command (shell-free argv, as the unit gates are) in `path`."""
+    import collections
+
+    def run(command, path):
+        tail = collections.deque(maxlen=200)
+        res = supervisor.run(shlex.split(command), cwd=path, env_allow=("HOME",), timeout=timeout,
+                             on_line=lambda stream, line: tail.append(line))
+        text = "\n".join(tail)
+        return {"command": command, "exit_code": res.get("exit_code"), "output_tail": text[-tail_chars:]}
+    return run

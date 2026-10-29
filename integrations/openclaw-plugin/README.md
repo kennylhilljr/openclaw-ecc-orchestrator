@@ -21,7 +21,7 @@ options are written without their two leading hyphens: the option shown as
 | :- | :- |
 | Event tailing | A background service polls the JSONL log (default every second). Only complete lines are consumed, so a torn last line is retried later. Lines that do not parse or lack the envelope are skipped; unknown event types are ignored. Events are deduplicated by `id`, must have a `seq` above the last processed one, and are applied in `seq` order. A rotated or truncated log is re read from the start without replaying. |
 | Restart safety | The read position (byte offset, file identity, last `seq`, recent ids) and the view model are written together, atomically, to `<stateDir>/plugin-state.json`. A restart resumes after the last applied event. An unreadable state file is set aside and the view is rebuilt from the log. |
-| Surfaces | Run progress and unit state changes, the last progress line per unit, `attention.required` items, pending `approval.requested` items with summary, plan sha256, head sha, requesting session and time left, `approval.resolved`, and `merge.completed`. |
+| Surfaces | Run progress and unit state changes, the last progress line per unit, runner health (`unit.health`; a running unit that is not healthy shows its health state), runner completions (`unit.completed`: exit, duration, attempt, tier, runner), `attention.required` items (with short explanations for `suspected_hang`, `hung_cancelled` and `long_running`), pending `approval.requested` items with summary, plan sha256, head sha, requesting session and time left, `approval.resolved`, and `merge.completed`. |
 | Decisions | Copies the pending request's binding fields verbatim from the `approval.requested` event (`request_id`, `run_id`, `unit_id`, `action`, `plan_sha256`, and `requesting_session` as `session_id`) and adds `decision` and `decided_by`. Writes a hidden temp file (`0600`), fsyncs, renames it to `<ms>-<request_id>-<random>.json` and fsyncs the directory. |
 | Secrets | Relies on the runtime's redaction, then applies its own: values under secret looking keys (`token`, `secret`, `password`, `api_key`, `auth`, `cookie`, `session_id`, ...) are replaced, known token shapes, credentials in URLs, `name=value` pairs and long mixed case opaque strings are masked, control and bidi characters are stripped, and strings are bounded. Hex strings (plan hashes, commit shas) are kept. Logs contain counts and error codes only, never event text. |
 
@@ -206,8 +206,10 @@ All paths are inside the installed package
   clients (where it is the client program id, for example `cli`, which the
   plugin refuses). For Control UI and terminal UI connections it is absent,
   so `/ecc-decide` fails closed there and operators use
-  `ecc-orchestrator.decide`. A command context field with the authenticated
-  profile would let the command work everywhere.
+  `ecc-orchestrator.decide`, most simply through `bin/ecc-decide` (an operator
+  UI client; verified live on 2026-10-18 with `decided_by` `gateway-owner`).
+  A command context field with the authenticated profile would let the
+  command work everywhere.
 * **Session on the gateway method.** Plugin RPC handlers receive the
   authenticated profile but no host bound session. The caller names the
   session and the plugin requires it to equal the request's requesting
@@ -227,11 +229,15 @@ All paths are inside the installed package
   items in the tab (refreshes every 10 seconds), `/ecc` or the snapshot.
 * **Tab is read only.** Gateway protected tab frames accept only GET and
   HEAD, so approve buttons cannot live in the tab.
-* **Runtime inbox consumer.** The runtime processes inbox files only inside
-  `approvals approve` or `approvals reject` or through
-  `DecisionInbox.process`. A decision written by the plugin waits until one of
-  those runs; the runtime needs a standing inbox consumer or a CLI subcommand
-  that only processes the inbox.
+* **Runtime inbox consumer (closed).** The runtime now has a standing
+  consumer: `ecc-orchestrator approvals process-inbox` in watch mode
+  (options `watch` and `interval`, typed with the usual two leading hyphens)
+  polls the inbox and applies each decision through the same `DecisionInbox`
+  and `ApprovalBroker` validation as `approvals approve`, so a decision made
+  in OpenClaw no longer waits for a CLI command. It is typically run by a
+  launchd agent whose plist lives in `integrations/launchd/`. Point its
+  state dir and decision inbox at the directory this plugin's `inbox`
+  names. See the runtime's `docs/cli.md` (Standing inbox processor).
 * **Plugin state location.** The plugin keeps its position in its own
   `stateDir` instead of OpenClaw's keyed store, to keep it outside
   `~/.openclaw`.

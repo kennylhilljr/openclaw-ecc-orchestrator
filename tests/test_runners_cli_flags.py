@@ -11,9 +11,9 @@ import unittest
 from openclaw_ecc_orchestrator.runners import probes
 from openclaw_ecc_orchestrator.runners.base import (CancelResult, CommandResult, ProbeContext,
                                                     default_cancel_runner)
-from openclaw_ecc_orchestrator.runners.cli_adapters import (CANCEL_PROMPT, EXERCISE_FILES,
+from openclaw_ecc_orchestrator.runners.cli_adapters import (CANCEL_ATTEMPTS, EXERCISE_FILES, PROBE_PROMPT,
                                                             ClaudeAdapter, CodexAdapter)
-from tests.test_runners_probes import (CLAUDE_JSON, CODEX_JSONL, FakeCommands, UnitTestRuns,
+from tests.test_runners_probes import (CLAUDE_JSON, CODEX_JSONL, STREAMED, FakeCommands, UnitTestRuns,
                                        claude_rules, codex_rules, ctx, ok, reasons, statuses)
 
 PY = sys.executable
@@ -42,20 +42,70 @@ class ClaudeFlagTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--effort") + 1], "low")
         self.assertEqual(argv[-2:], ["--", "-rf prompt"])
 
+    def test_writable_runs_ignore_user_plugins_and_hooks(self):
+        """Live finding (rmcp-m0f): a user-level plugin hook refused M0-05's edits to platform/secrets.py."""
+        argv = ClaudeAdapter().build_invocation("x", writable=True)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
+        self.assertNotIn("--setting-sources", ClaudeAdapter().build_invocation("x"))
+
     def test_writable_allows_edit_git_and_python_only(self):
         argv = ClaudeAdapter().build_invocation("x", writable=True)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
         tools = argv[argv.index("--allowedTools") + 1]
         self.assertIn("Bash(git *)", tools)
         self.assertIn("Bash(python3 *)", tools)
+        self.assertIn("Bash(uv *)", tools)
+        self.assertIn("Skill", tools.split(","))  # repository and bundled skills (TEAM-DELIVERY v6 4.5)
+        self.assertIn("Bash(tools/ci.sh *)", tools)
+        self.assertNotIn("Bash(*)", tools)
         self.assertNotIn("bypassPermissions", argv)
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertLess(argv.index("--allowedTools"), argv.index("--"))
 
-    def test_cancel_invocation_allows_only_sleep(self):
+    def test_handoff_tokens_are_filled_with_the_attempt_path(self):
+        from openclaw_ecc_orchestrator.runs.conductor import (
+            HANDOFF_DIR_TOKEN, HANDOFF_PATH_TOKEN, fill_handoff_tokens)
+        argv = ["claude", "--add-dir", HANDOFF_DIR_TOKEN, "--", "write to " + HANDOFF_PATH_TOKEN]
+        out = fill_handoff_tokens(argv, "/s/logs/r1/U1-attempt1.handoff.json")
+        self.assertEqual(out[2], "/s/logs/r1")
+        self.assertEqual(out[-1], "write to /s/logs/r1/U1-attempt1.handoff.json")
+        self.assertEqual(fill_handoff_tokens(["x", "--", "y"], "/a/b.json"), ["x", "--", "y"])
+
+    def test_runner_prompt_names_the_handoff_path_placeholder(self):
+        from openclaw_ecc_orchestrator.cli.commands import runner_prompt
+        from openclaw_ecc_orchestrator.runs.conductor import HANDOFF_PATH_TOKEN
+        self.assertIn(HANDOFF_PATH_TOKEN, runner_prompt({"id": "U1", "title": "t"}))
+
+    def test_handoff_template_in_prompt_is_schema_valid(self):
+        import json
+        from openclaw_ecc_orchestrator import schemas
+        from openclaw_ecc_orchestrator.cli.commands import HANDOFF_TEMPLATE
+        doc = json.loads(HANDOFF_TEMPLATE.replace("<UNIT_ID>", "U1").replace("<full sha>", "a" * 40)
+                         .replace("<repo/relative/path>", "src/a.py"))
+        report = schemas.validate_handoff(doc, {"id": "U1", "scope": {"files": ["src/a.py"]}})
+        self.assertTrue(report.ok, report.errors)
+
+    def test_runner_env_keeps_user_for_keychain_login(self):
+        allow = ClaudeAdapter().env_allow()
+        self.assertIn("USER", allow)
+        self.assertIn("HOME", allow)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", allow)
+
+    def test_cancel_invocation_streams_the_probe_prompt(self):
         argv = ClaudeAdapter().build_cancel_invocation("haiku")
-        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Bash(sleep *)")
-        self.assertEqual(argv[-1], CANCEL_PROMPT)
+        self.assertEqual(argv[:4], ["claude", "-p", "--output-format", "stream-json"])
+        self.assertIn("--verbose", argv)  # print mode refuses stream-json without it
+        self.assertEqual(argv[-2:], ["--", PROBE_PROMPT])
+        self.assertNotIn("--allowedTools", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[argv.index("--permission-prompts") + 1], "none")
+        self.assertNotIn("--verbose", ClaudeAdapter().build_invocation("x"))
+
+    def test_codex_cancel_invocation_is_the_streaming_probe(self):
+        argv = CodexAdapter().build_cancel_invocation("m", cwd="/w")
+        self.assertEqual(argv[:3], ["codex", "exec", "--json"])
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertEqual(argv[-2:], ["--", PROBE_PROMPT])
 
     def test_auth_status_is_json_and_checks_logged_in(self):
         self.assertEqual(ClaudeAdapter.auth_argv, ["claude", "auth", "status", "--json"])
@@ -109,11 +159,51 @@ class CodexFlagTests(unittest.TestCase):
         self.assertNotIn("--add-dir", argv)
 
     def test_writable_run_can_commit_in_its_repo_only(self):
-        argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": "/nonexistent/uv-cache"}):
+            argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
         self.assertEqual(argv.count("--add-dir"), 1)
         self.assertEqual(argv[argv.index("--add-dir") + 1], os.path.join("/w/repo", ".git"))
         self.assertNotIn("--add-dir", CodexAdapter().build_invocation("x", writable=True))
+
+    def test_writable_run_shares_the_uv_cache(self):
+        """Live finding (rmcp-m0f): the sandbox could not use uv's cache, so acceptance commands could not run."""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as cache, mock.patch.dict(os.environ, {"UV_CACHE_DIR": cache}):
+            argv = CodexAdapter().build_invocation("x", cwd="/w/repo", writable=True)
+            self.assertIn(cache, [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"])
+            self.assertNotIn(cache, CodexAdapter().build_invocation("x", cwd="/w/repo"))
+        self.assertIn("UV_CACHE_DIR", CodexAdapter().env_allow())
+
+    def test_sandboxed_commands_run_uv_offline(self):
+        """Live finding (rm-m0b M0-02, 2026-10-22): the sandbox has no network, so `uv run` in the verifier's
+        fresh checkout tried to fetch hatchling from PyPI and every acceptance command failed. Offline, uv
+        builds from the shared cache."""
+        for writable in (False, True):
+            with self.subTest(writable=writable):
+                argv = CodexAdapter(effort="low").build_invocation("x", cwd="/w/repo", writable=writable)
+                overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+                self.assertIn('shell_environment_policy.set.UV_OFFLINE="1"', overrides)
+                self.assertEqual(overrides[0], 'model_reasoning_effort="low"')
+                self.assertLess(argv.index("-c"), argv.index("--"))
+
+    def test_writable_worktree_grants_the_common_git_dir(self):
+        """In a linked worktree .git is a pointer file; the grant must be the common .git."""
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = os.path.join(tmp, "repo"), os.path.join(tmp, "wt")
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                       GIT_COMMITTER_EMAIL="t@t")
+            for args in (["init", "-q", repo], ["-C", repo, "commit", "-q", "--allow-empty", "-m", "c"],
+                         ["-C", repo, "worktree", "add", "-q", "-b", "w", wt]):
+                subprocess.run(["git"] + args, check=True, env=env)
+            self.assertTrue(os.path.isfile(os.path.join(wt, ".git")))
+            argv = CodexAdapter().build_invocation("x", cwd=wt, writable=True)
+            granted = argv[argv.index("--add-dir") + 1]
+            self.assertEqual(os.path.realpath(granted), os.path.realpath(os.path.join(repo, ".git")))
 
     def test_auth_parse(self):
         adapter = CodexAdapter()
@@ -191,55 +281,120 @@ class RepoExerciseTests(unittest.TestCase):
 
 
 def cancel_ctx(result, **kw):
-    c = ctx(FakeCommands(claude_rules()), **kw)
-    c.cancel_command = lambda argv, after, cwd=None: result
-    return c
+    commands = FakeCommands(claude_rules(), cancel=result)
+    return ctx(commands, **kw), commands
+
+
+def early(stdout="", stderr="", event=False):
+    return CancelResult(True, True, 1, True, 0, 2.0, stdout, stderr, event, "system/init" if event else "")
+
+
+# Fake CLIs for the real cancel runner: stream one JSON event, then keep working.
+ONE_EVENT_THEN_SLEEP = ("import json, sys, time; print(json.dumps({'type': 'system', 'subtype': 'init'}), "
+                        "flush=True); time.sleep(60)")
+GRANDCHILD = ("import json, subprocess, sys, time; "
+              "subprocess.Popen([sys.executable, '-c', 'import subprocess, sys, time; "
+              "subprocess.Popen([sys.executable, \\'-c\\', \\'import time; time.sleep(60)\\']); "
+              "time.sleep(60)']); time.sleep(0.5); "
+              "print('not json yet', flush=True); "
+              "print(json.dumps({'type': 'thread.started'}), flush=True); time.sleep(60)")
 
 
 class CancellationTests(unittest.TestCase):
-    def test_group_gone_passes(self):
-        record = probes.probe_runner("claude", cancel_ctx(
-            CancelResult(True, False, -9, True, 3, 5.0)))
+    def test_first_event_and_group_gone_passes(self):
+        c, commands = cancel_ctx(CancelResult(True, False, -15, True, 3, 5.0, "{}\n", "", True,
+                                              "system/init", 1.2))
+        record = probes.probe(ClaudeAdapter(), c)
         self.assertEqual(statuses(record)["cancellation_timeout"], "pass")
-        self.assertIn("3 process(es)", [c for c in record["checks"]
-                                        if c["name"] == "cancellation_timeout"][0]["detail"])
+        detail = [x for x in record["checks"] if x["name"] == "cancellation_timeout"][0]["detail"]
+        self.assertIn("3 process(es)", detail)
+        self.assertIn("system/init", detail)
+        argv, max_wait = commands.cancel_calls[0]
+        self.assertIn("stream-json", argv)
+        self.assertEqual(argv[-1], PROBE_PROMPT)
+        self.assertEqual(max_wait, c.step_timeout)
 
-    def test_early_exit_fails_with_cli_error(self):
-        record = probes.probe_runner("claude", cancel_ctx(
-            CancelResult(True, True, 1, True, 0, 2.0, CREDIT_ERROR, "")))
+    def test_exit_before_event_is_retried_then_passes(self):
+        c, commands = cancel_ctx([early(), STREAMED])
+        record = probes.probe(ClaudeAdapter(), c)
+        self.assertEqual(statuses(record)["cancellation_timeout"], "pass")
+        self.assertEqual(len(commands.cancel_calls), 2)
+
+    def test_repeated_exit_before_event_fails_no_stream_event(self):
+        c, commands = cancel_ctx([early("", "boom")])
+        record = probes.probe(ClaudeAdapter(), c)
         self.assertEqual(statuses(record)["cancellation_timeout"], "fail")
-        self.assertIn("exited before the cancel point", reasons(record)["cancellation_timeout"])
+        self.assertEqual(reasons(record)["cancellation_timeout"], "no_stream_event")
+        self.assertEqual(len(commands.cancel_calls), CANCEL_ATTEMPTS)
+        self.assertEqual(CANCEL_ATTEMPTS, 3)  # one try plus two retries
+
+    def test_cli_error_is_reported_in_detail(self):
+        c, _ = cancel_ctx([early(CREDIT_ERROR, "")])
+        record = probes.probe(ClaudeAdapter(), c)
+        detail = [x for x in record["checks"] if x["name"] == "cancellation_timeout"][0]["detail"]
+        self.assertIn("Credit balance is too low", detail)
+
+    def test_no_event_while_running_fails_without_retry(self):
+        c, commands = cancel_ctx(CancelResult(True, False, -9, True, 1, 2.0))
+        record = probes.probe(ClaudeAdapter(), c)
+        self.assertEqual(reasons(record)["cancellation_timeout"], "no_stream_event")
+        self.assertEqual(len(commands.cancel_calls), 1)
 
     def test_surviving_group_fails(self):
-        record = probes.probe_runner("claude", cancel_ctx(
-            CancelResult(True, False, -9, False, 2, 5.0)))
-        self.assertEqual(reasons(record)["cancellation_timeout"],
-                         "process group survived cancellation")
+        c, _ = cancel_ctx(CancelResult(True, False, -9, False, 2, 5.0, "{}\n", "", True, "event", 0.1))
+        record = probes.probe(ClaudeAdapter(), c)
+        self.assertEqual(reasons(record)["cancellation_timeout"], "process group survived cancellation")
 
-    def test_injected_runner_early_exit_fails(self):
-        commands = FakeCommands(claude_rules(**{"Cancellation probe": ok(CLAUDE_JSON)}))
-        record = probes.probe_runner("claude", ctx(commands))
+    def test_injected_runner_without_cancel_runner_fails(self):
+        c = ctx(FakeCommands(claude_rules()))
+        c.cancel_command = None
+        record = probes.probe(ClaudeAdapter(), c)
         self.assertEqual(statuses(record)["cancellation_timeout"], "fail")
+        self.assertEqual(reasons(record)["cancellation_timeout"], "no event aware cancel runner")
+
+    def test_codex_cancellation_uses_json_stream(self):
+        commands = FakeCommands(codex_rules())
+        record = probes.probe(CodexAdapter(), ctx(commands))
+        self.assertEqual(statuses(record)["cancellation_timeout"], "pass")
+        self.assertIn("--json", commands.cancel_calls[0][0])
 
 
 class DefaultCancelRunnerTests(unittest.TestCase):
-    def test_kills_whole_group_including_grandchild(self):
-        code = ("import subprocess, sys, time; "
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-                "time.sleep(60)")
+    def test_cancels_on_first_event_and_group_is_gone(self):
         start = time.monotonic()
-        res = default_cancel_runner([PY, "-c", code], 0.8)
+        res = default_cancel_runner([PY, "-c", ONE_EVENT_THEN_SLEEP], 30.0)
         self.assertLess(time.monotonic() - start, 15)
         self.assertTrue(res.started)
+        self.assertTrue(res.event_seen)
+        self.assertEqual(res.first_event, "system/init")
         self.assertFalse(res.exited_early)
         self.assertTrue(res.group_gone)
-        self.assertGreaterEqual(res.members_before, 2)
+        self.assertGreaterEqual(res.members_before, 1)
+        self.assertIsNotNone(res.event_seconds)
 
-    def test_early_exit_reported(self):
+    def test_kills_grandchildren_and_skips_non_event_lines(self):
+        res = default_cancel_runner([PY, "-c", GRANDCHILD], 30.0)
+        self.assertTrue(res.event_seen, res)
+        self.assertEqual(res.first_event, "thread.started")
+        self.assertFalse(res.exited_early)
+        self.assertTrue(res.group_gone)
+        self.assertGreaterEqual(res.members_before, 3)
+        self.assertIn("not json yet", res.stdout)
+
+    def test_exit_before_any_event_is_reported(self):
         res = default_cancel_runner([PY, "-c", "print('hi')"], 5.0)
         self.assertTrue(res.exited_early)
+        self.assertFalse(res.event_seen)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout.strip(), "hi")
+
+    def test_no_event_within_bound_is_killed(self):
+        start = time.monotonic()
+        res = default_cancel_runner([PY, "-c", "import time; time.sleep(60)"], 0.5)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertFalse(res.exited_early)
+        self.assertFalse(res.event_seen)
+        self.assertTrue(res.group_gone)
 
     def test_rejects_shell_string_and_missing_binary(self):
         with self.assertRaises(TypeError):
@@ -257,7 +412,7 @@ class DefaultCancelRunnerTests(unittest.TestCase):
 
     def test_probe_uses_group_runner_with_default_command_runner(self):
         c = ProbeContext(env={"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"},
-                         step_timeout=5.0, cancel_timeout=0.5)
+                         step_timeout=5.0)
         isolated = probes._isolated_context(ClaudeAdapter(), c)
         self.assertIsNotNone(isolated.cancel_command)
         self.assertEqual(isolated.cancel_command.keywords["env"]["HOME"], "/nonexistent")

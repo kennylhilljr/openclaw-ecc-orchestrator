@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -15,7 +16,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
-from .discovery import HttpGetter, HttpResponse, default_http_get, tls_context
+from .discovery import (HttpGetter, HttpResponse, default_http_get, error_body, tls_context,
+                        with_user_agent)
 
 
 class CommandResult(NamedTuple):
@@ -128,18 +130,43 @@ def default_command_runner(argv: list[str], timeout: float, cwd: str | None = No
 
 
 class CancelResult(NamedTuple):
-    """Outcome of starting a long task and cancelling it (see ``default_cancel_runner``)."""
+    """Outcome of the event triggered cancellation check (see ``default_cancel_runner``)."""
     started: bool                 # the process was spawned
-    exited_early: bool            # it exited on its own before the cancel point
+    exited_early: bool            # it exited on its own before the cancel could be sent
     returncode: int | None
     group_gone: bool              # after the kill, no process of its group remains
     members_before: int           # processes in the group just before the kill
     elapsed_seconds: float
     stdout: str = ""
     stderr: str = ""
+    event_seen: bool = False      # a stream event (JSON object line) arrived on stdout
+    first_event: str = ""         # its type label, e.g. "system/init" or "thread.started"
+    event_seconds: float | None = None   # seconds from start to the first event
 
 
-CancelRunner = Callable[..., CancelResult]  # (argv, cancel_after, cwd=None)
+CancelRunner = Callable[..., CancelResult]  # (argv, max_wait, cwd=None)
+
+_EOF = object()
+_MAX_CANCEL_CAPTURE = 64 * 1024
+
+
+def stream_event_label(line: str) -> str | None:
+    """Type label of a streaming JSON event line, or None if it is not one."""
+    text = (line or "").strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    label = kind if isinstance(kind, str) and kind else "event"
+    subtype = event.get("subtype")
+    if isinstance(subtype, str) and subtype:
+        label = "%s/%s" % (label, subtype)
+    return label[:80]
 
 
 def _group_members(pgid: int) -> int:
@@ -176,15 +203,37 @@ def _group_gone(pgid: int, wait: float) -> bool:
         time.sleep(0.1)
 
 
-def default_cancel_runner(argv: list[str], cancel_after: float, cwd: str | None = None,
+def _pump(stream, sink: list, q=None) -> None:
+    """Read ``stream`` line by line into ``sink`` (bounded); forward lines to ``q``."""
+    size = 0
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            if size < _MAX_CANCEL_CAPTURE:
+                sink.append(line[:_MAX_CANCEL_CAPTURE - size])
+                size += len(line)
+            if q is not None:
+                q.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        if q is not None:
+            q.put(_EOF)
+
+
+def default_cancel_runner(argv: list[str], max_wait: float, cwd: str | None = None,
                           env: Mapping[str, str] | None = None,
                           verify_wait: float = 5.0) -> CancelResult:
-    """Start ``argv`` in its own process group, cancel it after ``cancel_after``
-    seconds (SIGTERM to the group, SIGKILL after the grace period) and prove
-    that no process of the group survives.
+    """Event triggered cancellation: start ``argv`` (a CLI in its streaming
+    output mode) in its own process group, and as soon as the first stream
+    event line (a JSON object) arrives on stdout, cancel the whole group
+    (SIGTERM, SIGKILL after the grace period) and prove that no process of
+    the group survives, grandchildren included.
 
-    A process that exits on its own before the cancel point is reported with
-    ``exited_early``; that does not exercise cancellation.
+    Nothing is timed except the upper bound ``max_wait`` on waiting for that
+    first event. A process that exits before the cancel can be sent is
+    reported with ``exited_early``; one that emits no event within
+    ``max_wait`` is killed and reported with ``event_seen`` False.
     """
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         raise TypeError("argv must be a non-empty list of strings (no shell strings)")
@@ -197,26 +246,61 @@ def default_cancel_runner(argv: list[str], cancel_after: float, cwd: str | None 
     except (FileNotFoundError, PermissionError, NotADirectoryError):
         return CancelResult(False, False, None, True, 0, 0.0, "", "could not start process")
     pgid = proc.pid
-    try:
-        out, err = proc.communicate(timeout=cancel_after)
-        return CancelResult(True, True, proc.returncode, _group_gone(pgid, verify_wait), 0,
-                            round(time.monotonic() - started_at, 3), _decode(out), _decode(err))
-    except subprocess.TimeoutExpired as exc:
-        partial_out, partial_err = exc.stdout, exc.stderr
-    members = _group_members(pgid)
+    lines: queue.Queue = queue.Queue()
+    out: list[str] = []
+    err: list[str] = []
+    readers = [threading.Thread(target=_pump, args=(proc.stdout, out, lines), daemon=True),
+               threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True)]
+    for reader in readers:
+        reader.start()
+    deadline = started_at + float(max_wait)
+    label, event_at, exited, stdout_open = None, None, False, True
+    while True:
+        try:
+            item = lines.get(timeout=0.05)
+        except queue.Empty:
+            item = None
+        if item is _EOF:
+            stdout_open = False
+        elif item is not None:
+            label = stream_event_label(item)
+            if label:
+                event_at = time.monotonic()
+                exited = _exited_nowait(proc)   # the cancel is sent now, unless it already exited
+                break
+            continue
+        if _exited_nowait(proc):
+            # Look at lines that arrived just before the exit.
+            while label is None:
+                try:
+                    item = lines.get(timeout=0.2 if stdout_open else 0)
+                except queue.Empty:
+                    break
+                if item is _EOF:
+                    stdout_open = False
+                    continue
+                label = stream_event_label(item)
+                if label:
+                    event_at = time.monotonic()
+            exited = True
+            break
+        if time.monotonic() >= deadline:
+            break
+    members = 0 if exited else _group_members(pgid)
+    # Always signal the group: grandchildren may outlive an exited leader.
     _terminate_group(proc, float(KILL_GRACE_SECONDS))
-    try:
-        out, err = proc.communicate(timeout=float(KILL_GRACE_SECONDS))
-    except (subprocess.TimeoutExpired, ValueError):
-        out, err = partial_out, partial_err
-        for stream in (proc.stdout, proc.stderr):
-            try:
-                stream.close()
-            except (OSError, AttributeError):
-                pass
     gone = _group_gone(pgid, verify_wait)
-    return CancelResult(True, False, proc.returncode, gone, members,
-                        round(time.monotonic() - started_at, 3), _decode(out), _decode(err))
+    for reader in readers:
+        reader.join(float(KILL_GRACE_SECONDS))
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            stream.close()
+        except (OSError, AttributeError, ValueError):
+            pass
+    return CancelResult(True, exited, proc.returncode, gone, members,
+                        round(time.monotonic() - started_at, 3), "".join(out), "".join(err),
+                        label is not None, label or "",
+                        round(event_at - started_at, 3) if event_at is not None else None)
 
 
 def default_write_file(path: str, content: str) -> None:
@@ -227,14 +311,14 @@ def default_write_file(path: str, content: str) -> None:
 def default_http_post(url: str, headers: Mapping[str, str], body: dict,
                       timeout: float) -> HttpResponse:
     data = json.dumps(body).encode("utf-8")
-    hdrs = {"Content-Type": "application/json", **dict(headers)}
+    hdrs = with_user_agent({"Content-Type": "application/json", **dict(headers)})
     request = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout,  # noqa: S310
                                     context=tls_context()) as resp:
             return HttpResponse(resp.status, resp.read(_MAX_CAPTURE).decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        return HttpResponse(exc.code, "")
+        return HttpResponse(exc.code, error_body(exc))
 
 
 @dataclass
@@ -245,15 +329,15 @@ class ProbeContext:
     env: Mapping[str, str] = field(default_factory=lambda: os.environ)
     clock: Callable[[], float] = time.time
     step_timeout: float = 120.0
-    cancel_timeout: float = 5.0
     make_workdir: Callable[[], str] = lambda: tempfile.mkdtemp(prefix="runner-probe-")
     cleanup_workdir: Callable[[str], None] = lambda path: shutil.rmtree(path, ignore_errors=True)
     model: str | None = None            # model id (catalog) or alias (cli) to exercise
     policy: Mapping[str, Any] = field(default_factory=dict)
     certification_ttl_seconds: float = 7 * 24 * 3600
-    # Cancellation runner proving process-group cleanup. None: the probe uses
-    # ``run_command`` with ``cancel_timeout`` (injected runners), or
-    # ``default_cancel_runner`` with the minimal env (default command runner).
+    # Event triggered cancellation runner proving process group cleanup
+    # (``default_cancel_runner`` with the minimal env when the default command
+    # runner is used). Injected command runners must inject one too, or the
+    # cancellation check fails: a finished command cannot be cancelled.
     cancel_command: CancelRunner | None = None
     write_file: Callable[[str, str], None] = default_write_file
     # Progress hook ``on_step(check_name, phase)``; phase is "start" or the

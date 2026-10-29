@@ -3,6 +3,9 @@
 import json
 import os
 import unittest
+from unittest import mock
+
+from openclaw_ecc_orchestrator.plugin.inbox import DecisionInbox
 
 try:
     from . import test_cli_support as S
@@ -150,6 +153,21 @@ class ApprovalTest(S.CliTestBase):
         self.assertEqual([p["request_id"] for p in pending], [request_id])
         self.ok(self.reviewed(*self.approve_args(request_id)))
         self.assertEqual(self.ok(self.cli("approvals", "list"))["data"]["pending"], [])
+
+    def test_approve_coexists_with_the_standing_processor(self):
+        head, request_id = self.to_review()
+        real = DecisionInbox.process
+
+        def standing_processor_first(inbox, dry_run=False, wait=0.0):
+            real(DecisionInbox(inbox.inbox_dir, inbox.broker))  # another consumer takes every file
+            return []
+
+        with mock.patch.object(DecisionInbox, "process", standing_processor_first):
+            doc = self.ok(self.reviewed(*self.approve_args(request_id)))
+        self.assertTrue(any("standing inbox processor" in w for w in doc["warnings"]), doc["warnings"])
+        self.assertEqual(doc["data"]["result"]["decision"], "approved")
+        resolved = [e for e in self.events() if e["type"] == "approval.resolved"]
+        self.assertEqual(len(resolved), 1)
 
     def test_rejected_approval_blocks_merge(self):
         head, request_id = self.to_review()

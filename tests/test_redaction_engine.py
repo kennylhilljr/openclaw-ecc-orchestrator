@@ -120,6 +120,63 @@ class EnginePatternTests(unittest.TestCase):
         self.assertIs(process_redact.looks_secret_name, redaction.looks_secret_name)
 
 
+class JsonLineTests(unittest.TestCase):
+    """Live finding (rm-m0b M0-02, 2026-10-22): masking "session_id": "<uuid>" together with its quotes, and
+    "thinking_tokens": null as a value, left Claude's result line invalid JSON in the log. The verdict
+    inside it was then reported as "no ECC_VERIFY line" and its cost as $0.00."""
+
+    RESULT = {"type": "result", "subtype": "success", "is_error": False, "stop_reason": "end_turn",
+              "session_id": "0f9c2d1e-7a3b-4c5d-9e8f-123456789abc", "total_cost_usd": 0.4473,
+              "usage": {"input_tokens": 24, "output_tokens": 9550,
+                        "output_tokens_details": {"thinking_tokens": None}},
+              "modelUsage": {"claude-opus": {}},
+              "result": 'Checked.\nECC_VERIFY {"verdict": "pass", "head": "2f6abdbb5c78", "checks": []}'}
+
+    def test_redacted_result_line_stays_json_and_parses(self):
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        line = json.dumps(self.RESULT, separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertNotIn(self.RESULT["session_id"], out)
+            self.assertEqual(doc["session_id"], REDACTED)
+            parsed = ClaudeAdapter().parse_output(out)
+            self.assertIn("ECC_VERIFY", parsed["text"])
+            self.assertEqual(parsed["cost_usd"], 0.4473)
+
+    def test_counter_closing_an_object_stays_json(self):
+        """Live finding (rm-m0d plan check, 2026-10-23): "thinking_tokens":15327} was masked with its
+        brace, the result line stopped being JSON and the plan check read "no ECC_REVIEW line"."""
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        result = dict(self.RESULT, usage={"output_tokens": 15327,
+                                          "output_tokens_details": {"thinking_tokens": 15327}},
+                      result='Checked.\nECC_REVIEW {"verdict": "approved", "head": "2f6abdbb5c78", "findings": []}')
+        line = json.dumps(result, separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertEqual(doc["usage"]["output_tokens_details"], {"thinking_tokens": 15327})
+            self.assertIn("ECC_REVIEW", ClaudeAdapter().parse_output(out)["text"])
+
+    def test_escaped_quotes_inside_a_json_string_stay_escaped(self):
+        """Live finding (rm-m0f M0-20, 2026-10-23): inside Claude's result string,
+        `SecretState.INVALID = \\"invalid\\"` and `test_secrets.py:62\\"` lost the backslash that
+        escapes a quote, the line stopped being JSON and six reviews read "no ECC_REVIEW line"."""
+        from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
+        text = ('`SecretState.INVALID = "invalid"` matches the LLD.\n'
+                'ECC_REVIEW {"verdict": "approved", "head": "2f6abdbb5c78", "findings": [{"severity": "minor", '
+                '"where": "tests/unit/platform/test_secrets.py:62", "what": "order", "api_key": "abc123xyz"}]}')
+        line = json.dumps(dict(self.RESULT, result=text), separators=(",", ":"))
+        for out in (Redactor().redact(line), redaction.redact_text(line)):
+            doc = json.loads(out)
+            self.assertNotIn("abc123xyz", out)
+            self.assertIn("ECC_REVIEW", ClaudeAdapter().parse_output(out)["text"])
+            self.assertEqual(doc["result"].splitlines()[-1][:11], "ECC_REVIEW ")
+
+    def test_quoted_secret_value_is_masked_inside_its_quotes(self):
+        out = Redactor().redact('{"api_key": "abc123xyz", "n": 1}')
+        self.assertNotIn("abc123xyz", out)
+        self.assertEqual(json.loads(out), {"api_key": REDACTED, "n": 1})
+
+
 class ArgvRedactionTests(unittest.TestCase):
     def test_secret_flags(self):
         argv = ["tool", "--token", "hunter2hunter2xyz", "--password", "Sup3rS3cretPass", "--api-key=abcdef1",
@@ -200,6 +257,41 @@ class SupervisorRedactionTests(unittest.TestCase):
             with open(os.path.join(d, "s.json")) as fh:
                 self.assertNotIn(secret, fh.read())
             self.assertNotIn(secret, json.dumps(res))
+
+
+class BranchNameTests(unittest.TestCase):
+    """Orchestrator unit branches are judged segment by segment (smoke run
+    smoke-20261019T005138Z failed handoff_valid with secret_detected on
+    commit.branch before this rule)."""
+
+    def test_timestamped_branches_are_not_secrets(self):
+        flagged = []
+        for hour in range(24):
+            for minute in range(60):
+                for second in range(0, 60, 7):
+                    branch = f"ecc/smoke-20261019T{hour:02d}{minute:02d}{second:02d}Z/smoke"
+                    if contains_secret(branch):
+                        flagged.append(branch)
+        self.assertEqual(flagged, [])
+        for form in ("refs/heads/ecc/smoke-20261019T005138Z/smoke", "branch=ecc/smoke-20261019T005138Z/smoke",
+                     "ecc/run-20261019-homesentinel-m0/settings-loader"):
+            self.assertFalse(contains_secret(form), form)
+        self.assertEqual(redaction.redact_text("pushed ecc/smoke-20261019T005138Z/smoke ok"),
+                         "pushed ecc/smoke-20261019T005138Z/smoke ok")
+
+    def test_random_segments_inside_a_branch_are_still_secrets(self):
+        key = SAMPLES["high_entropy"] + "Ab12"
+        for text in ("ecc/run1/" + key, "ecc/" + key + "/u1", "ecc/a/b" + key):
+            self.assertTrue(contains_secret(text), text)
+            self.assertIn(REDACTED, redaction.redact_text(text))
+        for name, value in SAMPLES.items():
+            self.assertTrue(contains_secret("ecc/run1/u1 " + value), name)
+
+    def test_handoff_with_timestamped_branch_validates(self):
+        from openclaw_ecc_orchestrator.handoffs.redaction import scan_strings
+        doc = {"commit": {"sha": "dba11d66970f4aed210c325c27a4116711c3a613",
+                          "branch": "ecc/smoke-20261019T005138Z/smoke", "worktree": "."}}
+        self.assertEqual(scan_strings(doc), [])
 
 
 if __name__ == "__main__":

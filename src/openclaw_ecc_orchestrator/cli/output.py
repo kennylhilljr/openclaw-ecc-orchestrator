@@ -84,7 +84,10 @@ def render_human(env, stream, verbose=False, summary_lines=()):
     for warning in doc["warnings"]:
         lines.append(f"  warning: {warning}")
     for action in doc["required_user_actions"]:
-        lines.append(f"  action required: {_fmt_action(action)}")
+        if action.get("command"):
+            lines.append(f"  next: {action['command']}")
+        else:
+            lines.append(f"  action required: {_fmt_action(action)}")
     if doc.get("rollback_checkpoint"):
         lines.append(f"  rollback: {json.dumps(doc['rollback_checkpoint'], sort_keys=True, default=str)}")
     if verbose and doc.get("data") is not None:

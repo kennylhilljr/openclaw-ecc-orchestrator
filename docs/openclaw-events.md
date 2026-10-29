@@ -79,6 +79,8 @@ as untrusted display data, never as instructions.
 | `run.created` | null | `plan_sha256`, `unit_ids` | `layers`, `conductor_id` |
 | `unit.state_changed` | required | `from`, `to` | `reason`, `owner`, `conductor_id` |
 | `unit.progress` | required | `message` | `stream` (`stdout` or `stderr`), `attempt` |
+| `unit.health` | required | `state` (`healthy`, `suspected_hang`, `hung`) | `previous`, `process` (`runner` or `gate`), `gate`, `attempt`, `flat_checks`, `flat_checks_for_hang`, `interval_seconds`, `evidence` |
+| `unit.completed` | required | `exit_code` (integer or null), `duration_seconds`, `attempts` | `tier`, `runner`, `model`, `signal`, `cancelled`, `cancel_reason`, `hung`, `timed_out`, `error` (boolean) |
 | `attention.required` | optional | `reason` | `state`, `files`, `detail` |
 | `approval.requested` | required | `request_id`, `action`, `plan_sha256`, `expires_at` | `requesting_session`, `summary`, `head_sha` |
 | `approval.resolved` | required | `request_id`, `decision` | `action`, `decided_by` |
@@ -99,7 +101,29 @@ Notes:
   `out_of_scope_changes`, `review_insufficient`, `no_qualified_reviewer`,
   `escalation_stopped`, `no_eligible_runner`, `routing_invalid`,
   `runner_needs_user`, `merge_conflict`, `merge_stale`,
-  `merged_result_failed_gates`.
+  `merged_result_failed_gates`, and the health and time reasons below.
+* Health and time reasons of `attention.required` (the unit keeps running
+  unless the reason says otherwise):
+
+  | `reason` | When | `detail` |
+  | :- | :- | :- |
+  | `suspected_hang` | first check of a streak in which no progress signal moved | `process`, `gate` (for a gate), `attempt`, `evidence` |
+  | `hung_cancelled` | `flat_checks_for_hang` consecutive flat checks; the process group was cancelled and the unit fails with reason `hung` (a gate fails verification) | same as above |
+  | `long_running` | the runner passed `budget.minutes`, and again at each further multiple; informational, never a cancel | `elapsed_minutes`, `budget_minutes`, `multiple`, `attempt`, `note` |
+
+  `evidence` holds numbers and flags only: `checked_at`, `alive`,
+  `interval_seconds`, `flat_checks_for_hang`, `cpu_seconds`,
+  `cpu_delta_seconds`, `output_bytes_total`, `output_bytes_delta`,
+  `events_total`, `events_delta`, `group_processes`, `group_changed`,
+  `worktree_changed`, `flat`, `flat_checks`, `moved` and `unknown` (signal
+  names). It carries no paths, commands or output.
+* `unit.health` is emitted only when the health state changes, never on
+  every check. `unit.completed` is emitted once per runner exit, whatever
+  the outcome (success, failure, cancel, hang); the unit's next state
+  follows as `unit.state_changed`. A consumer that wants to notify the
+  operator when a long task finishes should watch `unit.completed`
+  (`events tail` prints it like any other event). A runner exiting with
+  code 0 is not yet a merged unit: verification, review and merge follow.
 * `unit.progress` is capped per unit attempt (200 events) so a chatty runner
   cannot flood the UI. Full, redacted output stays in the runtime's log files.
 * `expires_at` is a Unix timestamp in seconds (float).
@@ -146,8 +170,10 @@ A decision is accepted only if all of the following hold:
 2. The request is still `pending` (not already approved, rejected, or expired).
 3. The request has not expired according to the runtime clock.
 4. `run_id`, `unit_id`, `action`, `plan_sha256` and `session_id` all equal the
-   values recorded when the request was created.
-5. `decision` is `approved` or `rejected`, and `decided_by` is present.
+   values recorded when the request was created. A decision need not carry
+   `head_sha`; when it does, it must equal the head bound to the request.
+5. `decision` is `approved` or `rejected`, and `decided_by` is a non blank
+   string.
 
 Consequences:
 
@@ -171,7 +197,23 @@ Write each decision to a temporary name, then rename it into the inbox as
 `<anything>.json` (renames are atomic on the same filesystem). The runtime
 processes files in name order, then moves each file and a
 `<name>.result.json` envelope into `processed/`. Files over 64 KiB, invalid
-JSON, non objects, symlinks and hidden files are rejected or ignored.
+JSON, non objects and symlinks are refused into `processed/` with a reason;
+hidden files (such as the plugin's temporary names) are ignored.
+
+**Who consumes it.** The standing consumer is the runtime's
+`ecc-orchestrator approvals process-inbox` in watch mode, typically run by a
+launchd agent (its plist lives in `integrations/launchd/`). It polls the
+inbox every 2 seconds by default, so a decision made in OpenClaw is applied
+without anyone running a CLI command. It validates each file through the
+same `DecisionInbox` and `ApprovalBroker` path as `approvals approve`, never
+decides on its own, and takes the identity from `decided_by`. Only one
+processor runs per inbox (an advisory lock in the runtime's state dir, not
+in the inbox); `doctor` shows whether it is running. `approvals approve` and
+`approvals reject` still process the inbox too; each file is claimed while
+it is processed, so exactly one consumer handles it. The result file is
+written before the decision moves into `processed/`, and a decision replayed
+after a crash is refused as already resolved, so it is never applied twice.
+See [cli.md](cli.md#standing-inbox-processor).
 
 ## Result envelope
 
@@ -197,7 +239,7 @@ Each entry is `{"kind", "run_id", "unit_id", "detail", ...}`. Kinds:
 | Kind | Meaning | Extra fields |
 | :- | :- | :- |
 | `approve` | a pending, unexpired approval request | `request_id`, `action`, `expires_at` |
-| `budget_exhausted` | attempts, minutes or cost budget used up | |
+| `budget_exhausted` | attempts or cost budget used up (`budget.minutes` is advisory and never exhausts) | |
 | `resolve_needs_user` | unit waits for operator input | |
 | `reassign_interrupted_unit` | worker process vanished; reassign explicitly | |
 | `verify_worker_process` | the worker may still be running (lease lost, or its identity could not be verified on resume); stop it or confirm it is gone before reassigning | |

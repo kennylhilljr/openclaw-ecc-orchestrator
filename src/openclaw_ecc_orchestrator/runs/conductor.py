@@ -14,9 +14,20 @@ Lifecycle of one unit:
    the runner with `ECC_HANDOFF_PATH` (where the runner writes its handoff)
    and `ECC_UNIT_ID` in its environment.
 3. `wait_unit` renews the lease while the runner works, then: marks the
-   process finished, compares shared git state, records usage, validates
-   the handoff (`schemas.validate_handoff`), verifies (gates, actual diff
-   against scope, re-classification) and records the escalation outcome.
+   process finished (and emits `unit.completed`), compares shared git state,
+   records usage, validates the handoff (`schemas.validate_handoff`),
+   verifies (gates, actual diff against scope, re-classification) and
+   records the escalation outcome.
+
+Runners and gates have no wall clock limit. While they run, the supervisor
+checks their health every `health.interval_seconds` (`process.health`); only
+`health.flat_checks_for_hang` consecutive checks without any progress signal
+cancel the process group (reason `hung`). The first flat check emits
+`attention.required` (`suspected_hang`), a confirmed hang emits
+`attention.required` (`hung_cancelled`), and `unit.health` is emitted on each
+health state change. `budget.minutes` is advisory: a runner that passes it
+gets `attention.required` (`long_running`) once per multiple of the budget
+and is never cancelled for it.
 4. `record_review` accepts only a review that names the verified head and
    meets the review tier and independence for the actual diff, then
    requests a merge approval bound to that head.
@@ -24,28 +35,32 @@ Lifecycle of one unit:
    consumes the approval through the broker.
 """
 
+import contextlib
 import copy
 import json
 import os
 import threading
 import time
 
+from .. import schemas
 from ..gates.runner import run_gates
 from ..merge_queue.conflicts import diff_stats, out_of_scope_changes
 from ..merge_queue.dispatch import Dispatcher
 from ..merge_queue.queue import approval_request_id
 from ..plugin.summary import summarize_required_user_actions
+from ..process import health as H
 from ..routing.classify import classify
-from ..routing.escalation import AttemptOutcome, EscalationController
+from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.registry import model_family
-from ..worktrees.git import git_out, rev_exists
+from ..worktrees.git import git_out, rev_exists, run_git
+from . import repair as R
 from . import state as S
 from .envelope import SCHEMA_VERSION, check, envelope
-from .store import StoreError
+from .store import StoreError, iso
 
 try:  # provided by the worktrees package; optional until it lands
-    from ..worktrees.guard import diff_shared_git_state, snapshot_shared_git_state
+    from ..worktrees.guard import diff_shared_git_state, refs_only, snapshot_shared_git_state, target_move_paths
     DEFAULT_GIT_STATE_GUARD = (snapshot_shared_git_state, diff_shared_git_state)
 except ImportError:  # pragma: no cover - depends on the installed tree
     DEFAULT_GIT_STATE_GUARD = None
@@ -53,6 +68,42 @@ except ImportError:  # pragma: no cover - depends on the installed tree
 MAX_PROGRESS_EVENTS = 200
 MAX_HANDOFF_BYTES = 256 * 1024
 HANDOFF_ENV = "ECC_HANDOFF_PATH"
+# Placeholders a runner command may carry; start_unit replaces them with the
+# attempt's handoff file and its folder. CLI runners cannot always read their
+# environment (Claude print mode denies printenv) or write outside the
+# worktree, so the literal path goes in the prompt and the folder is granted
+# with --add-dir (live finding, run rmcp-m0d, 2026-10-19).
+HANDOFF_PATH_TOKEN = "{ECC_HANDOFF_PATH}"
+HANDOFF_DIR_TOKEN = "{ECC_HANDOFF_DIR}"
+# Consecutive requests for changes from one reviewer role before the unit
+# stops for the owner instead of trying again.
+REJECTION_CAP = 3
+
+
+def runner_usage(stdout):
+    """``{"cost_usd": x}`` from a coding CLI's own JSON result line (Claude's
+    ``total_cost_usd``), read from the raw stdout inside the process handle.
+    Agents rarely fill ``usage`` in their handoff, so without this every unit
+    reported 0.0 (live finding, rm-m0f)."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{") or "total_cost_usd" not in line:
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        value = doc.get("total_cost_usd") if isinstance(doc, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return {"cost_usd": float(value)}
+    return {}
+
+
+def fill_handoff_tokens(argv, handoff_path):
+    """Return argv with the handoff placeholders replaced (no-op without them)."""
+    folder = os.path.dirname(handoff_path)
+    return [str(a).replace(HANDOFF_PATH_TOKEN, handoff_path).replace(HANDOFF_DIR_TOKEN, folder)
+            for a in argv]
 UNIT_ENV = "ECC_UNIT_ID"
 _UNSET = object()
 # Failures that leave durable state untouched and are worth retrying.
@@ -61,10 +112,20 @@ TRANSIENT_ERRORS = (OSError, StoreError, TimeoutError)
 
 class Conductor:
     def __init__(self, conductor_id, *, manager, worktrees, supervisor, queue, broker=None, emitter=None,
-                 repo_checks=None, target_branch="main", log_root, runner_timeout=3600.0, gate_timeout=600.0,
+                 repo_checks=None, target_branch="main", log_root, runner_timeout=None, gate_timeout=None,
                  runner_env_allow=(), protected_globs=(), clock=time.time, policy=None, certified_runners=None,
                  catalog=None, breaker=None, tier_costs=None, lease_renew_interval=10.0,
-                 git_state_guard=_UNSET):
+                 git_state_guard=_UNSET, health_override=None, auto_retry=False, handoff_repair_turns=0,
+                 repair_timeout=900.0, skills_pass=None, skills_pass_argv=None, lessons_state_dir=None):
+        """`runner_timeout` and `gate_timeout` are optional hard wall clock
+        ceilings in seconds, None (off) by default; setting them is
+        discouraged because health monitoring already stops hung processes.
+        `health_override` (a `process.health.HealthSettings`) replaces the
+        policy and unit health settings; tests use it for short intervals.
+        `auto_retry` returns a failed unit to `ready` when its escalation
+        controller allows another attempt (TEAM-DELIVERY-v2 5.1);
+        `handoff_repair_turns` allows that many handoff-only repair turns per
+        attempt (5.2), each limited to `repair_timeout` seconds."""
         self.id = conductor_id
         self.manager = manager
         self.worktrees = worktrees
@@ -88,10 +149,23 @@ class Conductor:
         self.lease_renew_interval = float(lease_renew_interval)
         # (snapshot(repo) -> dict, diff(before, after, allow_refs=()) -> list[str]) or None
         self.git_state_guard = DEFAULT_GIT_STATE_GUARD if git_state_guard is _UNSET else git_state_guard
+        self.health_override = health_override
+        self.auto_retry = bool(auto_retry)
+        self.handoff_repair_turns = int(handoff_repair_turns)
+        self.repair_timeout = float(repair_timeout)
+        # team.json "skills_pass" (TEAM-DELIVERY v6 4.5); `skills_pass_argv(prompt, path)`
+        # replaces the Claude command line in tests.
+        self.skills_pass = dict(skills_pass) if isinstance(skills_pass, dict) else None
+        self.skills_pass_argv = skills_pass_argv
+        # TEAM-DELIVERY v7 4.6: failures and coders' `Lesson:` notes feed the run's lessons log.
+        self.lessons_state_dir = lessons_state_dir
         self.dispatcher = Dispatcher(manager)
         self._handles = {}
         self._cancel_terminal = {}
         self._handoff_paths = {}
+        self._log_paths = {}
+        self._repair_argv = {}
+        self._repairs_used = {}
         self._git_before = {}
         self._stages = {}
         self._controllers = {}
@@ -99,7 +173,7 @@ class Conductor:
         self._lock = threading.Lock()
 
     # == run level ==
-    def create_run(self, plan, run_id=None, dry_run=False, metadata=None):
+    def create_run(self, plan, run_id=None, dry_run=False, metadata=None, replace=False):
         repo = self.worktrees.repo
         if not rev_exists(repo, f"refs/heads/{self.target}"):
             return envelope("run.create", ok=False, checks=[check("target_branch_exists", False, self.target)])
@@ -107,7 +181,7 @@ class Conductor:
         run_metadata = copy.deepcopy(metadata or {})
         run_metadata.update({"base_commit": base, "target_branch": self.target})
         return self.manager.create_run(plan, self.id, run_id=run_id, dry_run=dry_run, policy=self.policy,
-                                       metadata=run_metadata)
+                                       metadata=run_metadata, replace=replace)
 
     def resume(self, run_id, dry_run=False):
         return self.manager.resume(run_id, self.id, dry_run=dry_run)
@@ -130,19 +204,97 @@ class Conductor:
         return summarize_required_user_actions(run, pending, queue_state=self.queue.state(), now=self.clock())
 
     def _attention(self, run_id, unit_id, reason, **data):
+        return self._emit("attention.required", run_id, unit_id, dict(data, reason=reason))
+
+    def _emit(self, event_type, run_id, unit_id, data):
         if self.emitter is None:
             return []
         try:
-            self.emitter.emit("attention.required", run_id, unit_id=unit_id, data=dict(data, reason=reason))
+            self.emitter.emit(event_type, run_id, unit_id=unit_id, data=data)
         except Exception as exc:  # emission must never break the lifecycle
             return [f"event emission failed: {exc}"]
         return []
 
+    # == health ==
+    def health_settings(self, unit=None, policy=_UNSET):
+        """Health settings for a unit: repository policy, then the unit's own
+        `health` block, then the conductor's `health_override`."""
+        policy = self.policy if policy is _UNSET else policy
+        try:
+            return H.resolve_health_settings(policy, unit, self.health_override)
+        except H.HealthSettingsError:  # validated at create_run; never fail open or closed here
+            return H.HealthSettings()
+
+    def _health_listener(self, run_id, unit_id, attempt, settings, process="runner", gate=None, budget=None):
+        """Callback for every health check of one process: emits
+        `unit.health` on state changes, `attention.required` for
+        `suspected_hang`, `hung_cancelled` and (runners) `long_running`."""
+        notified = {"long_running": 0}
+
+        def on_check(result):
+            base = {"process": process, "attempt": attempt}
+            if gate is not None:
+                base["gate"] = gate
+            if result.changed:
+                self._emit("unit.health", run_id, unit_id, dict(
+                    base, state=result.state, previous=result.previous_state, flat_checks=result.flat_checks,
+                    flat_checks_for_hang=settings.flat_checks_for_hang,
+                    interval_seconds=settings.interval_seconds, evidence=result.evidence))
+                if process == "runner":
+                    try:
+                        self.manager.annotate_unit(run_id, self.id, unit_id, "health", {
+                            "state": result.state, "attempt": attempt, "flat_checks": result.flat_checks,
+                            "interval_seconds": settings.interval_seconds,
+                            "flat_checks_for_hang": settings.flat_checks_for_hang,
+                            "checked_at": result.evidence.get("checked_at")})
+                    except Exception:  # noqa: BLE001 - status only; the lease may be elsewhere
+                        pass
+                if result.state == H.SUSPECTED_HANG:
+                    self._attention(run_id, unit_id, "suspected_hang", detail=dict(base, evidence=result.evidence))
+                elif result.state == H.HUNG:
+                    self._attention(run_id, unit_id, "hung_cancelled", detail=dict(base, evidence=result.evidence))
+            if budget and budget.get("seconds"):
+                total = budget["used_seconds"] + float(result.elapsed_seconds or 0.0)
+                multiple = int(total // budget["seconds"])
+                if multiple >= 1 and multiple > notified["long_running"]:
+                    notified["long_running"] = multiple
+                    self._attention(run_id, unit_id, "long_running", detail=dict(
+                        base, elapsed_minutes=round(total / 60.0, 2), budget_minutes=budget["minutes"],
+                        multiple=multiple, note="budget.minutes is advisory; the runner keeps running"))
+        return on_check
+
+    def _minutes_budget(self, unit, plan_unit):
+        """Advisory minutes budget of a unit (per unit, all attempts), tightened
+        by the policy's `max_minutes_per_unit` when present."""
+        budget = (plan_unit or {}).get("budget") or unit.get("budget") or {}
+        minutes = budget.get("minutes", budget.get("max_minutes"))
+        ceiling = ((self.policy or {}).get("budget") or {}).get("max_minutes_per_unit")
+        values = [float(v) for v in (minutes, ceiling)
+                  if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+        if not values:
+            return None
+        limit = min(values)
+        return {"minutes": limit, "seconds": limit * 60.0,
+                "used_seconds": float(unit.get("minutes_used") or 0.0) * 60.0}
+
     # == gates ==
-    def gate(self, unit, worktree):
+    def gate(self, unit, worktree, run_id=None):
+        """Run the unit's gates in `worktree`, health monitored. With
+        `run_id`, health changes of a gate command are emitted as events."""
+        settings = self.health_settings(unit)
+        on_health = None
+        if run_id is not None and unit.get("id"):
+            listeners = {}
+
+            def on_health(name, result):
+                if name not in listeners:
+                    listeners[name] = self._health_listener(run_id, unit["id"], None, settings, process="gate",
+                                                            gate=name)
+                listeners[name](result)
         return run_gates(unit, worktree, repo_checks=self.repo_checks, supervisor=self.supervisor,
                          protected_globs=self.protected_globs, timeout=self.gate_timeout,
-                         log_dir=os.path.join(self.log_root, "gates"), clock=self.clock)
+                         log_dir=os.path.join(self.log_root, "gates"), clock=self.clock,
+                         health=settings, on_health=on_health)
 
     # == routing ==
     def _classify(self, run, unit_id, stats=None, previous_attempt_failed=False):
@@ -163,14 +315,7 @@ class Conductor:
         ctrl = EscalationController(self.manager.plan_unit(run, unit_id), classification,
                                     tier_costs=self.tier_costs, clock=self.clock, policy=self.policy)
         record = (run["units"][unit_id].get("annotations") or {}).get("escalation") or {}
-        for attempt in record.get("attempts") or []:
-            if ctrl.finished:
-                break
-            ctrl.record(AttemptOutcome(
-                passed=bool(attempt.get("passed")), objective_failure=bool(attempt.get("objective_failure")),
-                cost_usd=float(attempt.get("cost_usd") or 0.0), elapsed_seconds=attempt.get("elapsed_seconds"),
-                runner=attempt.get("runner"), model=attempt.get("model"), usage=attempt.get("usage"),
-                reason=attempt.get("reason") or ""))
+        replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]))
         with self._lock:
             self._controllers[key] = ctrl
         return ctrl
@@ -230,10 +375,261 @@ class Conductor:
             state = self.manager.load(run_id)["units"][unit_id]["state"]
             if S.NEEDS_USER in S.TRANSITIONS.get(state, ()):
                 self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="escalation_stopped")
+        elif not passed and self.auto_retry and nxt["action"] not in ("done",):
+            state = self.manager.load(run_id)["units"][unit_id]["state"]
+            if state == S.FAILED:
+                self.manager.transition(run_id, self.id, unit_id, S.READY, reason=f"retry:{reason}")
+                self._emit("unit.retry_scheduled", run_id, unit_id,
+                           {"previous_reason": reason, "next_action": nxt.get("action"), "tier": nxt.get("tier")})
         return nxt
 
+    # == repair support (TEAM-DELIVERY-v2 section 5) ==
+    def return_for_changes(self, run_id, unit_id, reason, evidence):
+        """A review, verification or merge found the work wanting (TEAM-DELIVERY-v2
+        4.1 and 5.1): the attempt that passed the gates is re-recorded as an
+        objective failure, so the escalation controller decides the next step
+        (repair, escalate or stop) within the unit's budget, and the unit goes
+        back to `ready` (reason `review:<reason>`) with the evidence for the
+        failure brief. The worktree and branch stay."""
+        op = "unit.return_for_changes"
+        run = self.manager.load(run_id)
+        unit = run["units"][unit_id]
+        record = copy.deepcopy((unit.get("annotations") or {}).get("escalation") or {})
+        attempts = record.get("attempts") or []
+        if attempts and attempts[-1].get("passed"):
+            attempts[-1].update(passed=False, objective_failure=True, reason=reason)
+            record["final"] = None
+            self.manager.annotate_unit(run_id, self.id, unit_id, "escalation", record)
+        with self._lock:
+            self._controllers.pop((run_id, unit_id), None)
+        self._note_failure(run_id, unit_id, reason, evidence)
+        streak = 0
+        for attempt in reversed(attempts):
+            if attempt.get("passed") or attempt.get("reason") != reason:
+                break
+            streak += 1
+        if reason.endswith("_changes_requested") and streak >= REJECTION_CAP:
+            # The same reviewer role keeps asking for changes: another attempt
+            # rarely helps, so the owner reads the findings (live finding, rm-m0f
+            # M0-20: seven attempts on six pr_reviewer rejections).
+            return self._needs_user(run_id, unit_id, "repeated_rejections",
+                                    f"{reason} {streak} times in a row", op)
+        ctrl = self._controller(self.manager.load(run_id), unit_id)
+        nxt = ctrl.next_action() if ctrl is not None else {"action": "stop", "reason": "no controller"}
+        if nxt["action"] in ("stop", "done"):
+            return self._needs_user(run_id, unit_id, "escalation_stopped",
+                                    f"{reason}; escalation: {nxt.get('reason')}", op)
+        res = self.manager.transition(run_id, self.id, unit_id, S.READY, reason=f"review:{reason}")
+        if not res["ok"]:
+            return res
+        self._emit("unit.returned_for_changes", run_id, unit_id,
+                   {"reason": reason, "next_action": nxt.get("action"), "tier": nxt.get("tier")})
+        return envelope(op, ok=True, changed=True, checks=[check("returned_to_coder", True, reason)],
+                        data={"next_action": nxt})
+
+    def _lessons(self, run_id):
+        if not self.lessons_state_dir:
+            return None
+        from ..team.learning import Lessons
+        return Lessons(self.lessons_state_dir, run_id)
+
+    def _note_failure(self, run_id, unit_id, reason, evidence, fix=None):
+        """Record what the next attempt needs to know (`last_failure`)."""
+        log = self._lessons(run_id)
+        if log is not None:
+            from ..team.learning import capture_failure
+            try:
+                capture_failure(log, unit_id, reason, evidence, at=iso(self.clock()))
+            except OSError:
+                pass
+        try:
+            unit = self.manager.load(run_id)["units"][unit_id]
+            self.manager.annotate_unit(run_id, self.id, unit_id, "last_failure", {
+                "reason": reason, "attempt": unit.get("attempts"), "evidence": evidence, "fix": fix,
+                "at": iso(self.clock())})
+        except TRANSIENT_ERRORS:
+            pass
+
+    def _stop_runner(self, run_id, unit_id, unit, stop, log_text, data):
+        """Section 5.3: a failure retrying cannot fix. The unit goes to
+        `needs_user` with the exact fix and the escalation record is not
+        charged."""
+        op = "unit.complete"
+        kind, detail = stop
+        runner = (unit.get("routing") or {}).get("runner")
+        fix = R.stop_fix(kind, runner)
+        self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason=kind)
+        self._note_failure(run_id, unit_id, kind, R.failure_evidence(kind, log_text=log_text), fix=fix)
+        warnings = self._attention(run_id, unit_id, kind, detail=detail, fix=fix)
+        return envelope(op, ok=False, changed=True, checks=[check("runner_ready", False, f"{kind}: {detail}")],
+                        warnings=warnings, data=data,
+                        required_user_actions=[{"kind": "resolve_needs_user", "run_id": run_id, "unit_id": unit_id,
+                                                "detail": fix}])
+
+    def _handoff_problems(self, run, unit_id, doc, missing):
+        """(problems, repairable). Only a missing, unreadable or malformed
+        handoff is repairable by a handoff-only turn. Semantic violations
+        (claimed success with failing commands, files outside the scope) are
+        about the work itself and never go to a repair turn, which could
+        otherwise paper over them; a valid handoff that honestly reports
+        failed, partial or blocked work is not a handoff problem at all."""
+        if missing:
+            return [missing], missing != "handoff_too_large"
+        report = schemas.validate_handoff(doc, self.manager.plan_unit(run, unit_id))
+        violations = [v.get("kind", "violation") for v in report.violations]
+        return list(report.errors) + violations, not violations
+
+    def _can_repair_handoff(self, key):
+        with self._lock:
+            return bool(self._repair_argv.get(key)) and self._repairs_used.get(key, 0) < self.handoff_repair_turns
+
+    def _repair_handoff(self, run_id, unit_id, workspace, problems, data):
+        """Section 5.2: one short turn that rewrites only the handoff. Not an
+        attempt: the escalation record is not charged. Returns the re-read
+        (doc, missing)."""
+        key = (run_id, unit_id)
+        with self._lock:
+            self._repairs_used[key] = self._repairs_used.get(key, 0) + 1
+            template = list(self._repair_argv.get(key) or [])
+            handoff_path = self._handoff_paths.get(key)
+            log_path = self._log_paths.get(key)
+        prompt = R.handoff_repair_prompt(unit_id, HANDOFF_PATH_TOKEN, problems, R.HANDOFF_TEMPLATE, R.HANDOFF_RULES)
+        argv = fill_handoff_tokens([prompt if a == R.REPAIR_PROMPT_TOKEN else a for a in template], handoff_path)
+        self._emit("unit.handoff_repair", run_id, unit_id, {"problems": problems[:10]})
+        record = {"problems": problems[:20], "at": iso(self.clock())}
+        try:
+            handle = self.supervisor.start(argv, cwd=workspace["path"], env_allow=self.runner_env_allow,
+                                           extra_env={HANDOFF_ENV: handoff_path, UNIT_ENV: unit_id},
+                                           log_path=(log_path[:-4] + "-handoff-repair.log") if log_path else None,
+                                           timeout=self.repair_timeout)
+            if handle.pid is None:
+                result = handle.wait()
+            else:
+                while True:
+                    try:
+                        result = handle.wait(self.lease_renew_interval)
+                        break
+                    except TimeoutError:
+                        self._keep_lease(run_id)
+            record.update(exit_code=result.get("exit_code"), duration_s=result.get("duration_s"),
+                          error=result.get("error"))
+        except (OSError, TypeError, ValueError) as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        doc, missing = self._read_handoff(key, None)
+        record["handoff_found"] = missing is None
+        data["handoff_repair"] = record
+        self.manager.annotate_unit(run_id, self.id, unit_id, "handoff_repair", record)
+        return doc, missing
+
     # == unit execution ==
-    def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None):
+    def _run_skills_pass(self, run_id, unit_id):
+        """After an attempt by an author other than the skills runner (Claude Code by
+        default), a fresh session of that runner applies the repository's build skills
+        and its own (/simplify, /verify, /code-review, /security-review for high-risk
+        units) to the unit's changes and commits fixes within scope, before the gates
+        (TEAM-DELIVERY v6 4.5). Never fails the attempt: the gates and reviewers that
+        follow judge the result; the record says what happened."""
+        cfg = self.skills_pass
+        if not cfg or cfg.get("enabled") is False:
+            return None
+        run = self.manager.load(run_id)
+        unit = run["units"][unit_id]
+        runner = cfg.get("runner", "claude")
+        author = (unit.get("routing") or {}).get("runner")
+        if not author or author == runner:
+            return None
+        path = (unit.get("workspace") or {}).get("path")
+        if not path or not os.path.isdir(path):
+            return None
+        record = {"runner": runner, "author": author, "attempt": unit.get("attempts"), "at": iso(self.clock())}
+        plan_unit = self.manager.plan_unit(run, unit_id)
+        files = list((plan_unit.get("scope") or {}).get("files") or [])
+        high = plan_unit.get("risk") == "high"
+        skills = "/simplify, /verify and /code-review" + (", then /security-review" if high else "")
+        base = git_out(["merge-base", "HEAD", f"refs/heads/{self.target}"], path)
+        prompt = (
+            f"You are the skills pass for work unit {unit_id}, written by {author}. Read AGENTS.md first. The unit's "
+            f"changes are `git diff {base[:12]}...HEAD` on this branch. Run {skills} on those changes, following the "
+            "repository skills in .agents/skills (run-research-mcp, simplify-change, verify-change, review-change"
+            + (", security-review" if high else "") + "). Fix what they find, but only in the unit's files: "
+            + ", ".join(files) + ". Run the unit's acceptance commands ("
+            + "; ".join((plan_unit.get("acceptance") or {}).get("commands") or [])
+            + ") after any fix, commit each fix on this branch with a message starting \"Skills pass:\", and never "
+            "push, switch branches or touch other files. Finish with one line: ECC_SKILLS "
+            '{"simplify": "...", "verify": "...", "code_review": "..."' + (', "security_review": "..."' if high else "")
+            + '} summarizing what each found and changed.')
+        if self.skills_pass_argv is not None:
+            argv = list(self.skills_pass_argv(prompt, path))
+            env_allow = ()
+        else:
+            from ..runners.probes import get_adapter
+            names = {c.get("runner") if isinstance(c, dict) else c for c in (self.certified_runners or [])}
+            if runner not in names:
+                record["status"] = "skipped: runner not certified"
+                self.manager.annotate_unit(run_id, self.id, unit_id, "skills_pass", record)
+                return record
+            adapter = get_adapter(runner)
+            model = (((run.get("policy") or self.policy or {}).get("cli_models") or {}).get(runner) or {}).get(
+                cfg.get("class", "standard"))
+            argv = adapter.build_invocation(prompt, model=model, cwd=path, writable=True)
+            env_allow = tuple(adapter.env_allow())
+        log_path = os.path.join(self.log_root, run_id, f"{unit_id}-skills-attempt{unit.get('attempts')}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        before = git_out(["rev-parse", "HEAD"], path)
+        res = self.supervisor.run(list(argv), cwd=path, env_allow=env_allow, log_path=log_path,
+                                  timeout=float(cfg.get("timeout_minutes", 30)) * 60)
+        after = git_out(["rev-parse", "HEAD"], path)
+        leftovers = git_out(["status", "--porcelain"], path)
+        if leftovers:
+            # Uncommitted edits from the pass are kept aside, never discarded and never verified.
+            run_git(["stash", "push", "--include-untracked", "-m", f"skills pass leftovers {unit_id}"], path,
+                    check=False)
+        self._keep_lease(run_id, force=True)  # the pass can outlast the lease; take it back before recording
+        record.update(status="ran" if res.get("exit_code") == 0 else f"exit {res.get('exit_code')}",
+                      head_before=before, head_after=after,
+                      commits=int(git_out(["rev-list", "--count", f"{before}..{after}"], path) or 0),
+                      leftovers_stashed=bool(leftovers), log_path=log_path)
+        self.manager.annotate_unit(run_id, self.id, unit_id, "skills_pass", record)
+        return record
+
+    def _sync_with_target(self, path):
+        """Bring the target's current tip into an existing unit worktree before an
+        attempt (TEAM-DELIVERY v5 section 4.4). Returns a note for the runner's
+        prompt, or None when the branch already contains the tip."""
+        repo = self.worktrees.repo
+        try:
+            tip = git_out(["rev-parse", f"refs/heads/{self.target}"], repo)
+        except Exception:  # noqa: BLE001 - no target branch: nothing to sync
+            return None
+        short = tip[:12]
+        if os.path.exists(os.path.join(git_out(["rev-parse", "--absolute-git-dir"], path), "MERGE_HEAD")):
+            files = git_out(["diff", "--name-only", "--diff-filter=U"], path).split()
+            return (f"A merge of {self.target} into your branch is still in progress"
+                    + (f" with conflicts in: {', '.join(files)}" if files else "")
+                    + ". Finish it first (resolve, then commit the merge), then continue the unit.")
+        if run_git(["merge-base", "--is-ancestor", tip, "HEAD"], path, check=False).returncode == 0:
+            return None
+        dirty = [line for line in git_out(["status", "--porcelain", "--untracked-files=no"], path).splitlines() if line]
+        if dirty:
+            return (f"{self.target} has moved to {short}, but your branch has uncommitted changes, so ECC did not "
+                    f"merge it. Commit your work, run `git merge --no-edit {self.target}`, resolve any conflicts, "
+                    "and make the unit pass on top of it.")
+        res = run_git(["merge", "--no-edit", "-m", f"Merge {self.target} ({short}) into the unit branch (ECC)", tip],
+                      path, check=False)
+        if res.returncode == 0:
+            return (f"Before this attempt ECC merged {self.target} ({short}) into your branch. Your unit must pass on "
+                    "top of it; dependency files it brought in are not yours to change.")
+        files = git_out(["diff", "--name-only", "--diff-filter=U"], path).split()
+        if not files:
+            run_git(["merge", "--abort"], path, check=False)
+            return (f"ECC could not merge {self.target} ({short}) into your branch: "
+                    f"{(res.stderr or res.stdout).strip()[:300]}. Run `git merge --no-edit {self.target}` yourself "
+                    "and resolve what it reports before continuing.")
+        return (f"ECC started merging {self.target} ({short}) into your branch and it conflicts in: "
+                f"{', '.join(files)}. Resolve these conflicts first, keeping both sides' intent, commit the merge, "
+                "then continue the unit.")
+
+    def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None, repair_argv=None):
         op = "unit.start"
         run = self.manager.load(run_id)
         unit = run["units"].get(unit_id)
@@ -241,7 +637,11 @@ class Conductor:
             return envelope(op, ok=False, checks=[check("unit_assigned", False, unit["state"] if unit else "unknown")])
         paths = self.worktrees.paths(run_id, unit_id)
         if not os.path.isdir(paths["path"]):
-            base = (run.get("metadata") or {}).get("base_commit") or self.target
+            # Branch from the target's current tip: a unit becomes ready only after its
+            # dependencies merged there, so the run's starting commit would leave them out
+            # (live finding, rmcp-m0f: M0-08 started without M0-01 and M0-03).
+            base = self.target if rev_exists(self.worktrees.repo, f"refs/heads/{self.target}") \
+                else (run.get("metadata") or {}).get("base_commit") or self.target
             created = self.worktrees.create(run_id, unit_id, base_ref=base, owner=unit["owner"])
             if not created["ok"]:
                 return created
@@ -250,6 +650,11 @@ class Conductor:
             res = self.manager.record_workspace(run_id, self.id, unit_id, workspace)
             if not res["ok"]:
                 return res
+        else:
+            note = self._sync_with_target(paths["path"])
+            if note and "--" in runner_argv:
+                runner_argv = list(runner_argv)
+                runner_argv[-1] = f"{runner_argv[-1]}\n\n{note}"
         before = None
         if self.git_state_guard is not None:
             try:
@@ -280,9 +685,15 @@ class Conductor:
             os.unlink(handoff_path)
         env = dict(extra_env or {})
         env.update({HANDOFF_ENV: handoff_path, UNIT_ENV: unit_id})
+        plan_unit = self.manager.plan_unit(run, unit_id)
+        settings = self.health_settings(plan_unit, run.get("policy") or self.policy)
+        health = H.HealthConfig(settings=settings, worktree=paths["path"], on_check=self._health_listener(
+            run_id, unit_id, unit["attempts"], settings, budget=self._minutes_budget(unit, plan_unit)))
+        runner_argv = fill_handoff_tokens(runner_argv, handoff_path)
         handle = self.supervisor.start(list(runner_argv), cwd=paths["path"], env_allow=self.runner_env_allow,
                                        extra_env=env, on_line=progress, log_path=log_path,
-                                       status_path=status_path, timeout=self.runner_timeout)
+                                       status_path=status_path, timeout=self.runner_timeout, health=health,
+                                       parse_stdout=runner_usage)
         if handle.pid is None:
             result = handle.wait()
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="spawn_failed")
@@ -293,11 +704,14 @@ class Conductor:
         with self._lock:
             self._handles[key] = handle
             self._handoff_paths[key] = handoff_path
+            self._log_paths[key] = log_path
+            self._repair_argv[key] = list(repair_argv) if repair_argv else None
+            self._repairs_used[key] = 0
             self._git_before[key] = before
             self._stages[key] = {}
         return envelope(op, changed=True, checks=[check("runner_started", True)] + rec["checks"],
                         data={"pid": handle.pid, "log_path": log_path, "worktree": paths["path"],
-                              "handoff_path": handoff_path})
+                              "handoff_path": handoff_path, "health": settings.to_dict()})
 
     def cancel_unit(self, run_id, unit_id, reason="operator", terminal=True):
         """Cooperative cancel of the unit's runner; the unit ends cancelled
@@ -312,6 +726,36 @@ class Conductor:
         return self.wait_unit(run_id, unit_id)
 
     # == lease keeping ==
+    @contextlib.contextmanager
+    def lease_heartbeat(self, run_id):
+        """Keep the run lease alive through a long blocking step that has no
+        runner handle to poll: the skills pass and the gates. The skills pass on
+        rm-m0b M0-02 ran six minutes, the five-minute lease expired, and every
+        later mutation was refused (live finding, 2026-10-21). Renewed every
+        third of the lease, and once more at the end so the caller can record
+        the result."""
+        period = max(1.0, float(getattr(self.manager, "lease_ttl", 300.0)) / 3.0)
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(period):
+                try:
+                    self._keep_lease(run_id, force=True)
+                except Exception:  # noqa: BLE001 - a missed beat is retried on the next one
+                    pass
+
+        thread = threading.Thread(target=beat, name=f"lease-{run_id}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            try:
+                self._keep_lease(run_id, force=True)
+            except Exception:  # noqa: BLE001 - the caller's own mutation reports a lost lease
+                pass
+
     def _keep_lease(self, run_id, force=False):
         """Renew the run lease when due; re-acquire it when it merely expired.
         Returns (held, detail)."""
@@ -402,6 +846,25 @@ class Conductor:
                 refs.append(f"refs/heads/{self.worktrees.paths(run['run_id'], uid)['branch']}")
         return refs
 
+    def _target_move(self, run, unit_id, before, after):
+        """The target branch's move during a runner's window, judged by its new
+        commits: a fast-forward whose files fall outside every active unit's
+        scope (the owner's README or LICENSE commit, a pull of either) is not
+        the unit's business; its next merge of the target picks it up. A
+        rewrite, or a file inside any active scope, touches the scope. None
+        when the target did not move (live finding, rm-m0f: four units stopped
+        for commits that touched none of them)."""
+        ref = f"refs/heads/{self.target}"
+        old, new = (before.get("refs") or {}).get(ref), (after.get("refs") or {}).get(ref)
+        if old == new or not old or not new:
+            return None
+        files = target_move_paths(self.worktrees.repo, old, new)
+        scopes = [list((self.manager.plan_unit(run, uid).get("scope") or {}).get("files") or [])
+                  for uid, u in sorted(run["units"].items()) if uid == unit_id or u["state"] in S.ACTIVE]
+        touched = files is None or any(out_of_scope_changes(files, scope) != files for scope in scopes)
+        return {"ref": ref, "old": old[:12], "new": new[:12], "files": (files or [])[:50],
+                "touches_scope": touched}
+
     def _note_own_ref_move(self, ref, old, new):
         """The conductor itself moved `ref` (a local merge): advance every
         in-flight unit's baseline for that ref, but only when the baseline
@@ -445,20 +908,38 @@ class Conductor:
             if not res["ok"]:
                 return envelope(op, ok=False, checks=res["checks"], data=data), False
             stage["exit"] = True
+        if not stage.get("completed_event"):
+            routing = unit.get("routing") or {}
+            self._emit("unit.completed", run_id, unit_id, {
+                "exit_code": result.get("exit_code"), "signal": result.get("signal"),
+                "duration_seconds": result.get("duration_s"), "attempts": unit.get("attempts"),
+                "tier": routing.get("tier"), "runner": routing.get("runner"), "model": routing.get("model"),
+                "cancelled": bool(result.get("cancelled")), "cancel_reason": result.get("cancel_reason"),
+                "hung": bool(result.get("hung")), "timed_out": bool(result.get("timed_out")),
+                "error": bool(result.get("error"))})
+            stage["completed_event"] = True
         if not stage.get("guard"):
             before = self._git_before.get(key)
             if self.git_state_guard is not None and before is not None:
                 after = self.git_state_guard[0](self.worktrees.repo)
-                changes = list(self.git_state_guard[1](before, after,
-                                                       allow_refs=self._allowed_refs(run, unit_id)))
+                allow = self._allowed_refs(run, unit_id)
+                target_move = self._target_move(run, unit_id, before, after)
+                if target_move and not target_move["touches_scope"]:
+                    allow.append(target_move["ref"])
+                changes = list(self.git_state_guard[1](before, after, allow_refs=allow))
+                if target_move and not target_move["touches_scope"] and not changes:
+                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes",
+                                               {"target_moved_outside_scope": target_move})
                 if changes:
                     data["shared_git_state_changes"] = changes
                     res = self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER,
                                                   reason="shared_git_state_changed")
                     if not res["ok"]:
                         return envelope(op, ok=False, checks=res["checks"], data=data), False
-                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes",
-                                               {"shared_git_state_changes": changes})
+                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes", {
+                        "shared_git_state_changes": changes,
+                        "touches_scope": bool(target_move and target_move["touches_scope"]),
+                        "refs_only": refs_only(changes)})
                     return envelope(op, ok=False, changed=True,
                                     checks=[check("shared_git_state_unchanged", False, ", ".join(changes))],
                                     required_user_actions=[{"kind": "resolve_needs_user", "run_id": run_id,
@@ -473,6 +954,8 @@ class Conductor:
             value = doc["usage"].get("cost_usd")
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 cost = float(value)
+        if not cost:
+            cost = float((result.get("parsed") or {}).get("cost_usd") or 0.0)
         cancel = self._cancel_terminal.get(key)
         if result["cancelled"] and cancel is not None:
             terminal, reason = cancel
@@ -489,11 +972,23 @@ class Conductor:
             if not usage["ok"]:
                 return envelope(op, ok=False, changed=True, checks=usage["checks"],
                                 required_user_actions=usage["required_user_actions"], data=data), True
-        if result["error"] or result["timed_out"] or result["exit_code"] != 0:
-            reason = "runner_timeout" if result["timed_out"] else f"runner_exit_{result['exit_code']}"
+        if result["error"] or result["timed_out"] or result.get("hung") or result["exit_code"] != 0:
+            if result.get("hung"):
+                reason = "hung"
+            elif result["timed_out"]:
+                reason = "runner_timeout"
+            else:
+                reason = f"runner_exit_{result['exit_code']}"
+            log_text = R.read_tail(self._log_paths.get(key))
+            stop = None
+            if not (result["timed_out"] or result.get("hung") or result["error"]):
+                stop = R.classify_runner_failure(log_text, result["exit_code"])
+            if stop:
+                return self._stop_runner(run_id, unit_id, unit, stop, log_text, data), True
             res = self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=result["error"] or reason)
             if not res["ok"]:
                 return envelope(op, ok=False, checks=res["checks"], data=data), False
+            self._note_failure(run_id, unit_id, reason, R.failure_evidence(reason, log_text=log_text))
             self._record_outcome(run_id, unit_id, False, False, reason, cost)
             return envelope(op, ok=False, changed=True, checks=[check("runner_succeeded", False, reason)],
                             data=data), True
@@ -501,13 +996,26 @@ class Conductor:
 
     def _accept_handoff(self, run_id, unit_id, doc, missing, cost, data):
         op = "unit.complete"
-        workspace = self.manager.load(run_id)["units"][unit_id]["workspace"]
+        run = self.manager.load(run_id)
+        workspace = run["units"][unit_id]["workspace"]
+        problems, repairable = self._handoff_problems(run, unit_id, doc, missing)
+        if problems and repairable and self._can_repair_handoff((run_id, unit_id)):
+            doc, missing = self._repair_handoff(run_id, unit_id, workspace, problems, data)
         head = git_out(["rev-parse", "HEAD"], workspace["path"])
         if missing:
+            self._note_failure(run_id, unit_id, missing, R.failure_evidence(
+                missing, handoff_problems=[missing], log_text=R.read_tail(self._log_paths.get((run_id, unit_id)))))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=missing)
             self._record_outcome(run_id, unit_id, False, False, missing, cost)
             return envelope(op, ok=False, changed=True, checks=[check("handoff_valid", False, missing)],
                             data=data), True
+        log = self._lessons(run_id)
+        if log is not None and isinstance(doc, dict):
+            from ..team.learning import capture_handoff
+            try:
+                capture_handoff(log, unit_id, doc, at=iso(self.clock()))
+            except OSError:
+                pass
         res = self.manager.record_handoff(run_id, self.id, unit_id, doc, head=head)
         data["handoff"] = (res.get("data") or {}).get("handoff")
         if not res["ok"]:
@@ -518,9 +1026,15 @@ class Conductor:
             if wants_user and not summary.get("violations"):
                 self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="runner_needs_user")
             else:
+                reported = doc.get("unresolved_failures") if isinstance(doc, dict) else None
+                self._note_failure(run_id, unit_id, "handoff_invalid", R.failure_evidence(
+                    "handoff_invalid", handoff_problems=list(summary.get("problems") or [])
+                    + [f"unresolved: {f}" for f in (reported or []) if isinstance(f, str)][:10]))
                 self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="handoff_invalid")
                 self._record_outcome(run_id, unit_id, False, False, "handoff_invalid", cost)
             return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), True
+        with self.lease_heartbeat(run_id):
+            self._run_skills_pass(run_id, unit_id)
         return self._verify(run_id, unit_id, data, cost), True
 
     def _verify(self, run_id, unit_id, data, cost=0.0):
@@ -534,12 +1048,21 @@ class Conductor:
         plan_unit = self.manager.plan_unit(run, unit_id)
         dirty = git_out(["status", "--porcelain", "--untracked-files=all"], workspace["path"])
         if dirty:
+            self._note_failure(run_id, unit_id, "uncommitted_changes", R.failure_evidence(
+                "uncommitted_changes", files=dirty.splitlines()))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="uncommitted_changes")
             self._record_outcome(run_id, unit_id, False, False, "uncommitted_changes", cost)
             return envelope(op, ok=False, checks=[check("work_committed", False, dirty.splitlines()[0])], data=data)
-        verification = self.gate(plan_unit, workspace["path"])
+        with self.lease_heartbeat(run_id):
+            verification = self.gate(plan_unit, workspace["path"], run_id=run_id)
         gates_passed = bool(verification["passed"])
-        stats = diff_stats(self.worktrees.repo, workspace["branch"], workspace["base_commit"])
+        # A dependency may merge after this worktree was created.  Verify the
+        # unit against the newest target commit it has incorporated, not the
+        # worktree's creation point, or inherited dependency files look like
+        # out-of-scope changes owned by this unit.
+        base = git_out(["merge-base", workspace["branch"], self.target], self.worktrees.repo)
+        stats = diff_stats(self.worktrees.repo, workspace["branch"], base)
+        verification["base_commit"] = base
         verification["head"] = git_out(["rev-parse", "HEAD"], workspace["path"])
         verification["changed_files"] = stats["files"]
         verification["diff_stats"] = {k: stats[k] for k in ("files_changed", "lines_added", "lines_removed")}
@@ -561,6 +1084,8 @@ class Conductor:
         data["verification"] = verification
         if verification["out_of_scope"]:
             warnings += self._attention(run_id, unit_id, "out_of_scope_changes", files=verification["out_of_scope"])
+            self._note_failure(run_id, unit_id, "out_of_scope_changes", R.failure_evidence(
+                "out_of_scope_changes", files=verification["out_of_scope"]))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="out_of_scope_changes")
             self._record_outcome(run_id, unit_id, False, False, "out_of_scope_changes", cost)
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
@@ -568,6 +1093,8 @@ class Conductor:
             self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="classification_invalid")
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
         if not gates_passed:
+            self._note_failure(run_id, unit_id, "gates_failed", R.failure_evidence(
+                "gates_failed", gates=verification.get("gates") or []))
             self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="gates_failed")
             self._record_outcome(run_id, unit_id, False, True, "gates_failed", cost)
             return envelope(op, ok=False, checks=checks, warnings=warnings, data=data)
@@ -591,7 +1118,9 @@ class Conductor:
         head = (unit["annotations"].get("verification") or {}).get("head")
         if not head:
             return envelope(op, ok=False, checks=[check("verified_head_recorded", False)])
-        stats = diff_stats(self.worktrees.repo, head, unit["workspace"]["base_commit"])
+        base = (unit["annotations"].get("verification") or {}).get("base_commit") \
+            or unit["workspace"]["base_commit"]
+        stats = diff_stats(self.worktrees.repo, head, base)
         classification = self._classify(run, unit_id, stats)
         chosen = select_reviewer(unit.get("routing") or {}, classification, self.certified_runners or [],
                                  self.catalog, self.policy, breaker=self.breaker, now=self.clock())
@@ -655,7 +1184,9 @@ class Conductor:
                       check("branch_matches_verified_head", bool(head) and tip == head, f"tip={tip}")]
             if not all(c["ok"] for c in checks):
                 return envelope(op, ok=False, checks=checks)
-            stats = diff_stats(self.worktrees.repo, head, unit["workspace"]["base_commit"])
+            base = (unit["annotations"].get("verification") or {}).get("base_commit") \
+                or unit["workspace"]["base_commit"]
+            stats = diff_stats(self.worktrees.repo, head, base)
             classification = self._classify(run, unit_id, stats)
             sufficient, reasons = review_satisfies(review, routing, classification, self.certified_runners,
                                                    self.catalog, self.policy, breaker=self.breaker, now=self.clock())

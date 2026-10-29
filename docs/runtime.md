@@ -20,7 +20,8 @@ OpenClaw boundary. The event and approval contract is in
 | `runs.envelope` | the boundary result envelope |
 | `worktrees.manager` | one branch plus one worktree per unit, root validation, safe cleanup |
 | `worktrees.git` | argument list git wrapper |
-| `process.supervisor` | runner processes: env allowlist, streaming, redaction, timeout, cancel |
+| `process.supervisor` | runner processes: env allowlist, streaming, redaction, health monitoring, cancel |
+| `process.health` | hang detection: progress signals, flat check streaks, health settings |
 | `process.redact` | secret redaction for text and nested payloads |
 | `gates.runner` | acceptance commands plus required checks, structured verification |
 | `merge_queue.conflicts` | overlap prediction from declared scope and from changed files; actual diff stats; out of scope check |
@@ -129,11 +130,18 @@ Pending units become ready automatically once all dependencies are merged.
   or present owner of the unit are refused as not independent.
 * Budgets use the work unit schema names. `budget.attempts` is per tier and
   is checked on every assignment against `attempts_by_tier`;
-  `budget.minutes` and `budget.maximum_cost_usd` are per unit and are checked
-  on every `record_usage` (and cost again on assignment). Exhaustion moves the
-  unit to `needs_user` with reason `budget_exhausted`. Runs persisted before
-  the rename may carry `max_attempts` (a total cap) and `max_minutes`; these
-  are still read as deprecated aliases, but new plans using them fail
+  `budget.maximum_cost_usd` is per unit and is checked on every
+  `record_usage` and again on assignment. Exhaustion of either moves the unit
+  to `needs_user` with reason `budget_exhausted`. `budget.minutes` (per unit,
+  all attempts) is advisory: it is never a kill and never a hard failure.
+  While a runner works past it, the conductor emits `attention.required`
+  with reason `long_running` once, and again at each further multiple of the
+  budget; `record_usage` still accumulates `minutes_used` and reports
+  `over_minutes_budget`, and the escalation controller only marks such an
+  attempt `over_time_budget`. The policy's `budget.max_minutes_per_unit`
+  tightens the advisory threshold the same way. Runs persisted before the
+  rename may carry `max_attempts` (a total cap) and `max_minutes`; these are
+  still read as deprecated aliases, but new plans using them fail
   validation.
 
 ## Plan validation, handoffs and routing
@@ -164,6 +172,30 @@ Pending units become ready automatically once all dependencies are merged.
   attempt is fed back to the controller and its record is persisted, so a
   new conductor rebuilds the controller after a restart. A `stop` from the
   controller moves the unit to `needs_user` (`escalation_stopped`).
+* Findings from the research-mcp M0 run `rm-m0f` (2026-10-25), fixed in
+  commit `c02a6c8`, with the file and the fix for each; regression tests in
+  `tests/test_m0_retro.py`:
+  * M0-22, a Keychain unit, merged on an inconclusive verifier verdict,
+    because ECC accepts that verdict when its own gates passed on the same
+    head. In `team/review.py` a unit that needs the security reviewer (high
+    risk, a `high_risk_paths` file or a security signal) now stops in
+    `needs_user` (`verifier_inconclusive`) instead; other units keep the old
+    acceptance.
+  * M0-20 took seven attempts on six pr_reviewer rejections. In
+    `runs/conductor.py`, `return_for_changes` stops the unit in `needs_user`
+    (`repeated_rejections`) when the same `<role>_changes_requested` reason
+    ends `REJECTION_CAP` (3) attempts in a row. The owner reads the findings
+    and resumes or rescopes; `ecc resume` allows one more attempt.
+  * Four retries had no cause in the retrospective: the
+    `shared_git_state_changed` stops never reach the escalation record.
+    `Drive.retro_table` in `team/drive.py` now lists every transition into
+    `needs_user`, `failed` or `blocked`, and every review return, from the
+    run's event log.
+  * Every unit reported `cost_usd` 0.0, because agents rarely fill `usage` in
+    their handoff. `start_unit` in `runs/conductor.py` passes `runner_usage`
+    as the supervisor's `parse_stdout`, which reads Claude's
+    `total_cost_usd` from the raw result line; the handoff value still wins
+    when it is set.
 * `Conductor.select_reviewer` re-classifies with the verified diff and calls
   `routing.select_reviewer` with the author's routing record. When no
   qualified reviewer exists for Tier 2 or high risk work, the unit moves to
@@ -199,12 +231,21 @@ mutating call accepts `dry_run=True` and then only reports its plan.
   redactor, so a runner echoing its token cannot leak it.
 * stdout and stderr are streamed line by line, redacted, then passed to the
   callback and appended to the log file.
-* Hard timeout and cooperative cancel both send SIGTERM to the group and
+* No wall clock limit by default. With a health configuration (the conductor
+  always passes one for runners and gates), a monitor thread checks the
+  process every `health.interval_seconds` and cancels the group only when it
+  is hung (see [Health monitoring](#health-monitoring-instead-of-wall-clock-kills)).
+  An optional hard `timeout` still exists for callers that set one
+  explicitly; it is off by default and discouraged.
+* stdout and stderr are read in chunks, so bytes are counted as they arrive
+  even without a newline (progress bars), then split into lines.
+* A hang cancel and a cooperative cancel both send SIGTERM to the group and
   SIGKILL after the grace period. When the main child exits, leftover group
   members are killed while the child is still an unreaped zombie, so the
   group id cannot be recycled underneath us.
 * The exit record (`status.json`) has argv (redacted), pid, times, exit code,
-  signal, timeout and cancel flags, and line counts.
+  signal, timeout, cancel and `hung` flags, line and byte counts, and a
+  `health` summary (last state, checks, flat streak, last evidence).
 
 ## Quality gates
 
@@ -213,8 +254,11 @@ split with `shlex.split` and executed without a shell; shell operator tokens
 (`&&`, `|`, `;`, redirections) are rejected as invalid. Protected command
 globs (push, hard reset, force flags, recursive delete, sudo, network tools,
 publish and deploy commands, plus any configured globs) are refused before
-execution. Each gate records argv, status, exit code, duration, timeout flag
-and a truncated, redacted output tail. `passed` is true only when at least one
+execution. Each gate records argv, status, exit code, duration, timeout and
+`hung` flags and a truncated, redacted output tail. Gate commands have no
+wall clock limit either (the former fixed 600 second kill is gone): they are
+health monitored with the same settings as the unit's runner, and a hung
+gate gets status `hung`, which fails the gates. `passed` is true only when at least one
 gate ran and every gate passed.
 
 ## Conflicts, dispatch and the merge queue
@@ -261,9 +305,10 @@ gate ran and every gate passed.
 
 `Conductor` wires the pieces: `create_run` pins the base commit and
 validates the plan, `assign_unit` routes and assigns, `start_unit` snapshots
-shared git state, creates the worktree and starts the runner, `wait_unit`
-keeps the lease, records the exit, checks shared git state, records usage,
-validates the handoff and runs verification, `cancel_unit` cancels
+shared git state, creates the worktree and starts the runner under health
+monitoring, `wait_unit` keeps the lease, records the exit (emitting
+`unit.completed`), checks shared git state, records usage, validates the
+handoff and runs verification, `cancel_unit` cancels
 cooperatively, `select_reviewer` routes the review, `record_review` enforces
 independence, head binding and the review tier and requests a bound
 approval, `enqueue_merge` and `process_merge_queue` drive the queue and
@@ -280,15 +325,89 @@ changes are the unit's own branch, the branches of the run's other units
 (the conductor creates them and their runners commit to them in parallel),
 and target branch moves made by this conductor's own merges (the baseline of
 every in flight unit is advanced only when it still shows the pre merge
-commit). Anything else moves the unit to `needs_user` with reason
-`shared_git_state_changed` and an `attention.required` event. Tampering with
+commit). Remote-tracking refs (`refs/remotes/*`, including `origin/HEAD`)
+are ignored: the owner's push or pull moves them. A target branch move by
+anyone else is judged by its new commits: when the old tip is an ancestor of
+the new one and no changed file falls inside the scope of this unit or any
+active unit (an owner's README or LICENSE commit), the unit continues and
+gets a `target_moved_outside_scope` note; its next merge of the target picks
+the commits up. Anything else moves the unit to `needs_user` with reason
+`shared_git_state_changed` and an `attention.required` event. The unit's
+`notes` record `touches_scope` and `refs_only`; when only refs moved and no
+scope was touched, `ecc drive` returns the unit to `ready` itself (at most
+twice per unit) instead of stopping for the owner. Tampering with
 another unit's branch is caught later: the queue refuses a tip that differs
 from that unit's verified head.
 
+## Health monitoring instead of wall clock kills
+
+A task that takes a long time but completes is the desired outcome. The
+conductor therefore sets no wall clock limit on runners or gates
+(`runner_timeout` and `gate_timeout` default to None). A process is stopped
+only when it is hung, and hang status is established by checks at regular
+intervals (`process.health`).
+
+Every `health.interval_seconds` (default 120) the monitor samples these
+signals and compares each with the previous check:
+
+| Signal | Source |
+| :- | :- |
+| alive | `runs.liveness` (pid identity; a zombie counts as not alive) |
+| CPU | cumulative CPU time of the whole process group: `/proc` on Linux (including reaped children), otherwise `ps -A -o pid= -o pgid= -o stat= -o time=` under `LC_ALL=C` with a 5 second bound; growth below 0.1 percent of the interval is treated as idle noise |
+| output | new stdout or stderr bytes |
+| events | new stream events (JSON object lines) |
+| worktree | digest of `git status` (porcelain v2 with the branch header, so HEAD moves count) plus mtime and size of each changed path, run through the hardened orchestrator git wrapper; only for a git checkout |
+| process set | the set of live pids in the group changed |
+
+A check is flat only if the process is alive, every signal was read and none
+moved. A signal that could not be read makes the check indeterminate: it
+neither counts as flat nor resets the streak, so a failing probe can never
+make a busy process look hung. `health.flat_checks_for_hang` (default 5)
+consecutive flat checks mean the process is hung; any movement resets the
+count. A process that is no longer alive is never hung: the normal exit path
+handles it.
+
+States and events:
+
+| Transition | Event |
+| :- | :- |
+| healthy to `suspected_hang` (first flat check of a streak) | `unit.health`, `attention.required` reason `suspected_hang` with the evidence |
+| `suspected_hang` back to healthy (a signal moved) | `unit.health` |
+| to `hung` (threshold reached) | the group is cancelled through the normal cancel path with reason `hung`; `unit.health` and `attention.required` reason `hung_cancelled` with the evidence |
+
+`unit.health` is emitted only on a state change, never every tick. Evidence
+holds numbers and flags only (CPU seconds and delta, byte and event totals
+and deltas, group size, which signals moved or were unknown, the streak), no
+paths, commands or output, and passes through event redaction. The runner's
+last health state is also kept in the unit's `health` annotation, which
+`status` shows. A hung runner moves the unit to `failed` with reason `hung`
+and is fed to the escalation controller like any failed attempt, so normal
+retry, escalation, reassignment or `needs_user` follows. A hung gate fails
+verification.
+
+Settings live in the repository policy (`health.interval_seconds`, 30 to
+1800; `health.flat_checks_for_hang`, 2 to 20) and a work unit may override
+either key in its own `health` block; both are validated at `create_run` and
+in the JSON Schema files. `Conductor(health_override=...)` replaces them;
+`HealthSettings.for_tests` allows intervals below 30 seconds and exists for
+tests only. With the defaults a completely silent, idle process is cancelled
+after about 10 minutes without any progress signal; a process that is busy
+on CPU, printing, changing its worktree or starting processes is never
+cancelled, however long it runs.
+
+An operator may still configure a hard ceiling (`runner_timeout`,
+`gate_timeout` in the CLI config, or the conductor arguments). It is off by
+default and discouraged: it kills work that is still progressing.
+
 ## Known limitations
 
-* Process liveness and pid reuse detection rely on Linux `/proc`; elsewhere
-  only `kill(pid, 0)` is used.
+* Process liveness and pid reuse detection use Linux `/proc` or, on macOS
+  and the BSDs, `ps` start times with one second resolution.
+* Health signals follow the runner's process group. A helper that moves
+  itself to another session or group is not seen by the CPU and process set
+  signals (its output and worktree changes still count).
+* `long_running` notices are raised at health check time, so they can arrive
+  up to one `health.interval_seconds` after the budget multiple passes.
 * Locks are advisory `flock` locks and assume a local filesystem.
 * A merge queue dry run may write git objects (never refs) through merge-tree.
 * Scope overlap matching is intentionally conservative and can defer units
@@ -318,7 +437,7 @@ section is current.
   (redacted). `wait()` also notices a monitor thread that died without a
   result, so it never blocks forever.
 * `ProcessHandle.wait(timeout=None)` accepts a timeout in seconds and raises
-  `TimeoutError` when the process is still running.
+  `TimeoutError` when the process is still running; waiting never kills.
 
 ### Redaction
 
@@ -327,7 +446,8 @@ There is one engine, `handoffs.redaction`; `process.redact` re-exports it.
 | Covered | How |
 | :- | :- |
 | `sk-`, `sk-ant-`, `sk-or-`, `sk-proj-`, `gsk_`, `AIza`, `ghp_`, `gho_`, `github_pat_`, `glpat-`, `xox*`, `AKIA`, `ASIA`, `hf_`, JWTs, bearer credentials | prefix patterns |
-| long mixed case tokens | entropy rule (hex digests up to 64 characters are kept) |
+| long mixed case tokens | entropy rule (hex digests up to 64 characters are kept). Inside an absolute path under a common root (`/private/`, `/var/`, `/tmp/`, `/Users/`, `/home/` and similar), each path segment is judged on its own, so macOS temp paths such as `/private/var/folders/<x>/<id>/T/tmpXXXX` stay readable while a long random segment is still masked |
+| provider account and key ids in error bodies (`org-<hex>`, `ak-<id>`) | prefix patterns |
 | `NAME=value`, `name: value`, JSON pairs with a secret looking name; `Authorization` headers; URL passwords | value rules that keep the name and mask the value |
 | private key blocks | masked whole inside one text; `StreamRedactor` masks every line from BEGIN through END when a key arrives line by line |
 | argv | `redact_argv` masks the value of token, password, passphrase, api key, secret, auth, cookie and similar flags in both the separate and the equals form, and `NAME=value` pairs with a secret looking name |
@@ -335,6 +455,57 @@ There is one engine, `handoffs.redaction`; `process.redact` re-exports it.
 
 Log lines, the line callback, `status.json`, the returned result and error
 messages all pass through the process redactor. Errors never echo a value.
+
+A CLI turn no longer reads its verdict from the log. `team.invoke.run_cli`
+passes the adapter's `parse_output` to `Supervisor.run` as `parse_stdout`. The
+process handle keeps the raw stdout in memory, parses it when the process ends,
+redacts the string values of the parsed result with that process's redactor,
+and returns them as `parsed`, which is not written to `status.json`. The raw
+stdout is then dropped. Output the adapter cannot parse is a runner error
+(`unparsable CLI output`), never a verdict. Before this change (commit
+`fffa9f2`), 38 of the 63 Claude result lines logged in runs rm-m0b, rm-m0d and
+rm-m0f were invalid JSON after masking; each became `no ECC_REVIEW line` and
+counted as changes requested. The change is in
+`src/openclaw_ecc_orchestrator/process/supervisor.py` (`parse_stdout`,
+`ProcessHandle._parsed`) and `src/openclaw_ecc_orchestrator/team/invoke.py`
+(`run_cli`); regression tests in `tests/test_invoke_raw_parse.py`. The rules
+below still matter for every log line and for API turns.
+
+Redaction should leave a JSON line parseable, so a log stays readable. The
+three live findings below broke Claude's result line, and the verdict check
+reported `no ECC_REVIEW line` (or `no ECC_VERIFY line`) even though the reply
+had one. The name rule therefore masks a quoted value inside its quotes, and
+`_benign_named_value` leaves unmasked the values that cannot be credentials:
+JSON structure tokens, `null`, `true` and `false`, and numbers on counter
+fields (names ending in `count`, `limit` or `tokens`). These values may
+carry the brackets that close their object or array, as in
+`"thinking_tokens":15327}`.
+
+Live findings: rm-m0b (2026-10-22) lost a verifier verdict to
+`"session_id":[REDACTED]` and `"thinking_tokens":[REDACTED]` written over
+`null`. The rm-m0d plan check (2026-10-23) stopped with
+`plan_check_failed: reviewer output unusable: no ECC_REVIEW line`. Claude CLI
+had started writing a number for `thinking_tokens`, and `_NUMBER_RE` in
+`src/openclaw_ecc_orchestrator/handoffs/redaction.py` did not accept the
+closing `}`, so the number and the brace were both masked. The fix (commit
+`a4a7d79`) lets `_NUMBER_RE` end in `[}\]]*`, the same allowance
+`_JSON_LITERALS_RE` already had. Regression test:
+`JsonLineTests.test_counter_closing_an_object_stays_json` in
+`tests/test_redaction_engine.py`.
+
+In run rm-m0f (2026-10-23), M0-20 used up six attempts on reviews that read
+`no ECC_REVIEW line`, though the last reviewer had approved. Inside Claude's
+result string the quotes are escaped. For `SecretState.INVALID = \"invalid\"`
+and `test_secrets.py:62\"`, the name rule took the backslash before the quote
+as an unquoted value and masked it, so the quote ended the JSON string. The
+fix (commit `fff89ae`) is in the same file,
+`src/openclaw_ecc_orchestrator/handoffs/redaction.py`: the first rule of
+`_VALUE_RULES` now accepts a value in escaped quotes (`\"...\"`) and a name in
+escaped quotes, and `_redaction_spans` masks inside the escaped quotes and
+leaves the trailing backslash of an unquoted value outside the mask. Values in
+escaped quotes, such as `\"api_key\": \"...\"` inside a JSON string, were not
+masked before and are now. Regression test:
+`JsonLineTests.test_escaped_quotes_inside_a_json_string_stay_escaped`.
 
 ### Orchestrator git
 
@@ -368,7 +539,10 @@ and `objects/info/alternates`, digests of risky config keys (for example
 returns readable lines such as `ref moved: refs/heads/main a1b2 -> c3d4`,
 `risky config added: config:core.fsmonitor` or `hook added: hooks/post-merge`.
 Config values are never echoed. `allow_refs` takes full ref names, globs, or
-branch names (the unit branch is usually the only one). Take the snapshot
+branch names (the unit branch is usually the only one); remote-tracking refs
+are always allowed. `target_move_paths(repo, old, new)` lists the files a
+branch move changed, or returns None for a rewrite, and `refs_only(changes)`
+says whether a diff holds nothing but ref moves. Take the snapshot
 before the runner starts and diff after it exits; any line is a violation.
 Worker set filter drivers would run during a later checkout of the unit
 branch, so a non empty diff must stop the unit before its branch is merged.
@@ -409,7 +583,8 @@ the gates finish.
 
 Certification probes run each step with `runners.base.minimal_env`: `PATH`,
 `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR` plus the adapter's declared
-`credential_env` names. Each step gets its own process group; on timeout the
+`credential_env` names. Each step gets its own process group; on timeout (a
+bound on certification probes only, never on unit runners) the
 group receives SIGTERM, then SIGKILL after `KILL_GRACE_SECONDS`. Claude and
 Codex adapters declare `HOME` by default because on macOS both CLIs find
 their login through it; pass `adapter.env_allow()` as the supervisor

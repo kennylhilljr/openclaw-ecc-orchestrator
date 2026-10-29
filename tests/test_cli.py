@@ -307,8 +307,17 @@ class StatusAndEventsTest(S.CliTestBase):
         units = {u["unit_id"]: u for u in self.ok(self.cli("status", "--run-id", self.RUN_ID))["data"]["units"]}
         self.assertEqual(units["alpha"]["state"], "ready")
         self.assertEqual(units["beta"]["state"], "pending")
-        for key in ("tier", "runner", "attempts", "budget", "used"):
+        for key in ("tier", "runner", "attempts", "budget", "used", "health"):
             self.assertIn(key, units["alpha"])
+        self.assertIsNone(units["alpha"]["health"])
+
+    def test_config_has_no_wall_clock_limits_by_default(self):
+        from openclaw_ecc_orchestrator.cli.config import load_config
+        import types
+        cfg = load_config(types.SimpleNamespace(config=self.config_path), {"HOME": self.tmp}, self.tmp,
+                          validate_locations=False)
+        self.assertIsNone(cfg.runner_timeout)
+        self.assertIsNone(cfg.gate_timeout)
 
     def test_status_shows_pending_approvals_and_actions(self):
         head, request_id = self.to_review()
@@ -375,7 +384,11 @@ class DispatchVerifyTest(S.CliTestBase):
         code, doc = self.dispatch("alpha", mode="fail")
         self.assertEqual(code, 1)
         self.assertFalse(doc["ok"])
-        self.assertEqual(self.unit("alpha")["state"], "failed")
+        # TEAM-DELIVERY-v2 5.1: within budget the unit returns to ready with the evidence recorded.
+        unit = self.unit("alpha")
+        self.assertEqual(unit["state"], "ready")
+        self.assertEqual(unit["reason"], "retry:runner_exit_1")
+        self.assertEqual(unit["last_failure"]["reason"], "runner_exit_1")
 
     def test_dispatch_refuses_pending_unit(self):
         self.create_run()
@@ -420,7 +433,7 @@ class DestructiveCleanupTest(S.CliTestBase):
         self.create_run()
         code, _ = self.dispatch("alpha", "alpha.txt=a", mode="forged")
         self.assertEqual(code, 1)
-        self.assertEqual(self.unit("alpha")["state"], "failed")
+        self.assertEqual(self.unit("alpha")["reason"], "retry:handoff_invalid")
 
     def test_cleanup_without_archive_refuses_unique_work(self):
         self.failed_unit_with_commits()

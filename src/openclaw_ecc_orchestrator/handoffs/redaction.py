@@ -42,6 +42,10 @@ _PREFIX_PATTERNS = [
     r"xox[a-z]-[A-Za-z0-9\-]{10,}",
     r"(?:AKIA|ASIA)[A-Z0-9]{16}",
     r"hf_[A-Za-z0-9]{20,}",
+    # Provider account and key identifiers echoed in error bodies (Moonshot,
+    # observed 2026-10-18). Not secrets on their own, but they identify the account.
+    r"\bak-[a-z0-9]{16,}",
+    r"\borg-[0-9a-f]{24,}",
     r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
     r"(?i:bearer)\s+[A-Za-z0-9._~+/\-]{16,}=*",
 ]
@@ -66,8 +70,8 @@ _SECRET_NAME = re.compile(r"(?i)(?:%s)|(?:^|[_.-])(?:key|pass|pwd)(?:$|[_.-])" %
 _VALUE_RULES = [
     # NAME=value, NAME: value, "name": "value" with a secret looking name.
     re.compile(
-        r"(?i)\b[A-Za-z0-9_.-]*(?:%s|_key\b|_pass\b|_pwd\b)[A-Za-z0-9_.-]*[\"']?"
-        r"\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;\"']+)" % _NAME_WORDS),
+        r"(?i)\b[A-Za-z0-9_.-]*(?:%s|_key\b|_pass\b|_pwd\b)[A-Za-z0-9_.-]*(?:\\?[\"'])?"
+        r"\s*[:=]\s*(\\\"(?:[^\"\\]|\\[^\"])*\\\"|\"[^\"]*\"|'[^']*'|[^\s,;\"']+)" % _NAME_WORDS),
     # Authorization: <scheme> <credential>, or Authorization: <credential>.
     re.compile(r"(?i)\b(?:proxy-)?authorization\s*[:=]\s*(?:[A-Za-z]+\s+)?([^\s,;\"']{4,})"),
     # Bearer / Basic credentials of any length.
@@ -109,36 +113,104 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+# Absolute filesystem paths under these roots are judged one path segment at a
+# time by the high entropy rule. Otherwise a whole macOS temp path such as
+# /private/var/folders/6j/8_5x46rs.../T/tmpabc (mixed case, digits, slashes)
+# reads as one random token and gets masked. A segment that is itself long
+# and random is still masked, and the credential prefix rules apply anywhere.
+_PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
+               "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
+
+
 def _path_start(token: str) -> int:
-    """Index where an absolute path begins inside a token match, or -1.
+    """Index where an absolute path begins in ``token`` (at its start or right
+    after ``=`` / ``:`` as in ``cwd=/private/...``), or -1."""
+    best = -1
+    for root in _PATH_ROOTS:
+        idx = token.find(root)
+        while idx > 0 and token[idx - 1] not in "=:":
+            idx = token.find(root, idx + 1)
+        if idx >= 0 and (best < 0 or idx < best):
+            best = idx
+    return best
 
-    "/" is a token character because base64 secrets contain it, so a whole
-    path such as a venv interpreter would otherwise be scored as one token.
-    A path starts the match, or follows "=" (``cwd=/x``); base64 only uses
-    "=" as trailing padding, so "=/" does not occur inside a secret.
-    """
-    if token.startswith("/"):
-        return 0
-    i = token.find("=/")
-    return i + 1 if i >= 0 else -1
+
+# Orchestrator unit branches (``ecc/<run_id>/<unit_id>``, optionally under
+# ``refs/heads/``) are judged one segment at a time, like paths. Joined, a
+# time-stamped run id and a unit id often reach 32 characters with mixed
+# case and digits and would read as one random token (for example
+# ``ecc/smoke-20261019T005138Z/smoke``). A segment that is itself long and
+# random is still masked.
+_BRANCH_RE = re.compile(
+    r"(?:refs/heads/)?ecc/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _token_spans(m: re.Match) -> list[tuple[int, int]]:
-    token, base = m.group(0), m.start()
-    cut = _path_start(token)
-    if cut < 0:
+def _branch_spans(m: "re.Match[str]") -> list[tuple[int, int]] | None:
+    """Spans for a token holding an orchestrator branch, or None if it holds none."""
+    token = m.group(0)
+    for b in _BRANCH_RE.finditer(token):
+        if b.start() > 0 and token[b.start() - 1] != "=":
+            continue
+        if b.end() < len(token) and token[b.end()] not in "=":
+            continue
+        spans = []
+        for lo, hi in ((0, max(0, b.start() - 1)), (b.end(), len(token))):
+            part = token[lo:hi]
+            if len(part) >= 32 and _is_high_entropy(part):
+                spans.append((m.start() + lo, m.start() + hi))
+        offset = m.start() + b.start()
+        for segment in token[b.start():b.end()].split("/"):
+            if len(segment) >= 32 and _is_high_entropy(segment):
+                spans.append((offset, offset + len(segment)))
+            offset += len(segment) + 1
+        return spans
+    return None
+
+
+def _continues_path(m: "re.Match[str]") -> bool:
+    """True when the token resumes an absolute path right after a hidden
+    directory's dot ("/.local/share/..." splits at the dot, so the rest no
+    longer starts at a path root). A credential is never preceded by "/."."""
+    i = m.start()
+    return i >= 2 and m.string[i - 1] == "." and m.string[i - 2] == "/"
+
+
+# Repository-relative file paths (for example docs/prd/components/PRD-platform-v3.md)
+# are judged one segment at a time, like absolute paths: joined, the folders and a
+# versioned file name reach 32 characters with mixed case and digits. The token
+# stops at the extension's dot, so a following known extension marks the path.
+_FILE_EXT_RE = re.compile(r"\.(?:md|py|pyi|json|ya?ml|toml|txt|sql|sh|mjs|js|ts|html|css|cfg|ini|lock)\b")
+
+
+def _repo_relative_path(m: "re.Match[str]") -> bool:
+    return "/" in m.group(0) and _FILE_EXT_RE.match(m.string, m.end()) is not None
+
+
+def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
+    token = m.group(0)
+    branch = _branch_spans(m)
+    if branch is not None:
+        return branch
+    start = 0 if _continues_path(m) or _repo_relative_path(m) else _path_start(token)
+    if start < 0:
         return [m.span()] if _is_high_entropy(token) else []
-    # Score the text before the path as before, then each path segment alone.
-    parts = [(0, cut)] + [(cut + s.start(), cut + s.end()) for s in re.finditer(r"[^/]+", token[cut:])]
-    return [(base + a, base + b) for a, b in parts
-            if b - a >= _TOKEN_MIN_LEN and _is_high_entropy(token[a:b])]
+    spans = []
+    head = token[:start]
+    if len(head) >= 32 and _is_high_entropy(head):
+        spans.append((m.start(), m.start() + start))
+    offset = m.start() + start
+    for segment in token[start:].split("/"):
+        if len(segment) >= 32 and _is_high_entropy(segment):
+            spans.append((offset, offset + len(segment)))
+        offset += len(segment) + 1
+    return spans
 
 
 def _detect_spans(text: str) -> list[tuple[int, int]]:
     spans = [m.span() for m in _PREFIX_RE.finditer(text)]
     spans += [m.span() for m in _PEM_BLOCK_RE.finditer(text)]
     for m in _TOKEN_RE.finditer(text):
-        spans += _token_spans(m)
+        spans.extend(_entropy_spans(m))
     return spans
 
 
@@ -153,9 +225,43 @@ def _redaction_spans(text: str) -> list[tuple[int, int]]:
             if index == 0 and _AUTH_HEADER_RE.match(m.group(0)):
                 continue  # the header rule keeps the scheme and masks the credential
             value = m.group(1)
+            if index == 0 and _benign_named_value(text[m.start(0):m.start(1)], value):
+                continue
             if value and value != REDACTED and value.strip("\"'") != REDACTED:
-                spans.append(m.span(1))
+                start, end = m.span(1)
+                if len(value) >= 4 and value.startswith('\\"') and value.endswith('\\"'):
+                    # The same inside a JSON string, where the quotes are
+                    # escaped (live finding, rm-m0f M0-20).
+                    start, end = start + 2, end - 2
+                elif len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    # Mask inside the quotes so a JSON line stays JSON (live
+                    # finding, rm-m0b: "session_id":[REDACTED] broke Claude's
+                    # result line and its verdict and cost were lost).
+                    start, end = start + 1, end - 1
+                else:
+                    # An unquoted value keeps a trailing backslash: it escapes
+                    # the quote that ends the JSON string around it.
+                    end -= len(value) - len(value.rstrip("\\"))
+                if end > start:
+                    spans.append((start, end))
     return _merge(spans)
+
+
+# Usage counters such as "promptTokenCount": 12 or "max_tokens": 64 match the
+# secret name rule ("token") but hold plain numbers, never credentials.
+_COUNTER_NAME_RE = re.compile(r"(?i)(?:count|limit|tokens)[\"']?\s*[:=]\s*$")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?[}\]]*")  # "thinking_tokens":15327} ends an object
+_STRUCTURAL_VALUES = frozenset({"[", "{", "[]", "{}"})
+_JSON_LITERALS_RE = re.compile(r"(?:null|true|false)[}\]]*")
+
+
+def _benign_named_value(prefix: str, value: str) -> bool:
+    """True for values the name rule must leave visible (unquoted numbers of
+    counter or limit fields, bare JSON structure tokens, and JSON null, true
+    and false, as in "thinking_tokens":null)."""
+    if value in _STRUCTURAL_VALUES or _JSON_LITERALS_RE.fullmatch(value):
+        return True
+    return bool(_NUMBER_RE.fullmatch(value) and _COUNTER_NAME_RE.search(prefix))
 
 
 def _apply(text: str, spans: list[tuple[int, int]]) -> str:
@@ -179,6 +285,44 @@ def contains_secret(text: object) -> bool:
     if not isinstance(text, str) or not text:
         return False
     return bool(_spans(text))
+
+
+# JSON fields that carry provider generated opaque values (reasoning
+# signatures, pagination cursors, response ids). A high entropy value inside
+# one of these is not treated as a leaked credential during log inspection.
+# Credential prefixes and registered secret values still count everywhere.
+OPAQUE_FIELDS = ("thoughtSignature", "thought_signature", "nextPageToken", "next_page_token",
+                 "responseId", "response_id")
+_OPAQUE_VALUE_RE = re.compile(
+    r"\"(?:%s)\"\s*:\s*\"([^\"]*)\"" % "|".join(re.escape(f) for f in OPAQUE_FIELDS))
+
+
+def inspection_findings(texts: Iterable[object], secrets: Iterable[str] = ()) -> list[dict]:
+    """Credential findings in runner output, for the certification log check.
+
+    Each finding is ``{"text": index, "kind": ...}`` and never contains the
+    value. Kinds: ``registered_secret`` (a literal secret such as the
+    provider key), ``credential_pattern`` (known key prefixes, JWTs, private
+    key blocks) and ``high_entropy`` (a long random looking token outside the
+    opaque provider fields in :data:`OPAQUE_FIELDS`).
+    """
+    literal = [s for s in secrets if s]
+    findings: list[dict] = []
+    for index, text in enumerate(texts):
+        if not isinstance(text, str) or not text:
+            continue
+        if any(value in text for value in literal):
+            findings.append({"text": index, "kind": "registered_secret"})
+        if _PREFIX_RE.search(text) or _PEM_BLOCK_RE.search(text):
+            findings.append({"text": index, "kind": "credential_pattern"})
+        opaque = [m.span(1) for m in _OPAQUE_VALUE_RE.finditer(text)]
+        for m in _TOKEN_RE.finditer(text):
+            hits = [span for span in _entropy_spans(m)
+                    if not any(start <= span[0] and span[1] <= end for start, end in opaque)]
+            if hits:
+                findings.append({"text": index, "kind": "high_entropy"})
+                break
+    return findings
 
 
 def _replace_literals(text: str, values: Iterable[str]) -> str:

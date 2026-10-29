@@ -22,6 +22,10 @@ runner at a time, and writes ``DIR/<runner>.json``, a redacted
   is still checked for reachability without sending any key.
 * Disposable repositories live in a fresh temporary work root outside any git
   repository; each is removed after its result is recorded.
+* The cancellation check is event triggered: the probe prompt runs in the
+  CLI's streaming output mode and the process group is cancelled as soon as
+  the first stream event arrives, then proven gone. The former
+  ``--cancel-after`` timer option was removed.
 
 ``--dry-run`` executes nothing and prints the plan (argv, environment variable
 names, model selection method).
@@ -43,7 +47,7 @@ from typing import Any, Callable, Mapping
 from ..handoffs.redaction import redact_text
 from ..schemas import SCHEMA_VERSION
 from .base import ProbeContext, default_command_runner, minimal_env
-from .cli_adapters import ClaudeAdapter, CodexAdapter
+from .cli_adapters import CANCEL_ATTEMPTS, ClaudeAdapter, CodexAdapter
 from .discovery import (PROVIDER_ENDPOINTS, default_http_get, fetch_catalog, rank_models,
                         select_model)
 from .probes import ADAPTERS, probe
@@ -52,15 +56,18 @@ from .registry import certified_runners, get_profile
 DEFAULT_RUNNERS = ("claude", "codex", "gemini", "groq", "openrouter", "kimi")
 MAX_STEP_TIMEOUT = 180.0
 DEFAULT_STEP_TIMEOUT = 170.0
-DEFAULT_CANCEL_AFTER = {"claude": 60.0, "codex": 30.0}
 DEFAULT_EFFORT = "low"
 DEFAULT_CLAUDE_MODEL = "haiku"
 # Economical preference patterns (globs over live catalog ids, never ids).
 DEFAULT_CODEX_PREFERENCES = ["gpt-*-luna", "*-luna", "*mini*"]
 DEFAULT_API_PREFERENCES = {
     "gemini": ["gemini-*flash-lite", "gemini-*flash-lite-*", "gemini-*flash", "gemini-*flash-*"],
-    "groq": ["*instant*", "*-8b*", "*small*", "*mini*"],
-    "kimi": ["kimi-*", "moonshot-v1-8k*"],
+    # Groq's 2026-10 catalog has no "instant" or 8b model; its small general
+    # model is openai/gpt-oss-20b. Guard, speech and safeguard models never match.
+    "groq": ["*instant*", "*-8b*", "*/gpt-oss-20b", "gpt-oss-20b", "*small*", "*mini*"],
+    # Prefer the k2 coding models; kimi-k3 (reasoning only, max effort by
+    # default) is the flagship, kept for long context work, not cheap probes.
+    "kimi": ["kimi-k2*-code", "kimi-k2*", "kimi-*", "moonshot-v1-8k*"],
     "openrouter": [],
 }
 ECONOMICAL_WORKERS = ("gemini", "groq", "kimi", "openrouter")
@@ -186,7 +193,6 @@ class Options:
     dry_run: bool = False
     policy: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     step_timeout: float = DEFAULT_STEP_TIMEOUT
-    cancel_after: float | None = None
     effort: str | None = DEFAULT_EFFORT          # Codex reasoning effort
     claude_effort: str | None = None             # Claude --effort; None keeps the default
     claude_model: str | None = None
@@ -289,7 +295,8 @@ def plan_runner(name: str, opts: Options, deps: Deps) -> dict:
                                                   writable=True),
             "cancel_argv": adapter.build_cancel_invocation(model, cwd="<workdir>"),
             "step_timeout": opts.step_timeout,
-            "cancel_after": opts.cancel_after or DEFAULT_CANCEL_AFTER.get(name, 30.0)})
+            "cancel_trigger": "first stream event on stdout",
+            "cancel_attempts": CANCEL_ATTEMPTS})
         if name == "codex":
             plan["model_discovery_argv"] = adapter.models_argv
     else:
@@ -336,7 +343,6 @@ def certify_runner(name: str, opts: Options, deps: Deps, work_root: str) -> dict
     ctx_kwargs: dict[str, Any] = dict(
         run_command=deps.run_command, http_get=deps.http_get, env=deps.env, clock=deps.clock,
         step_timeout=min(float(opts.step_timeout), MAX_STEP_TIMEOUT),
-        cancel_timeout=float(opts.cancel_after or DEFAULT_CANCEL_AFTER.get(name, 30.0)),
         make_workdir=deps.make_workdir or make_workdir,
         cleanup_workdir=deps.cleanup_workdir or cleanup_workdir,
         model=model, policy=opts.policy, transcript=transcript,
@@ -416,7 +422,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--policy")
     parser.add_argument("--step-timeout", type=float, default=DEFAULT_STEP_TIMEOUT)
-    parser.add_argument("--cancel-after", type=float)
     parser.add_argument("--effort", default=DEFAULT_EFFORT, help="Codex reasoning effort")
     parser.add_argument("--claude-effort", help="Claude --effort (default: CLI default)")
     parser.add_argument("--claude-model")
@@ -428,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     runners = tuple(n.strip() for n in args.runners.split(",") if n.strip())
     opts = Options(runners=runners, out=args.out, dry_run=args.dry_run,
                    policy=load_policy(args.policy), step_timeout=args.step_timeout,
-                   cancel_after=args.cancel_after, effort=args.effort or None,
+                   effort=args.effort or None,
                    claude_effort=args.claude_effort or None,
                    claude_model=args.claude_model, codex_model=args.codex_model,
                    work_root=args.work_root)

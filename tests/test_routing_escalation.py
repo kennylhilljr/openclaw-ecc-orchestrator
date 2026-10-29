@@ -4,7 +4,7 @@ import unittest
 
 from openclaw_ecc_orchestrator.routing import classify as C
 from openclaw_ecc_orchestrator.routing.breaker import CircuitBreaker
-from openclaw_ecc_orchestrator.routing.escalation import AttemptOutcome, EscalationController
+from openclaw_ecc_orchestrator.routing.escalation import AttemptOutcome, EscalationController, replay
 
 
 class FakeClock:
@@ -88,6 +88,25 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(actions, ["repair", "escalate", "repair", "stop"])
         self.assertEqual(ctl.tier, 1)
 
+    def test_maximum_tier_uses_the_whole_attempt_budget(self):
+        """Live finding (rmcp-m0f): a unit starting at its maximum tier got 2 of 3 attempts."""
+        ctl = controller(unit(attempts=3, initial=2, maximum=2))
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(3)], ["repair", "repair", "stop"])
+        ctl = controller(unit(attempts=3, initial=0, maximum=1))
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(2)], ["repair", "escalate"])
+        self.assertEqual([ctl.record(FAIL)["action"] for _ in range(3)], ["repair", "repair", "stop"])
+
+    def test_owner_grant_is_spent_at_the_first_stop(self):
+        """`ecc resume --extra-attempts`: held in reserve, spent where the unit would stop, replay unchanged."""
+        failed = [{"passed": False, "objective_failure": True, "cost_usd": 0.1, "reason": "review"}] * 3
+        ctl = replay(controller(unit(attempts=3, initial=2, maximum=2)), failed, grant=1)
+        self.assertEqual(ctl.next_action()["action"], "repair")
+        self.assertEqual(ctl.record(FAIL)["action"], "stop")
+        early = replay(controller(unit(attempts=3, initial=2, maximum=2)), failed[:2], grant=1)
+        self.assertEqual([early.record(FAIL)["action"] for _ in range(2)], ["repair", "stop"])
+        low = replay(controller(unit(attempts=3, initial=0, maximum=1)), failed[:2], grant=1)
+        self.assertEqual((low.tier, low.next_action()["action"], low.reserve_grant), (1, "escalate", 1))
+
     def test_single_attempt_budget_escalates_without_repair(self):
         ctl = controller(unit(attempts=1))
         self.assertEqual(ctl.record(FAIL)["action"], "escalate")
@@ -127,14 +146,14 @@ class EscalationTests(unittest.TestCase):
         action = ctl.record(AttemptOutcome(passed=False, objective_failure=True, cost_usd=0.1))
         self.assertEqual(action["action"], "stop")
 
-    def test_time_budget_stops(self):
+    def test_time_budget_is_advisory(self):
         clock = FakeClock()
         ctl = controller(unit(minutes=10), clock=clock)
         ctl.next_action()
         clock.t = 11 * 60
         action = ctl.record(FAIL)
-        self.assertEqual(action["action"], "stop")
-        self.assertIn("time budget", action["reason"])
+        self.assertNotEqual(action["action"], "stop")
+        self.assertTrue(ctl.history[-1]["over_time_budget"])
 
     def test_elapsed_measured_by_clock(self):
         clock = FakeClock(100.0)
