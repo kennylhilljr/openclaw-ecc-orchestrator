@@ -330,6 +330,65 @@ class SharedGitStateGuardTests(IntegrationBase):
         u = m.load("r1")["units"]["a"]
         self.assertEqual((u["state"], u["last_reason"]), ("needs_user", "shared_git_state_changed"))
 
+    # Issue #11 (rm-m0f): the owner's own pushes and commits stopped units whose
+    # files they never touched.
+    def owner_commit(self, path, content):
+        with open(os.path.join(self.repo, path), "w") as fh:
+            fh.write(content)
+        git(self.repo, "add", path)
+        git(self.repo, "commit", "-q", "-m", f"owner: {path}")
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def run_a_while(self, c, during):
+        """Run unit a (scope a.txt) and call `during()` while its runner waits."""
+        from openclaw_ecc_orchestrator.runs import conductor as C
+        if C.DEFAULT_GIT_STATE_GUARD is None:
+            self.skipTest("worktrees.guard not available")
+        self.ok(c.create_run(plan(work_unit("a", files=["a.txt"], commands=[exists_cmd("a.txt")])), run_id="r1"))
+        flag = os.path.join(self.tmp, "go")
+        self.ok(c.assign_unit("r1", "a"))
+        self.ok(c.start_unit("r1", "a", self.gated_argv(flag, "a.txt=a")))
+        during()
+        open(flag, "w").close()
+        return c.wait_unit("r1", "a")
+
+    def test_remote_tracking_ref_moves_are_not_a_violation(self):
+        c, m, _ = self.conductor("c1")
+
+        def push():
+            head = git(self.repo, "rev-parse", "HEAD")
+            git(self.repo, "update-ref", "refs/remotes/origin/main", head)
+            git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+            git(self.repo, "pack-refs", "--all")
+        self.ok(self.run_a_while(c, push))
+        self.assertEqual(m.load("r1")["units"]["a"]["state"], "reviewing")
+
+    def test_target_commit_outside_every_scope_continues_with_a_note(self):
+        c, m, _ = self.conductor("c1")
+        self.ok(self.run_a_while(c, lambda: self.owner_commit("LICENSE", "MIT\n")))
+        u = m.load("r1")["units"]["a"]
+        self.assertEqual(u["state"], "reviewing")
+        note = u["annotations"]["notes"]["target_moved_outside_scope"]
+        self.assertEqual((note["ref"], note["files"], note["touches_scope"]), ("refs/heads/main", ["LICENSE"], False))
+
+    def test_target_commit_inside_a_scope_stops(self):
+        c, m, _ = self.conductor("c1")
+        self.assertFalse(self.run_a_while(c, lambda: self.owner_commit("a.txt", "owner\n"))["ok"])
+        u = m.load("r1")["units"]["a"]
+        self.assertEqual((u["state"], u["last_reason"]), ("needs_user", "shared_git_state_changed"))
+        notes = u["annotations"]["notes"]
+        self.assertTrue(notes["touches_scope"])
+        self.assertTrue(notes["refs_only"])
+
+    def test_target_rewrite_touches_scope(self):
+        from openclaw_ecc_orchestrator.worktrees.guard import target_move_paths
+        base = git(self.repo, "rev-parse", "HEAD")
+        first = self.owner_commit("LICENSE", "MIT\n")
+        git(self.repo, "reset", "-q", "--hard", base)
+        second = self.owner_commit("NOTICE", "n\n")
+        self.assertEqual(target_move_paths(self.repo, base, first), ["LICENSE"])
+        self.assertIsNone(target_move_paths(self.repo, first, second))
+
 
 if __name__ == "__main__":
     unittest.main()

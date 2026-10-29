@@ -27,7 +27,7 @@ MAX_STEPS = 500
 
 # Self-healing before the owner is interrupted (TEAM-DELIVERY v5 section 7.1). Each
 # kind has a per-unit cap that persists across drives of the same run.
-HEAL_CAPS = {"grant": 2, "review": 2, "conflict": 2, "blocked_handoff": 1}
+HEAL_CAPS = {"grant": 2, "review": 2, "conflict": 2, "blocked_handoff": 1, "git_state": 2}
 GRANTABLE = {"escalation_stopped", "budget_exhausted", "runner_needs_user"}
 REVIEW_STALLS = {"no_qualified_reviewer", "no_qualified_verifier", "verifier_inconclusive"}
 OWNER_ONLY = {"runner_auth", "runner_missing", "runner_permission_denied", "routing_invalid",
@@ -213,6 +213,13 @@ class Drive:
                 if self._heal_once(uid, "review"):
                     m.transition(self.run_id, self.c.id, uid, S.REVIEWING, reason="heal_review_stall")
                     healed.append((uid, "review stall: back to the team review"))
+            elif u["state"] == S.NEEDS_USER and reason == "shared_git_state_changed" \
+                    and (ann.get("notes") or {}).get("refs_only") and not (ann.get("notes") or {}).get("touches_scope"):
+                # Only refs moved and no commit touched an active scope (the owner's
+                # branch or tag, a pack-refs): retry without the owner (issue #11).
+                if self._heal_once(uid, "git_state"):
+                    m.transition(self.run_id, self.c.id, uid, S.READY, reason="retry:heal_shared_git_state")
+                    healed.append((uid, "shared git state: refs moved outside every scope, retried"))
             elif u["state"] == S.BLOCKED and self._heal_once(uid, "conflict"):
                 m.annotate_unit(self.run_id, self.c.id, uid, "last_failure", {
                     "reason": "merge_conflict", "at": iso(self.clock()),

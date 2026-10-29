@@ -10,6 +10,11 @@ runner starts and compare after it exits::
     changes = diff_shared_git_state(before, snapshot_shared_git_state(repo),
                                     allow_refs=["refs/heads/ecc/<run>/<unit>"])
 
+Remote-tracking refs (``refs/remotes/*``) are not shared state a runner can
+abuse: they only mirror what a fetch saw, and the owner's own push or pull
+moves them. Their moves, and ``packed-refs`` rewrites that only reflect them,
+are ignored.
+
 Every string in ``changes`` is a human readable violation. Config values are
 never echoed (they may hold credentials or payloads); only key names are.
 Snapshots are plain JSON serialisable dicts. All git calls go through the
@@ -147,7 +152,12 @@ def snapshot_shared_git_state(repo_path) -> dict:
     return snap
 
 
+REMOTE_TRACKING_PREFIX = "refs/remotes/"
+
+
 def _allowed(ref, allow_refs):
+    if ref.startswith(REMOTE_TRACKING_PREFIX):
+        return True
     for pattern in allow_refs or ():
         pattern = str(pattern)
         candidates = {pattern} if pattern.startswith("refs/") else {pattern, "refs/heads/" + pattern}
@@ -174,7 +184,8 @@ def diff_shared_git_state(before, after, allow_refs=()) -> list:
     """Human readable changes between two snapshots, ignoring ``allow_refs``.
 
     ``allow_refs`` entries are full ref names, glob patterns, or branch names
-    (``ecc/r1/u1`` means ``refs/heads/ecc/r1/u1``).
+    (``ecc/r1/u1`` means ``refs/heads/ecc/r1/u1``). Remote-tracking refs are
+    always allowed.
     """
     changes = []
     if before.get("common_dir") != after.get("common_dir"):
@@ -224,4 +235,23 @@ def _only_allowed_ref_changes(b_refs, a_refs, allow_refs):
     return bool(changed) and all(_allowed(r, allow_refs) for r in changed)
 
 
-__all__ = ["snapshot_shared_git_state", "diff_shared_git_state", "RISKY_CONFIG_PATTERNS", "REF_NAMESPACES"]
+def refs_only(changes) -> bool:
+    """True when every change is a ref create, move or delete (or a packed-refs
+    rewrite), never a config, hook or object storage change."""
+    return bool(changes) and all(c.startswith(("ref created: ", "ref moved: ", "ref deleted: "))
+                                 or c == "packed-refs changed" for c in changes)
+
+
+def target_move_paths(repo_path, old, new):
+    """Files the commits ``old..new`` on a moved branch change, or None when
+    ``new`` does not descend from ``old`` (a rewrite, which is never benign)."""
+    if not old or not new:
+        return None
+    if run_git(["merge-base", "--is-ancestor", old, new], repo_path, check=False).returncode != 0:
+        return None
+    out = git_out(["diff", "--name-only", "--no-renames", old, new], repo_path)
+    return [line for line in out.splitlines() if line]
+
+
+__all__ = ["snapshot_shared_git_state", "diff_shared_git_state", "refs_only", "target_move_paths",
+           "RISKY_CONFIG_PATTERNS", "REF_NAMESPACES", "REMOTE_TRACKING_PREFIX"]

@@ -325,8 +325,17 @@ changes are the unit's own branch, the branches of the run's other units
 (the conductor creates them and their runners commit to them in parallel),
 and target branch moves made by this conductor's own merges (the baseline of
 every in flight unit is advanced only when it still shows the pre merge
-commit). Anything else moves the unit to `needs_user` with reason
-`shared_git_state_changed` and an `attention.required` event. Tampering with
+commit). Remote-tracking refs (`refs/remotes/*`, including `origin/HEAD`)
+are ignored: the owner's push or pull moves them. A target branch move by
+anyone else is judged by its new commits: when the old tip is an ancestor of
+the new one and no changed file falls inside the scope of this unit or any
+active unit (an owner's README or LICENSE commit), the unit continues and
+gets a `target_moved_outside_scope` note; its next merge of the target picks
+the commits up. Anything else moves the unit to `needs_user` with reason
+`shared_git_state_changed` and an `attention.required` event. The unit's
+`notes` record `touches_scope` and `refs_only`; when only refs moved and no
+scope was touched, `ecc drive` returns the unit to `ready` itself (at most
+twice per unit) instead of stopping for the owner. Tampering with
 another unit's branch is caught later: the queue refuses a tip that differs
 from that unit's verified head.
 
@@ -530,7 +539,10 @@ and `objects/info/alternates`, digests of risky config keys (for example
 returns readable lines such as `ref moved: refs/heads/main a1b2 -> c3d4`,
 `risky config added: config:core.fsmonitor` or `hook added: hooks/post-merge`.
 Config values are never echoed. `allow_refs` takes full ref names, globs, or
-branch names (the unit branch is usually the only one). Take the snapshot
+branch names (the unit branch is usually the only one); remote-tracking refs
+are always allowed. `target_move_paths(repo, old, new)` lists the files a
+branch move changed, or returns None for a rewrite, and `refs_only(changes)`
+says whether a diff holds nothing but ref moves. Take the snapshot
 before the runner starts and diff after it exits; any line is a violation.
 Worker set filter drivers would run during a later checkout of the unit
 branch, so a non empty diff must stop the unit before its branch is merged.

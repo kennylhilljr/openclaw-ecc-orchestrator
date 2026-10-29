@@ -60,7 +60,7 @@ from .envelope import SCHEMA_VERSION, check, envelope
 from .store import StoreError, iso
 
 try:  # provided by the worktrees package; optional until it lands
-    from ..worktrees.guard import diff_shared_git_state, snapshot_shared_git_state
+    from ..worktrees.guard import diff_shared_git_state, refs_only, snapshot_shared_git_state, target_move_paths
     DEFAULT_GIT_STATE_GUARD = (snapshot_shared_git_state, diff_shared_git_state)
 except ImportError:  # pragma: no cover - depends on the installed tree
     DEFAULT_GIT_STATE_GUARD = None
@@ -846,6 +846,25 @@ class Conductor:
                 refs.append(f"refs/heads/{self.worktrees.paths(run['run_id'], uid)['branch']}")
         return refs
 
+    def _target_move(self, run, unit_id, before, after):
+        """The target branch's move during a runner's window, judged by its new
+        commits: a fast-forward whose files fall outside every active unit's
+        scope (the owner's README or LICENSE commit, a pull of either) is not
+        the unit's business; its next merge of the target picks it up. A
+        rewrite, or a file inside any active scope, touches the scope. None
+        when the target did not move (live finding, rm-m0f: four units stopped
+        for commits that touched none of them)."""
+        ref = f"refs/heads/{self.target}"
+        old, new = (before.get("refs") or {}).get(ref), (after.get("refs") or {}).get(ref)
+        if old == new or not old or not new:
+            return None
+        files = target_move_paths(self.worktrees.repo, old, new)
+        scopes = [list((self.manager.plan_unit(run, uid).get("scope") or {}).get("files") or [])
+                  for uid, u in sorted(run["units"].items()) if uid == unit_id or u["state"] in S.ACTIVE]
+        touched = files is None or any(out_of_scope_changes(files, scope) != files for scope in scopes)
+        return {"ref": ref, "old": old[:12], "new": new[:12], "files": (files or [])[:50],
+                "touches_scope": touched}
+
     def _note_own_ref_move(self, ref, old, new):
         """The conductor itself moved `ref` (a local merge): advance every
         in-flight unit's baseline for that ref, but only when the baseline
@@ -903,16 +922,24 @@ class Conductor:
             before = self._git_before.get(key)
             if self.git_state_guard is not None and before is not None:
                 after = self.git_state_guard[0](self.worktrees.repo)
-                changes = list(self.git_state_guard[1](before, after,
-                                                       allow_refs=self._allowed_refs(run, unit_id)))
+                allow = self._allowed_refs(run, unit_id)
+                target_move = self._target_move(run, unit_id, before, after)
+                if target_move and not target_move["touches_scope"]:
+                    allow.append(target_move["ref"])
+                changes = list(self.git_state_guard[1](before, after, allow_refs=allow))
+                if target_move and not target_move["touches_scope"] and not changes:
+                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes",
+                                               {"target_moved_outside_scope": target_move})
                 if changes:
                     data["shared_git_state_changes"] = changes
                     res = self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER,
                                                   reason="shared_git_state_changed")
                     if not res["ok"]:
                         return envelope(op, ok=False, checks=res["checks"], data=data), False
-                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes",
-                                               {"shared_git_state_changes": changes})
+                    self.manager.annotate_unit(run_id, self.id, unit_id, "notes", {
+                        "shared_git_state_changes": changes,
+                        "touches_scope": bool(target_move and target_move["touches_scope"]),
+                        "refs_only": refs_only(changes)})
                     return envelope(op, ok=False, changed=True,
                                     checks=[check("shared_git_state_unchanged", False, ", ".join(changes))],
                                     required_user_actions=[{"kind": "resolve_needs_user", "run_id": run_id,

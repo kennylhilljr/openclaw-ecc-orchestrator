@@ -48,6 +48,31 @@ class V5Tests(DriveBase):
         self.assertEqual(alpha["annotations"]["budget_grant"]["by"], "delivery_lead")
         self.assertEqual(self.dispatched.count("alpha"), 2)
 
+    def git_state_stop(self, notes):
+        drive = self.make(self.units2())
+        self.ok(self.c.assign_unit("r1", "alpha"))
+        self.m.transition("r1", self.c.id, "alpha", "running", reason="attempt 1")
+        self.m.transition("r1", self.c.id, "alpha", "needs_user", reason="shared_git_state_changed")
+        self.m.annotate_unit("r1", self.c.id, "alpha", "notes", notes)
+        return drive.heal(self.m.load("r1")["units"], ["alpha"])
+
+    def test_git_state_stop_outside_every_scope_is_retried_by_the_delivery_lead(self):
+        """Issue #11: refs moved, no active scope touched, so the drive resumes the unit itself."""
+        healed = self.git_state_stop({"shared_git_state_changes": ["ref created: refs/tags/v1 at abc"],
+                                      "touches_scope": False, "refs_only": True})
+        self.assertEqual([uid for uid, _ in healed], ["alpha"])
+        self.assertEqual(self.m.load("r1")["units"]["alpha"]["state"], "ready")
+
+    def test_git_state_stop_inside_a_scope_waits_for_the_owner(self):
+        self.assertEqual(self.git_state_stop({"shared_git_state_changes": ["ref moved: refs/heads/main a -> b"],
+                                              "touches_scope": True, "refs_only": True}), [])
+        self.assertEqual(self.m.load("r1")["units"]["alpha"]["state"], "needs_user")
+
+    def test_git_state_stop_beyond_refs_waits_for_the_owner(self):
+        self.assertEqual(self.git_state_stop({"shared_git_state_changes": ["hook added: hooks/pre-commit"],
+                                              "touches_scope": False, "refs_only": False}), [])
+        self.assertEqual(self.m.load("r1")["units"]["alpha"]["state"], "needs_user")
+
     def test_repeated_block_stops_with_exact_next_steps(self):
         drive = self.make_modes(self.units2(), {"alpha": ["blocked"]})
         res = drive.go()
