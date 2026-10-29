@@ -196,6 +196,50 @@ def test_acceptance_command_paths_report_missing_and_unsafe_tokens():
     }
 
 
+def test_acceptance_command_output_paths_are_not_required_inputs():
+    plan = fixture()
+    plan["units"][0]["acceptance"]["commands"] = [
+        "pytest --junit-xml=reports/junit.xml tests/test_plan_lint.py",
+        "pytest --junitxml reports/alternate.xml tests/test_plan_lint.py",
+        "pytest --html=reports/results.html --log-file reports/pytest.log",
+    ]
+    result = lint_plan(
+        plan,
+        target_paths=["tests/test_plan_lint.py", "schemas/work_unit.schema.json", "docs/runtime.md"],
+    )
+    assert not any(
+        finding["code"].startswith("acceptance.command_path")
+        for finding in result["findings"]
+    )
+
+
+def test_acceptance_command_output_flags_do_not_hide_input_paths():
+    plan = fixture()
+    plan["units"][0]["acceptance"]["commands"] = [
+        "pytest --junit-xml reports/junit.xml missing/test_plan.py",
+    ]
+    result = lint_plan(plan, target_paths=[])
+    assert [
+        finding["paths"]
+        for finding in result["findings"]
+        if finding["code"] == "acceptance.command_path_missing"
+    ] == [["missing/test_plan.py"]]
+
+
+def test_malformed_depends_on_values_remain_deterministic_dag_findings():
+    for malformed in (None, 7, ["generate-schema", {"unit": "docs"}]):
+        plan = fixture()
+        plan["units"][1]["depends_on"] = malformed
+        first = lint_plan(plan, target_paths=[])
+        second = lint_plan(copy.deepcopy(plan), target_paths=[])
+        assert first == second
+        assert any(
+            finding["code"] == "dag.invalid_depends_on"
+            and finding["unit_ids"] == ["consume-schema"]
+            for finding in first["findings"]
+        )
+
+
 def test_repository_path_requirement_can_be_satisfied_by_target_tree():
     plan = fixture()
     plan["units"][1]["requires"] = ["schemas/work_unit.schema.json"]

@@ -39,6 +39,20 @@ _PATH_SUFFIXES = (
     ".yml",
 )
 
+# These options name files created by common acceptance tools.  Keep this
+# allowlist explicit: treating every option argument as an output would hide
+# genuine input-path mistakes (for example, pytest's ``--rootdir``).
+_OUTPUT_PATH_FLAGS = {
+    "--html",
+    "--json-report-file",
+    "--junit-xml",
+    "--junitxml",
+    "--log-file",
+    "--output",
+    "--output-file",
+    "-o",
+}
+
 
 def _finding(code, message, *, unit_ids=(), paths=()):
     return {"code": code, "message": message, "unit_ids": sorted(unit_ids), "paths": sorted(paths)}
@@ -173,6 +187,14 @@ def _argument_paths(tokens, program):
             continue
         if any(flag.startswith("--") and token.startswith(flag + "=") for flag in inline_flags):
             continue
+        if token in _OUTPUT_PATH_FLAGS:
+            skip_next = True
+            continue
+        if any(
+            flag.startswith("--") and token.startswith(flag + "=")
+            for flag in _OUTPUT_PATH_FLAGS
+        ):
+            continue
         if token in {"--command", "-m"}:
             # Module names and non-interpreter inline commands are not paths.
             skip_next = True
@@ -292,10 +314,17 @@ def lint_plan(plan, *, target_paths=(), policy=None):
         units = []
     by_id = {unit["id"]: unit for unit in units}
     ids = sorted(by_id)
-    deps = {
-        uid: [dep for dep in by_id[uid].get("depends_on", []) if dep in by_id]
-        for uid in ids
-    }
+    deps = {}
+    for uid in ids:
+        raw_deps = by_id[uid].get("depends_on", [])
+        # ``analyze_plan`` already emits dag.invalid_depends_on.  Traverse a
+        # sanitized view so malformed values cannot replace that useful,
+        # deterministic finding with an exception from this secondary pass.
+        if not isinstance(raw_deps, list):
+            raw_deps = []
+        deps[uid] = [
+            dep for dep in raw_deps if isinstance(dep, str) and dep in by_id
+        ]
     ancestors = _ancestors(ids, deps)
     scopes = {
         uid: (by_id[uid].get("scope") or {}).get("files") or []
