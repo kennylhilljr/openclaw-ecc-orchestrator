@@ -15,7 +15,9 @@ OpenClaw boundary. The event and approval contract is in
 | `runs.fsutil` | atomic JSON write, durable JSONL append, flock based `FileLock` |
 | `runs.state` | unit state machine and transition table |
 | `runs.manager` | `RunManager`: leases, transitions, assignment, handoffs, budgets, resume |
-| `runs.liveness` | pid liveness with zombie and pid reuse detection (Linux `/proc`) |
+| `runs.plan_lint` | deterministic, read only plan lint behind `lint-plan` and `create-run` |
+| `runs.repair` | repair loop helpers: runner failure classification and the failure evidence for the next attempt |
+| `runs.liveness` | pid liveness with zombie and pid reuse detection (Linux `/proc`, `ps` start times on macOS and the BSDs) |
 | `runs.conductor` | `Conductor` facade tying one unit's lifecycle together |
 | `runs.envelope` | the boundary result envelope |
 | `worktrees.manager` | one branch plus one worktree per unit, root validation, safe cleanup |
