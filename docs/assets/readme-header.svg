@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">OpenClaw ECC Orchestrator</title>
+  <desc id="desc">A midnight blue banner. A coral OpenClaw claw grips the top of the mint, blue and violet ECC stack, with a circuit trace running back to it. Route, run, verify, merge.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1224"/><stop offset="1" stop-color="#182642"/></linearGradient>
+    <linearGradient id="accent"><stop stop-color="#fb7185"/><stop offset=".5" stop-color="#6ee7b7"/><stop offset="1" stop-color="#93c5fd"/></linearGradient>
+    <linearGradient id="claw" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#4a1f36"/><stop offset="1" stop-color="#2b1a33"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#8ba6cf" stroke-opacity=".07"/></pattern>
+  </defs>
+  <rect width="1280" height="360" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="360" rx="24" fill="url(#grid)"/>
+  <path d="M56 68H120" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <text x="56" y="111" fill="#9cb1cf" font-size="14" font-weight="600" letter-spacing="4">OPENCLAW <tspan fill="#fb7185">×</tspan> ECC</text>
+    <text x="52" y="178" fill="#f3f7ff" font-size="52" font-weight="750" letter-spacing="-1.5"><tspan fill="#fda4af">OpenClaw</tspan> ECC Orchestrator</text>
+    <text x="56" y="224" fill="#c1cfe4" font-size="22">Task plans in. Reviewed, merged code out.</text>
+    <text x="56" y="294" fill="#6ee7b7" font-size="14" font-weight="600" letter-spacing="2">ROUTE</text>
+    <circle cx="134" cy="289" r="3" fill="#627b9f"/>
+    <text x="154" y="294" fill="#93c5fd" font-size="14" font-weight="600" letter-spacing="2">RUN</text>
+    <circle cx="213" cy="289" r="3" fill="#627b9f"/>
+    <text x="233" y="294" fill="#c4b5fd" font-size="14" font-weight="600" letter-spacing="2">VERIFY</text>
+    <circle cx="313" cy="289" r="3" fill="#627b9f"/>
+    <text x="333" y="294" fill="#fda4af" font-size="14" font-weight="600" letter-spacing="2">MERGE</text>
+  </g>
+  <g transform="translate(990 92)" fill="none" stroke-linejoin="round">
+    <circle cx="100" cy="110" r="134" stroke="#6b8bb7" stroke-opacity=".15" stroke-dasharray="4 12"/>
+    <path d="M0 160L100 214L200 160V134L100 188L0 134Z" fill="#202b50" stroke="#a78bfa" stroke-width="2"/>
+    <path d="M0 134L100 80L200 134L100 188Z" fill="#25365a" stroke="#a78bfa" stroke-width="2"/>
+    <path d="M0 106L100 160L200 106V80L100 134L0 80Z" fill="#193a54" stroke="#60a5fa" stroke-width="2"/>
+    <path d="M0 80L100 26L200 80L100 134Z" fill="#1b3d59" stroke="#60a5fa" stroke-width="2"/>
+    <path d="M0 52L100 106L200 52V26L100 80L0 26Z" fill="#15434c" stroke="#6ee7b7" stroke-width="2"/>
+    <path d="M0 26L100 -28L200 26L100 80Z" fill="#1c4b52" stroke="#6ee7b7" stroke-width="2"/>
+    <path d="M72 25L92 14M72 25L92 36M128 25L108 14M128 25L108 36" stroke="#c1fff0" stroke-width="3" stroke-linecap="round"/>
+    <path d="M200 160V184H242V106H200" stroke="#6985ae" stroke-width="2"/>
+    <circle cx="242" cy="106" r="5" fill="#93c5fd"/>
+  </g>
+  <g transform="translate(1010 131)" fill="none" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M-206 128C-190 106 -170 90 -150 78" stroke="#fb7185" stroke-opacity=".55" stroke-width="2" stroke-dasharray="3 7"/>
+    <circle cx="-206" cy="128" r="5" fill="#fb7185"/>
+    <path d="M-118 20L-98 32L-136 84L-156 72Z" fill="url(#claw)" stroke="#fb7185" stroke-width="2.5"/>
+    <ellipse cx="-92" cy="4" rx="36" ry="30" fill="url(#claw)" stroke="#fb7185" stroke-width="2.5"/>
+    <path d="M-72 -14C-62 -64 -8 -70 12 -26C-8 -42 -38 -40 -52 -6Z" fill="url(#claw)" stroke="#fb7185" stroke-width="2.5"/>
+    <path d="M-72 20C-60 56 -14 58 8 24C-14 36 -40 32 -52 12Z" fill="url(#claw)" stroke="#fb7185" stroke-width="2.5"/>
+    <path d="M-36 -36L-32 -28M-22 -38L-20 -30M-34 32L-30 25M-20 34L-18 27" stroke="#fda4af" stroke-width="2"/>
+    <path d="M-104 -8C-98 -16 -88 -18 -80 -14" stroke="#fda4af" stroke-opacity=".6" stroke-width="2"/>
+  </g>
+</svg>

@@ -1,3 +1,5 @@
+![OpenClaw ECC Orchestrator: route, run, verify, merge](docs/assets/readme-header.svg)
+
 # OpenClaw ECC Orchestrator
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399)](LICENSE)
