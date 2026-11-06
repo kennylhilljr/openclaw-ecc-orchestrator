@@ -1,0 +1,157 @@
+# Backup PR review for when the Mac running `prbot watch` is offline.
+#
+# Every 30 minutes this finds open, non-draft PRs whose head commit is at least
+# STALE_MINUTES old and has no review from prbot ("Reviewed commit `<sha>`") or
+# from this workflow ("Backup review of commit `<sha>`"). Claude reviews each
+# one read-only with the same prompt prbot uses, and the review is posted as
+# claude[bot] through the Claude GitHub App.
+#
+# Installed into a repo as .github/workflows/backup-review.yml by
+# integrations/github-actions/install-backup-review.sh.
+
+name: Backup review
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-review
+  cancel-in-progress: false
+
+env:
+  STALE_MINUTES: "120"
+  MAX_REVIEWS: "3"
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.find.outputs.prs }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          picked='[]'
+          for row in $(gh pr list -R "$REPO" --state open --limit 100 \
+              --json number,isDraft,headRefOid \
+              --jq '.[] | select(.isDraft | not) | "\(.number):\(.headRefOid)"'); do
+            n=${row%%:*}; sha=${row#*:}; short=${sha:0:10}
+            when=$(gh api "repos/$REPO/commits/$sha" --jq '.commit.committer.date')
+            age=$(( (now - $(date -u -d "$when" +%s)) / 60 ))
+            if [ "$age" -lt "$STALE_MINUTES" ]; then
+              continue
+            fi
+            done_already=$( { gh api --paginate "repos/$REPO/pulls/$n/reviews" --jq '.[].body'
+                              gh api --paginate "repos/$REPO/issues/$n/comments" --jq '.[].body'; } \
+              | grep -cE "(Reviewed commit|Backup review of commit) \`$short" || true)
+            if [ "$done_already" -gt 0 ]; then
+              continue
+            fi
+            echo "PR #$n at $short: no review after $age minutes"
+            picked=$(jq -c --argjson n "$n" --arg sha "$sha" '. + [{number: $n, sha: $sha}]' <<<"$picked")
+            if [ "$(jq length <<<"$picked")" -ge "$MAX_REVIEWS" ]; then
+              break
+            fi
+          done
+          echo "prs=$picked" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: find
+    if: needs.find.outputs.prs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pr: ${{ fromJSON(needs.find.outputs.prs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.pr.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Save the diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr.number }}
+          SHA: ${{ matrix.pr.sha }}
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR" -R "$REPO" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$SHA" ]; then
+            echo "PR #$PR moved to $head; the next run will look at it"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gh pr diff "$PR" -R "$REPO" > "$RUNNER_TEMP/pr.diff"
+          gh pr view "$PR" -R "$REPO" --json url,title > "$RUNNER_TEMP/pr.json"
+
+      - id: claude
+        if: env.SKIP != '1'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are reviewing GitHub pull request #${{ matrix.pr.number }} in ${{ github.repository }}. Its URL and title are in ${{ runner.temp }}/pr.json.
+            The full diff is in ${{ runner.temp }}/pr.diff. The current directory is a checkout of the PR's head commit; read files there for context if useful.
+
+            First read the repository's agent instructions if there are any (AGENTS.md, CLAUDE.md and the files they point to). Breaking a rule written there is a defect.
+
+            Find real defects. Check the change for each of these:
+            - Behavior: wrong results, missed edge cases (empty, missing, duplicate, very large or malformed input), races, and broken assumptions in the code the diff calls or is called by.
+            - Silent failures: errors caught and dropped, broad catches that also hide unrelated errors, fallbacks or default values returned on error without saying so, retries that give up quietly, and fakes or stubs reachable outside tests.
+            - Error messages: whether someone who hits the failure can tell what went wrong and what to do next.
+            - Security: injection, unchecked input reaching a shell, path or query, secrets in code or logs, and permission checks that can be skipped.
+            - Tests: tests that do not test what they claim, assertions that pass whether or not the code works, and new behavior or error paths with no test that would catch a regression. Name the missing test and the bug it would catch.
+            - Comments and docs: comments, docstrings and docs that no longer match what the code does after this change.
+            - Project rules: anything that breaks the agent instructions you read.
+            Skip style nits a linter would catch, matters of taste, and problems that were there before this PR and that it does not make worse.
+
+            Report a finding only when you are at least 80% sure it is real after reading the code involved. If you are less sure, read more of the surrounding code until you are, or leave it out.
+            For each finding give a priority (P1 breaks something, P2 likely bug, P3 minor), the file and line, what goes wrong with a concrete input, and the fix. Use the labels P1, P2 and P3 only to label findings.
+            If you find nothing worth reporting, say so in one sentence.
+
+            Put the review text, in GitHub Markdown and ready to post, in the "review" field of your structured output. Do not post anything yourself or change any file.
+          claude_args: >-
+            --allowedTools Read,Grep,Glob
+            --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch
+            --json-schema '{"type":"object","properties":{"review":{"type":"string","minLength":1}},"required":["review"]}'
+
+      - name: Post the review as claude[bot]
+        if: env.SKIP != '1' && steps.claude.outputs.structured_output != ''
+        env:
+          GH_TOKEN: ${{ steps.claude.outputs.github_token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr.number }}
+          SHA: ${{ matrix.pr.sha }}
+          REVIEW: ${{ fromJSON(steps.claude.outputs.structured_output).review }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016  # the backticks are Markdown
+          {
+            printf '%s\n\n' "$REVIEW"
+            printf -- '---\n<sub>Backup review of commit `%s` by the Claude Code GitHub Action, because prbot had not reviewed it after %s minutes. [Run](%s)</sub>\n' \
+              "${SHA:0:10}" "$STALE_MINUTES" "$RUN_URL"
+          } > "$RUNNER_TEMP/review.md"
+          gh pr review "$PR" -R "$REPO" --comment --body-file "$RUNNER_TEMP/review.md"
