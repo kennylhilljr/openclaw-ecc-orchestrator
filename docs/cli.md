@@ -516,10 +516,11 @@ holding an unexpired lease blocks the CLI (exit 1, `lease_held`).
 
 ## Limitations
 
-* No `resume` or `reassign` subcommand yet: a unit left `running` by a
-  crashed `dispatch`, or a unit in `needs_user` after its fix, needs the
-  Python API (`Conductor.resume`, `RunManager.transition`, `reassign_unit`).
-  Failed units within budget return to `ready` on their own (repair loop).
+* `resume` takes only units in `needs_user` or `failed`, and there is no
+  `reassign` subcommand. A unit left `assigned` or `running` by a crashed
+  `dispatch`, or one marked `interrupted`, needs the Python API
+  (`Conductor.resume`, `RunManager.transition`, `reassign_unit`). Failed
+  units within budget return to `ready` on their own (repair loop).
 * `dispatch` blocks until the runner exits and verification finishes. There
   is no wall clock limit; a runner is cancelled only when health checks find
   it hung (see [runtime.md](runtime.md#health-monitoring-instead-of-wall-clock-kills)).
