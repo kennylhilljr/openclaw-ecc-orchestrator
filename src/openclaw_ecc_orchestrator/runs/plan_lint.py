@@ -53,6 +53,14 @@ _OUTPUT_PATH_FLAGS = {
     "-o",
 }
 
+# These options take a test name pattern, not a path.  ``unittest discover``
+# matches ``-p`` against file names (``-p test_iwb.py``), and ``-k`` selects
+# tests by name in both tools.  pytest's ``-p`` names a plugin module.
+_PATTERN_FLAGS = {
+    "pytest": {"-k", "-p"},
+    "unittest": {"-k", "-p", "--pattern"},
+}
+
 
 def _finding(code, message, *, unit_ids=(), paths=()):
     return {"code": code, "message": message, "unit_ids": sorted(unit_ids), "paths": sorted(paths)}
@@ -136,6 +144,20 @@ def _path_present(path, target_paths):
     )
 
 
+def _scope_parent(path, scope):
+    """Return whether a literal directory contains a file in ``scope``."""
+    path = normalize(path).rstrip("/")
+    if not path or is_glob(path):
+        return False
+    for entry in scope:
+        if not isinstance(entry, str):
+            continue
+        literal = _glob_literal_prefix(entry) if is_glob(entry) else normalize(entry)
+        if literal.startswith(path + "/"):
+            return True
+    return False
+
+
 def _target_in_scope(path, scope):
     """Match a path obtained from Git without repeating user-input safety work."""
     if not scope:
@@ -177,10 +199,24 @@ def _argument_paths(tokens, program):
     """Extract path-shaped arguments, excluding an interpreter's inline code."""
     paths = []
     skip_next = False
+    module_next = False
     inline_flags = INLINE_CODE_FLAGS.get(program, set())
+    pattern_flags = _PATTERN_FLAGS.get("pytest" if program == "py.test" else program, set())
     for token in tokens:
+        if module_next:
+            module_next = False
+            pattern_flags = _PATTERN_FLAGS.get(token, pattern_flags)
+            continue
         if skip_next:
             skip_next = False
+            continue
+        if token in pattern_flags:
+            skip_next = True
+            continue
+        if any(
+            flag.startswith("--") and token.startswith(flag + "=")
+            for flag in pattern_flags
+        ):
             continue
         if token in inline_flags:
             skip_next = True
@@ -194,6 +230,11 @@ def _argument_paths(tokens, program):
             flag.startswith("--") and token.startswith(flag + "=")
             for flag in _OUTPUT_PATH_FLAGS
         ):
+            continue
+        if token == "-m" and not pattern_flags:
+            # ``python -m unittest`` and ``python -m pytest`` select the
+            # pattern options of the module that follows.
+            module_next = True
             continue
         if token in {"--command", "-m"}:
             # Module names and non-interpreter inline commands are not paths.
@@ -393,7 +434,11 @@ def lint_plan(plan, *, target_paths=(), policy=None):
                             paths=[path],
                         )
                     )
-                elif not scope_contains(path, scope) and not _path_present(path, target_paths):
+                elif (
+                    not scope_contains(path, scope)
+                    and not _scope_parent(path, scope)
+                    and not _path_present(path, target_paths)
+                ):
                     findings.append(
                         _finding(
                             "acceptance.command_path_missing",
