@@ -64,6 +64,9 @@ npm run test:contract
 `npm run test:integration` starts a disposable OpenClaw gateway and needs
 `openclaw` installed; run it only when asked.
 
+Before opening a pull request, run `scripts/check.sh`, the one command that
+runs the Python tests, the plugin unit tests and the secret scan.
+
 ## Conventions
 
 - Standard library only, in both the runtime and the tests.
