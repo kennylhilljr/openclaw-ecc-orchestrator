@@ -256,6 +256,8 @@ The plugin has its own Node suites. The contract suite runs the plugin's decisio
 
 `npm run test:integration` starts a disposable OpenClaw gateway and needs `openclaw` 2026.9.6 installed. `bin/roundtrip-smoke` runs a live round trip through a real OpenClaw gateway and the launchd inbox processor. Neither is automated: this repository has no CI workflow.
 
+Before opening a pull request, run `scripts/check.sh`, the one command that runs the Python tests, the plugin unit tests and the secret scan ([docs/ci.md](docs/ci.md) has the GitHub Actions workflow that runs it).
+
 ## Troubleshooting
 
 | Symptom | What to check |
