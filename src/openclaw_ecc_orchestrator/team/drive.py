@@ -459,6 +459,7 @@ class Drive:
             self._save()
         report["retrospective"] = self.state.get("retro") or {"table": table}
         report["gates"] = self.milestone_gates(head)
+        report["merges"] = self.merge_evidence(run, head)
         pack = self.product_pack(report)
         verdicts, used = [], set()
         for n in range(2 if self.cfg["roles"]["product_owner"].get("pair") else 1):
@@ -572,6 +573,20 @@ class Drive:
         proc = run_git(["show", f"{head}:{path}"], self.c.worktrees.repo, check=False)
         return proc.stdout if proc.returncode == 0 else None
 
+    def merge_evidence(self, run, head):
+        """Each unit's merge commit and whether it is an ancestor of the head,
+        checked here. Live finding (agent-control-plane-infra#25, #27): a product
+        owner without repository access rejected "every unit is merged" because
+        the evidence named no unit commit and no ancestry check."""
+        repo = self.c.worktrees.repo
+        out = []
+        for uid, u in run["units"].items():
+            commit = ((u.get("annotations") or {}).get("merge") or {}).get("merged_commit")
+            ancestor = bool(commit) and run_git(["merge-base", "--is-ancestor", commit, head], repo,
+                                                check=False).returncode == 0
+            out.append({"unit": uid, "state": u.get("state"), "merged_commit": commit, "ancestor_of_head": ancestor})
+        return out
+
     # == milestone close ==
     def milestone_close(self, run, head):
         """The delivery lead's close step before the product review (issue #12).
@@ -669,10 +684,18 @@ class Drive:
                     parts.append(f"### {doc['path']}\n\n" + E.extract_sections(fh.read(), doc.get("sections") or []))
         gates = "\n".join(f"- `{g.get('command')}` exit {g.get('exit_code')}\n```\n{g.get('output_tail', '')}\n```"
                           for g in report.get("gates") or [])
+        head = report["head"]
+        merges = "\n".join(
+            f"- `{m['unit']}`: state {m.get('state')}, merge commit `{m.get('merged_commit') or 'none recorded'}`; "
+            f"`git merge-base --is-ancestor {m.get('merged_commit') or '<none>'} {head}` "
+            + ("exit 0 (ancestor)" if m.get("ancestor_of_head") else "failed (not an ancestor)")
+            for m in report.get("merges") or [])
         return "\n\n".join([
             f"## Milestone {report.get('milestone')} on target branch `{self.c.target}` at {report['head']}",
             target_note(self.c.target, report["head"]),
             "## Exit criteria and goals\n\n" + ("\n\n".join(parts) or "(none configured)"),
+            f"## Unit merge evidence (checked by the orchestrator against {head[:12]})\n\n"
+            + (merges or "(no units)"),
             f"## Milestone gate commands (run by the orchestrator on `{self.c.target}` at {report['head'][:12]})\n\n"
             + (gates or "(none configured)"),
             "## Architect drift report\n\n```json\n" + json.dumps(report.get("drift"), indent=1, default=str)[:20000]
@@ -696,6 +719,10 @@ class Drive:
                 lines.append(f"- finding ({f.get('severity')}): {f.get('what')}")
             lines.append("")
         lines += ["## Gates", ""] + [f"- `{g.get('command')}`: exit {g.get('exit_code')}" for g in report["gates"]]
+        lines += ["", "## Unit merges", ""] + [
+            f"- `{m['unit']}`: `{m.get('merged_commit') or 'none'}`, "
+            + ("ancestor of head" if m.get("ancestor_of_head") else "NOT an ancestor of head")
+            for m in report.get("merges") or []]
         drift = report.get("drift") or {}
         lines += ["", "## Architect drift", ""] + [f"- ({f.get('severity')}) {f.get('where')}: {f.get('what')}"
                                                     for f in drift.get("findings") or []]

@@ -275,6 +275,35 @@ class DriveTests(DriveBase):
             self.assertIn("target branch `main`", prompt)
             self.assertIn(f"a unit is merged when its commit is an ancestor of {head}", prompt)
 
+    def test_product_owner_sees_each_unit_merge_commit_and_ancestry(self):
+        """Live finding (agent-control-plane-infra#25, #27): the product owner pack named no unit commit
+        and no ancestry check, so a product owner without repository access rejected "every unit is
+        merged" although the units were on the target branch."""
+        res = self.make(self.units2()).go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        head = self.main_head()
+        run = self.m.load("r1")
+        prompts = [p for r, p in self.prompts if r == "product_owner"]
+        self.assertTrue(prompts)
+        for uid in ("alpha", "beta"):
+            commit = run["units"][uid]["annotations"]["merge"]["merged_commit"]
+            self.assertTrue(commit)
+            for prompt in prompts:
+                self.assertIn(f"`{uid}`: state merged, merge commit `{commit}`", prompt)
+                self.assertIn(f"`git merge-base --is-ancestor {commit} {head}` exit 0 (ancestor)", prompt)
+        with open(res["data"]["report"]) as fh:
+            self.assertIn("ancestor of head", fh.read())
+
+    def test_merge_evidence_flags_a_unit_off_the_head(self):
+        from types import SimpleNamespace
+        base = git(self.repo, "rev-parse", "main")
+        fake = SimpleNamespace(c=SimpleNamespace(worktrees=SimpleNamespace(repo=self.repo)))
+        run = {"units": {"a": {"state": "merged", "annotations": {"merge": {"merged_commit": base}}},
+                         "b": {"state": "blocked", "annotations": {}}}}
+        got = D.Drive.merge_evidence(fake, run, base)
+        self.assertEqual([m["ancestor_of_head"] for m in got], [True, False])
+        self.assertIsNone(got[1]["merged_commit"])
+
     def test_product_evidence_names_a_bot_target_branch(self):
         from types import SimpleNamespace
         target = "bot/27-add-review-rules-98cf4f"
