@@ -53,12 +53,24 @@ def product_prompt(pack, head):
 plan_check_prompt = PC.prompt
 
 
-def drift_prompt(pack, head):
+def target_note(target, head):
+    """What "main" and "merged" mean in the milestone evidence. Units merge into
+    the target branch, which is not always the repository default branch (live
+    finding, orchestrator#27: a product owner read "on main" literally, found
+    the head missing from origin/main and rejected "every unit is merged")."""
+    return (f"Units merge into the target branch `{target}`, and its head {head} is the milestone result. In "
+            f"this evidence, \"main\" and \"merged\" mean that branch: a unit is merged when its commit is "
+            f"an ancestor of {head}. The target branch reaches the repository default branch through a pull "
+            f"request after the milestone is accepted, so do not require these commits on the default branch.")
+
+
+def drift_prompt(pack, head, target="main"):
     return "\n\n".join([
         "You are the architect on an agent delivery team. The milestone's units are merged. Compare the code "
-        "on main with the design: module boundaries, the names the design owns, layering rules and recorded "
-        "decisions. List every drift with where it is and what the design says. Drift is a finding, not a "
-        "verdict on the milestone; the product owner reads your report.",
+        f"on the target branch `{target}` with the design: module boundaries, the names the design owns, "
+        "layering rules and recorded decisions. List every drift with where it is and what the design says. "
+        "Drift is a finding, not a verdict on the milestone; the product owner reads your report.",
+        target_note(target, head),
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
         f'{P.REVIEW_MARK} {{"verdict": "approved|changes_requested", "head": "{head}", '
         '"findings": [{"severity": "blocker|major|minor", "where": "<path>", "what": "<text>"}]}',
@@ -435,7 +447,8 @@ class Drive:
             pack = f"## Diff stat {base[:12]}..{head[:12]}\n\n```\n{stat}\n```\n\n## Diff\n\n```diff\n{diff}\n```" \
                    f"\n\n## Design references\n\n{refs}"
             self.progress("milestone end: architect drift check")
-            self.state["drift"] = self._consult("architect", P.REVIEW_MARK, lambda: drift_prompt(pack, head), head)
+            self.state["drift"] = self._consult("architect", P.REVIEW_MARK,
+                                                lambda: drift_prompt(pack, head, self.c.target), head)
             self._save()
         report["drift"] = self.state.get("drift")
         table = self.retro_table(run)
@@ -657,9 +670,11 @@ class Drive:
         gates = "\n".join(f"- `{g.get('command')}` exit {g.get('exit_code')}\n```\n{g.get('output_tail', '')}\n```"
                           for g in report.get("gates") or [])
         return "\n\n".join([
-            f"## Milestone {report.get('milestone')} on main at {report['head']}",
+            f"## Milestone {report.get('milestone')} on target branch `{self.c.target}` at {report['head']}",
+            target_note(self.c.target, report["head"]),
             "## Exit criteria and goals\n\n" + ("\n\n".join(parts) or "(none configured)"),
-            "## Milestone gate commands (run by the orchestrator on main)\n\n" + (gates or "(none configured)"),
+            f"## Milestone gate commands (run by the orchestrator on `{self.c.target}` at {report['head'][:12]})\n\n"
+            + (gates or "(none configured)"),
             "## Architect drift report\n\n```json\n" + json.dumps(report.get("drift"), indent=1, default=str)[:20000]
             + "\n```",
             "## Delivery lead retrospective\n\n```json\n" + json.dumps(report.get("retrospective"), indent=1,
@@ -670,7 +685,8 @@ class Drive:
         name = f"{self.run_id}-{report.get('milestone') or 'milestone'}-product-v1"
         path = os.path.join(self.reports_dir, name + ".md")
         lines = [f"# Product report: {report.get('milestone')} ({self.run_id})", "",
-                 f"- Verdict: **{report['verdict']}**", f"- Main at `{report['head']}`, base `{report['base']}`", "",
+                 f"- Verdict: **{report['verdict']}**",
+                 f"- Target `{self.c.target}` at `{report['head']}`, base `{report['base']}`", "",
                  "## Product owners", ""]
         for v in report["product"]:
             lines.append(f"### {v.get('provider')} ({v.get('model')}): {v.get('verdict')}")

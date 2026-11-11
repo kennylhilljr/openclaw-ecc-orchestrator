@@ -57,6 +57,7 @@ class DriveBase(TeamBase):
     def cli_override(self, role, runner, prompt):
         r = self.role_of_prompt(prompt)
         self.calls.append((r, runner))
+        self.prompts = getattr(self, "prompts", []) + [(r, prompt)]
         if (r, runner) in getattr(self, "silent", ()):
             return [PY, "-c", "import sys; sys.exit(3)"]
         text = self.reply(r, None)
@@ -261,6 +262,30 @@ class DriveTests(DriveBase):
         self.assertNotEqual(owners[0], owners[1])
         with open(res["data"]["report"]) as fh:
             self.assertIn("Verdict: **reject**", fh.read())
+
+    def test_product_owner_reads_merged_as_on_the_target_branch(self):
+        """Live finding (orchestrator#27): the evidence said "on main" for the target branch head, so a
+        product owner checked origin/main, did not find the unit commit and rejected the milestone."""
+        res = self.make(self.units2()).go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        head = self.main_head()
+        prompts = [p for r, p in self.prompts if r in ("product_owner", "drift")]
+        self.assertTrue(prompts)
+        for prompt in prompts:
+            self.assertIn("target branch `main`", prompt)
+            self.assertIn(f"a unit is merged when its commit is an ancestor of {head}", prompt)
+
+    def test_product_evidence_names_a_bot_target_branch(self):
+        from types import SimpleNamespace
+        target = "bot/27-add-review-rules-98cf4f"
+        fake = SimpleNamespace(c=SimpleNamespace(target=target, worktrees=SimpleNamespace(repo=self.tmp)), cfg={})
+        pack = D.Drive.product_pack(fake, {"milestone": "M0", "head": "abc123", "gates": []})
+        self.assertIn(f"on target branch `{target}` at abc123", pack)
+        self.assertIn("do not require these commits on the default branch", pack)
+        self.assertNotIn("on main at", pack)
+        drift = D.drift_prompt("evidence", "abc123", target)
+        self.assertEqual(self.role_of_prompt(drift), "drift")
+        self.assertIn(f"on the target branch `{target}`", drift)
 
     def test_product_owner_pair_proceeds_on_one_provider(self):
         """Owner decision (rmcp-m0f): a silent provider is skipped, not a reject, and the pair may share
