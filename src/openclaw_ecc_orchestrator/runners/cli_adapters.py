@@ -323,7 +323,10 @@ class ClaudeAdapter(CliAdapter):
     # new capability).
     # Skill: the repository's skills (.claude/skills) and Claude Code's bundled ones
     # (/simplify, /verify, /code-review) are part of every unit's definition of done.
-    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),"
+    # gitleaks: units' acceptance commands run the secret scan; without it the
+    # verifier reports the check blocked and high-risk units stop for the owner
+    # (live finding, acp#20/#22: verifier_inconclusive on gate-passed heads).
+    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),Bash(gitleaks *),"
                   "Bash(tools/ci.sh),Bash(tools/ci.sh *),Bash(./tools/ci.sh),Bash(./tools/ci.sh *)")
 
     def _base(self, model, output_format="json"):
