@@ -93,3 +93,61 @@ runs the Python tests, the plugin unit tests and the secret scan.
   through the approval broker; do not work around the confirmation gate.
 - Never commit secrets. `.env` files are ignored and `.gitleaks.toml`
   configures secret scanning.
+
+## Review rules
+
+### Approvals
+
+- For CLI plans marked destructive, `Spec.execute` is reached only through
+  `cli.main.run_gated` (`src/openclaw_ecc_orchestrator/cli/main.py`), which
+  calls `Spec.authorize` before `Spec.execute`. The destructive-capable CLI
+  Specs in `GATED` today are `merge` (`authorize=authorize_merge`) and
+  `cleanup` (`authorize=authorize_cleanup`) in
+  `src/openclaw_ecc_orchestrator/cli/commands.py`.
+- Other executors also reach merges: `team/review.py` enqueues and processes
+  merges and `team/drive.py` processes the merge queue. For those paths the
+  approval is enforced by `MergeQueue.enqueue()`
+  (`src/openclaw_ecc_orchestrator/merge_queue/queue.py`), which consumes a
+  bound broker approval via `ApprovalBroker.consume()` before the merge runs.
+- `ApprovalBroker.usable()` (`src/openclaw_ecc_orchestrator/plugin/approvals.py`)
+  only validates a request and never consumes it. Consumption happens through
+  `ApprovalBroker.consume()`, which `authorize_cleanup` calls directly and
+  which `MergeQueue.enqueue()` calls on the merge path reached from
+  `execute_merge`'s enqueue.
+- `authorize_cleanup` in `cli/commands.py` admits a destructive cleanup
+  through one of two paths: `ApprovalBroker.consume()` with `plan_sha256`
+  equal to the plan digest `run_gated` computed over `Plan.doc`, or an
+  interactive operator confirmation on a TTY. `authorize_merge` admits a
+  fresh merge by calling `ApprovalBroker.usable()` with `run_id`, `unit_id`,
+  `action='merge'`, `plan_sha256=doc['run_plan_sha256']`, `session_id` and
+  `head_sha`; a unit already in `QUEUED_FOR_MERGE` skips the fresh check
+  because its approval was consumed at enqueue time.
+- `ApprovalBroker.usable()` and `ApprovalBroker.consume()` validate the
+  binding keyword arguments the caller supplies (via `_usable_checks`)
+  against the stored approval request, so an approval scoped to one
+  `run_id`, `unit_id`, `action` and `session_id` is not admitted for another.
+  `DecisionInbox` (`src/openclaw_ecc_orchestrator/plugin/inbox.py`) reads a
+  shared inbox directory and delegates binding validation of each decision
+  file to `ApprovalBroker._decision_checks`.
+- Worktree and state paths are checked by `cli.config.checked_path`,
+  `cli.config.forbidden_location` and `cli.config.check_state_outside_repo`
+  (`src/openclaw_ecc_orchestrator/cli/config.py`), and the worktree root
+  additionally by `worktrees.manager.validate_root`
+  (`src/openclaw_ecc_orchestrator/worktrees/manager.py`). These refuse paths
+  inside `.openclaw`, `.git` or the repository.
+
+### Envelopes
+
+- Every mutating command result is built with `runs.envelope.envelope()`
+  (`src/openclaw_ecc_orchestrator/runs/envelope.py`).
+- `envelope()` sets these top-level fields on every result: `ok`,
+  `operation`, `changed`, `checks`, `warnings`, `required_user_actions`,
+  `rollback_checkpoint`. An operation specific payload lives under an
+  optional `data` key.
+- `checks`, `warnings` and `required_user_actions` are always lists.
+- A successful destructive merge returns a `rollback_checkpoint` (set by
+  `merge_queue/queue.py` and passed through by `execute_merge` in
+  `cli/commands.py`). A successful destructive cleanup returns a
+  `rollback_checkpoint` (set by `WorktreeManager.cleanup()` in
+  `src/openclaw_ecc_orchestrator/worktrees/manager.py`, which
+  `execute_cleanup` delegates to).
