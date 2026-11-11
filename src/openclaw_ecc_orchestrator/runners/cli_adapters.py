@@ -326,7 +326,10 @@ class ClaudeAdapter(CliAdapter):
     # gitleaks: units' acceptance commands run the secret scan; without it the
     # verifier reports the check blocked and high-risk units stop for the owner
     # (live finding, acp#20/#22: verifier_inconclusive on gate-passed heads).
-    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),Bash(gitleaks *),"
+    # node: repositories with Node tooling (hooks, `node --test`, `node tools/sdd/cli.mjs check`) put it in
+    # their acceptance commands; without it every attempt was refused and the unit stopped with
+    # runner_needs_user (live finding, research-mcp#1). Like uv it runs code python3 already could.
+    edit_tools = ("Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),Bash(node *),Bash(gitleaks *),"
                   "Bash(tools/ci.sh),Bash(tools/ci.sh *),Bash(./tools/ci.sh),Bash(./tools/ci.sh *)")
 
     def _base(self, model, output_format="json"):
