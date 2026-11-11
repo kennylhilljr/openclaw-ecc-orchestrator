@@ -134,6 +134,26 @@ class RetryTests(RepairBase):
         self.assertIn("b.txt", tree)
 
 
+class GitDirGrantTests(RepairBase):
+    def test_codex_is_granted_the_common_git_dir_of_the_new_worktree(self):
+        """Live finding (iwb runs 2026-11-06 to 2026-11-08): the runner command is built before start_unit
+        creates the worktree, so the Codex grant named the worktree's .git pointer file and the runner could
+        not commit (".git is outside the writable sandbox roots")."""
+        self.make()
+        out = os.path.join(self.tmp, "argv.json")
+        dump = os.path.join(self.tmp, "dump.py")
+        with open(dump, "w") as fh:
+            fh.write(f"import json, sys\njson.dump(sys.argv, open({out!r}, 'w'))\nsys.exit(1)\n")
+        self.ok(self.c.assign_unit("r1", "u1"))
+        wt = self.c.worktrees.paths("r1", "u1")["path"]
+        self.ok(self.c.start_unit("r1", "u1", [PY, dump, "--add-dir", os.path.join(wt, ".git"), "--", "x"]))
+        self.c.wait_unit("r1", "u1")
+        with open(out) as fh:
+            argv = json.load(fh)
+        common = git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        self.assertEqual(os.path.realpath(argv[argv.index("--add-dir") + 1]), os.path.realpath(common))
+
+
 class BriefTests(unittest.TestCase):
     def test_at_td_03_brief_carries_the_evidence_and_is_bounded(self):
         """AT-TD-03: gate tails, handoff errors, review and verifier evidence; at most 6,000 characters."""

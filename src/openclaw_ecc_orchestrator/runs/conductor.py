@@ -52,6 +52,7 @@ from ..process import health as H
 from ..routing.classify import classify
 from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
 from ..routing.selection import review_satisfies, select_reviewer, select_runner
+from ..runners.cli_adapters import git_write_dir
 from ..runners.registry import model_family
 from ..worktrees.git import git_out, rev_exists, run_git
 from . import repair as R
@@ -78,6 +79,21 @@ HANDOFF_DIR_TOKEN = "{ECC_HANDOFF_DIR}"
 # Consecutive requests for changes from one reviewer role before the unit
 # stops for the owner instead of trying again.
 REJECTION_CAP = 3
+
+
+def grant_git_dir(argv, path):
+    """``argv`` with its ``--add-dir <path>/.git`` grant pointed at the directory
+    git really writes when committing in the worktree at ``path``. The command
+    is built before the worktree exists, when ``.git`` is not yet the pointer
+    file of a linked worktree, so the grant named the pointer and Codex could
+    not commit: ".git is outside the writable sandbox roots" (live finding,
+    iwb runs 2026-11-06 to 2026-11-08: the first attempt of most units)."""
+    if not argv:
+        return argv
+    stale, real = os.path.join(path, ".git"), git_write_dir(path)
+    if real == stale:
+        return argv
+    return [real if a == stale and i and argv[i - 1] == "--add-dir" else a for i, a in enumerate(argv)]
 
 
 def runner_usage(stdout):
@@ -689,7 +705,8 @@ class Conductor:
         settings = self.health_settings(plan_unit, run.get("policy") or self.policy)
         health = H.HealthConfig(settings=settings, worktree=paths["path"], on_check=self._health_listener(
             run_id, unit_id, unit["attempts"], settings, budget=self._minutes_budget(unit, plan_unit)))
-        runner_argv = fill_handoff_tokens(runner_argv, handoff_path)
+        runner_argv = fill_handoff_tokens(grant_git_dir(runner_argv, paths["path"]), handoff_path)
+        repair_argv = grant_git_dir(repair_argv, paths["path"])
         handle = self.supervisor.start(list(runner_argv), cwd=paths["path"], env_allow=self.runner_env_allow,
                                        extra_env=env, on_line=progress, log_path=log_path,
                                        status_path=status_path, timeout=self.runner_timeout, health=health,
