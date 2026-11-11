@@ -94,7 +94,7 @@ Flags were confirmed on 2026-09-24 against Claude Code `2.1.281` and codex-cli `
 | no session files | `no-session-persistence` | `ephemeral` |
 | model | `model <alias or id>` | `-m <slug>` |
 | reasoning effort | `effort low` | `-c model_reasoning_effort="low"` |
-| writable run | `permission-mode acceptEdits` and `allowedTools "Read,Edit,Write,Bash(git *),Bash(python3 *)"` | `sandbox workspace-write` and `add-dir <repo>/.git` (workspace-write keeps `.git` read only, so without it the agent cannot commit) |
+| writable run | `permission-mode acceptEdits` and `allowedTools "Read,Edit,Write,Skill,Bash(git *),Bash(python3 *),Bash(uv *),Bash(node *),Bash(gitleaks *),Bash(tools/ci.sh *)"` | `sandbox workspace-write` and `add-dir <repo>/.git` (workspace-write keeps `.git` read only, so without it the agent cannot commit) |
 | read only run | default tools, prompts denied | `sandbox read-only` |
 | working directory | process cwd | `-C <dir>` plus process cwd |
 | authentication | `claude auth status` with `json` (`loggedIn`, `authMethod`) | `codex login status` |
