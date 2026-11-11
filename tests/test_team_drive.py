@@ -154,6 +154,17 @@ class DriveTests(DriveBase):
         res, hit = self.plan_check(refresh=True)
         self.assertEqual((res["verdict"], hit, self.architect_turns()), ("approved", False, 2))
 
+    def test_plan_check_prompt_carries_unit_descriptions(self):
+        """research-mcp#1: an issue-driven unit has no design doc; without its description the
+        architect saw only acceptance commands and asked for the contract and scope decisions."""
+        from openclaw_ecc_orchestrator.team import plan_check as PC
+        units = self.units2()
+        units[0]["description"] = "Owner registers the hook in .claude/settings.json after merge."
+        prompt = PC.prompt(PC.pack(self.tmp, units), "abc123")
+        self.assertEqual(self.role_of_prompt(prompt), "plan_check")
+        self.assertIn("Owner registers the hook in .claude/settings.json after merge.", prompt)
+        self.assertIn("description is its approved contract", prompt)
+
     def test_drive_skips_its_plan_check_when_plan_check_passed(self):
         self.drive = self.make(self.units2())
         self.assertEqual(self.plan_check()[0]["verdict"], "approved")

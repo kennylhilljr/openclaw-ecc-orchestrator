@@ -37,7 +37,9 @@ def prompt(pack, head):
         "You are the architect on an agent delivery team. Before any unit of this milestone runs, check the "
         "plan against the design: every unit matches its design section, scopes do not overlap, dependencies "
         "are complete and in the right order, and each shared contract has exactly one owning unit that runs "
-        "before its users. Report only problems that would make a unit fail or force rework.",
+        "before its users. Report only problems that would make a unit fail or force rework. Each unit's "
+        "description is its approved contract: where no design section covers a unit, check the unit "
+        "against its description, and treat work the description assigns to the owner as owned.",
         "Make one exhaustive pass. Go through every unit for each category below and report every instance "
         "you find, not the first few: a partial list is a failed check, because each finding you leave out "
         "costs another plan revision and another check.\n" + "\n".join(f"- {c}" for c in CATEGORIES),
@@ -49,8 +51,12 @@ def prompt(pack, head):
 
 
 def pack(repo, plan_units):
-    """The plan's units and the design sections their descriptions name."""
-    units = [{k: u.get(k) for k in ("id", "title", "depends_on", "scope", "acceptance", "risk")} for u in plan_units]
+    """The plan's units, with their descriptions, and the design sections those descriptions name.
+
+    The description carries the unit's contract and its scope decisions; an issue-driven unit
+    has no design document, so without it the architect sees only acceptance commands."""
+    units = [{k: u.get(k) for k in ("id", "title", "description", "depends_on", "scope", "acceptance", "risk")}
+             for u in plan_units]
     refs = E.design_references(repo, " ".join(str(u.get("description") or "") for u in plan_units))
     return "## Plan\n\n```json\n" + json.dumps(units, indent=1) + "\n```\n\n## Design references\n\n" + refs
 
