@@ -343,6 +343,23 @@ class BudgetTests(ManagerBase):
         self.drive(run_id, "a", ["failed", "ready"])
         self.assertTrue(self.mgr.assign_unit(run_id, "c1", "a", "w1")["ok"])
 
+    def test_finished_attempt_over_cost_budget_is_still_verified(self):
+        # pr-review-bots#5: attempt 2 fixed the review finding and ended at
+        # $1.27 of $1; the unit went to needs_user and its work was dropped.
+        run_id = self.create([unit("a", budget={"attempts": 3, "maximum_cost_usd": 1.0})])
+        self.drive(run_id, "a", ["assigned", "running"])
+        res = self.mgr.record_usage(run_id, "c1", "a", minutes=1, cost_usd=1.27)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["data"]["over_cost_budget"])
+        self.assertEqual(self.mgr.load(run_id)["units"]["a"]["state"], "running")
+        self.drive(run_id, "a", ["verifying"])
+        # The cost cap still refuses the next attempt.
+        self.drive(run_id, "a", ["failed", "ready"])
+        res = self.mgr.assign_unit(run_id, "c1", "a", "w1")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["required_user_actions"][0]["kind"], "budget_exhausted")
+        self.assertEqual(self.mgr.load(run_id)["units"]["a"]["state"], "needs_user")
+
 
 class ResumeScopeTests(ManagerBase):
     """Restart must not interrupt units that are already past the runner."""

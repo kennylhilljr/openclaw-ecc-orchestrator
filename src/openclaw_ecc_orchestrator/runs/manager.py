@@ -666,19 +666,16 @@ class RunManager:
             unit["cost_usd"] = float(unit.get("cost_usd", 0.0)) + float(cost_usd)
             self._touch(run, tx, unit_id)
             _, _, limit, cost_limit = self._budget_limits(unit)
-            detail = None
-            # Minutes are advisory (long_running attention while it runs); only
-            # the cost budget is a hard limit here.
+            # Minutes are advisory (long_running attention while it runs). The
+            # cost budget is a hard limit on the next attempt (`_assign`), not on
+            # the attempt that just finished: its money is spent, so its work
+            # still goes through verification and review (live finding,
+            # pr-review-bots#5: a $1 unit's 2nd attempt fixed the review
+            # finding, ended at $1.27 and was dropped as budget_exhausted).
             over_minutes = limit is not None and unit["minutes_used"] > float(limit)
-            if cost_limit is not None and unit["cost_usd"] > float(cost_limit):
-                detail = f"cost {unit['cost_usd']}/{cost_limit} USD"
-            if detail:
-                if S.NEEDS_USER in S.TRANSITIONS[unit["state"]]:
-                    self._set_state(run, tx, unit_id, S.NEEDS_USER, conductor_id, reason="budget_exhausted")
-                return {"ok": False, "checks": [check("budget_available", False, detail)],
-                        "required_user_actions": [_action("budget_exhausted", run_id, unit_id, detail)]}
+            over_cost = cost_limit is not None and unit["cost_usd"] > float(cost_limit)
             return {"data": {"minutes_used": unit["minutes_used"], "cost_usd": unit["cost_usd"],
-                             "over_minutes_budget": over_minutes}}
+                             "over_minutes_budget": over_minutes, "over_cost_budget": over_cost}}
         return self._mutate(run_id, "unit.record_usage", conductor_id, fn)
 
     def resume(self, run_id, conductor_id, dry_run=False, ttl=None):
