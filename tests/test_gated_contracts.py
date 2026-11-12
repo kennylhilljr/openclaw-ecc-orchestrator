@@ -104,6 +104,20 @@ VARIANTS = {
 # every archiving cleanup.
 EXECUTED = [key for key, destructive in VARIANTS.items() if destructive != "refused"]
 
+# Variants the issue requires, listed independently of VARIANTS so that
+# dropping one from the registry fails instead of shrinking the coverage.
+REQUIRED_PLANNED = frozenset({
+    ("merge", "reviewing"), ("merge", "queued_for_merge"),
+    ("cleanup", "neither"), ("cleanup", "neither-archive"), ("cleanup", "bundle-archive"),
+    ("cleanup", "ignored-archive"), ("cleanup", "both-archive"), ("cleanup", "bundle"),
+    ("cleanup", "ignored"), ("cleanup", "both"),
+    ("approvals.approve", "pending"), ("approvals.reject", "pending"), ("resume", "needs_user"),
+})
+REQUIRED_EXECUTED = frozenset({
+    ("merge", "reviewing"), ("merge", "queued_for_merge"), ("cleanup", "bundle-archive"),
+    ("cleanup", "ignored-archive"), ("cleanup", "both-archive"),
+})
+
 
 class GatedContractBase(S.CliTestBase):
     """CliTestBase plus fixture repositories with signing off, a guarded PATH,
@@ -440,9 +454,12 @@ class GatedEnvelopeContractTest(Fixtures):
         for name, reason in SKIPPED.items():
             self.assertIsInstance(reason, str)
             self.assertTrue(reason.strip(), name)
-        executed = {name for name, _ in EXECUTED}
-        self.assertEqual(executed & set(SKIPPED), set())
-        self.assertEqual(executed | set(SKIPPED), set(GATED))
+        self.assertEqual(REQUIRED_PLANNED - set(VARIANTS), set(), "required variants missing from VARIANTS")
+        self.assertEqual(REQUIRED_EXECUTED - set(EXECUTED), set(), "required executions missing from EXECUTED")
+        # Every GATED name has an executable fixture or an explicit skip.
+        self.assertEqual({name for name, _ in EXECUTED} | set(SKIPPED), set(GATED))
+        # A skipped executor keeps its planner coverage.
+        self.assertEqual({name for name, _ in VARIANTS}, set(GATED))
 
     def test_every_gated_executor_returns_a_well_formed_envelope(self):
         exercised = set()
@@ -468,6 +485,9 @@ class GatedEnvelopeContractTest(Fixtures):
                     if fx["check"]:
                         fx["check"](result)
                 exercised.add((name, variant))
+        expected = {key for key in EXECUTED if key[0] not in SKIPPED}
+        self.assertEqual(exercised, expected)
+        self.assertEqual({key for key in REQUIRED_EXECUTED if key[0] not in SKIPPED} - exercised, set())
         self.assertEqual({name for name, _ in exercised} | set(SKIPPED), set(GATED))
 
 
@@ -493,6 +513,7 @@ class GatedAuthorizerContractTest(Fixtures):
                             self.assertTrue(callable(spec.authorize), f"{name} has no authorizer")
                 exercised.add((name, variant))
         self.assertEqual(exercised, set(VARIANTS))
+        self.assertEqual(REQUIRED_PLANNED - exercised, set())
         for name, spec in GATED.items():
             if spec.authorize is not None:
                 self.assertTrue(callable(spec.authorize), name)
