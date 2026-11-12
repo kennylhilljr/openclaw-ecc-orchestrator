@@ -1,8 +1,117 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openclaw.invalid/schemas/routing_decision.schema.json",
-  "title": "Routing decision",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "chosen_tier": {
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "type": "integer"
+    },
+    "decided_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "estimated_cost_usd": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "maximum_tier": {
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "type": "integer"
+    },
+    "minimum_tier": {
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "type": "integer"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reasons": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "review_tier": {
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "type": "integer"
+    },
+    "risk": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "runner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "score": {
+      "type": "integer"
+    },
+    "signals": {
+      "items": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "points": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "points",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "unit_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    }
+  },
   "required": [
     "schema_version",
     "unit_id",
@@ -15,115 +124,6 @@
     "reasons",
     "decided_at"
   ],
-  "additionalProperties": false,
-  "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "1.0"
-    },
-    "unit_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-    },
-    "score": {
-      "type": "integer"
-    },
-    "signals": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": [
-          "name",
-          "points",
-          "reason"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "points": {
-            "type": "integer"
-          },
-          "reason": {
-            "type": "string"
-          }
-        }
-      }
-    },
-    "risk": {
-      "type": "string",
-      "enum": [
-        "low",
-        "medium",
-        "high"
-      ]
-    },
-    "minimum_tier": {
-      "type": "integer",
-      "enum": [
-        0,
-        1,
-        2
-      ]
-    },
-    "chosen_tier": {
-      "type": "integer",
-      "enum": [
-        0,
-        1,
-        2
-      ]
-    },
-    "maximum_tier": {
-      "type": "integer",
-      "enum": [
-        0,
-        1,
-        2
-      ]
-    },
-    "review_tier": {
-      "type": "integer",
-      "enum": [
-        0,
-        1,
-        2
-      ]
-    },
-    "reasons": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "runner": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "provider": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "model": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "estimated_cost_usd": {
-      "type": [
-        "number",
-        "null"
-      ],
-      "minimum": 0
-    },
-    "decided_at": {
-      "type": "string",
-      "format": "date-time"
-    }
-  }
+  "title": "Routing decision",
+  "type": "object"
 }

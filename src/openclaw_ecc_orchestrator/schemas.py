@@ -1,8 +1,10 @@
 """Versioned document validators (authoritative).
 
 The JSON Schema files in ``schemas/`` describe the same documents for
-tooling; ``tests/test_schemas_json.py`` keeps their ``required`` lists and
-enum values in sync with ``DOCUMENT_SPECS`` below. Where the two disagree,
+tooling. They are generated from :func:`json_schemas` at the end of this
+module by ``scripts/export_schemas.py``; ``tests/test_schemas_json.py``
+checks that the committed files match and that their ``required`` lists and
+enum values agree with ``DOCUMENT_SPECS`` below. Where the two disagree,
 this module wins.
 
 Loading: only JSON is parsed here. ``.orchestration/config.yaml`` must be
@@ -879,3 +881,542 @@ def load_work_unit(text: str) -> dict:
 
 def load_repository_policy(text: str) -> dict:
     return load_validated(text, "repository_policy")
+
+
+# ---------------------------------------------------------------- JSON Schema export
+#
+# The committed files in schemas/ are generated from these definitions by
+# scripts/export_schemas.py. Edit the definitions here, then regenerate.
+# Shared values (version, ID pattern, required lists and enums) come from the
+# constants and DOCUMENT_SPECS above so they cannot drift from the validators.
+
+def _spec_list(doc_type: str, key: str, nested: str | None = None) -> list:
+    value = DOCUMENT_SPECS[doc_type][key]
+    return list(value[nested] if nested is not None else value)
+
+
+def _work_unit_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/work_unit.schema.json",
+        "title": "Work unit",
+        "type": "object",
+        "required": _spec_list('work_unit', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "id": {"type": "string", "pattern": ID_PATTERN},
+            "title": {"type": "string", "minLength": 1},
+            "description": {"type": "string"},
+            "depends_on": {
+                "type": "array",
+                "items": {"type": "string", "pattern": ID_PATTERN},
+            },
+            "scope": {
+                "type": "object",
+                "required": _spec_list('work_unit', "nested_required", 'scope'),
+                "additionalProperties": False,
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths.",
+                        },
+                    },
+                },
+            },
+            "acceptance": {
+                "type": "object",
+                "required": _spec_list('work_unit', "nested_required", 'acceptance'),
+                "additionalProperties": False,
+                "properties": {
+                    "commands": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Repository-relative path or glob that must match the pinned target tree.",
+                        },
+                    },
+                },
+            },
+            "risk": {"type": "string", "enum": list(RISKS)},
+            "capabilities": {
+                "type": "object",
+                "required": _spec_list('work_unit', "nested_required", 'capabilities'),
+                "additionalProperties": False,
+                "properties": {
+                    "network": {"type": "boolean"},
+                    "secrets": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "pattern": "^[A-Z][A-Z0-9_]{0,127}$",
+                        },
+                        "description": "Environment variable NAMES only.",
+                    },
+                },
+            },
+            "routing": {
+                "type": "object",
+                "required": _spec_list('work_unit', "nested_required", 'routing'),
+                "additionalProperties": False,
+                "properties": {
+                    "initial_tier": {"type": "integer", "enum": list(TIERS)},
+                    "maximum_tier": {"type": "integer", "enum": list(TIERS)},
+                    "reviewer_must_differ_from_author": {"type": "boolean"},
+                },
+                "description": "initial_tier must not exceed maximum_tier (enforced by the Python validator).",
+            },
+            "budget": {
+                "type": "object",
+                "required": _spec_list('work_unit', "nested_required", 'budget'),
+                "additionalProperties": False,
+                "properties": {
+                    "attempts": {"type": "integer", "minimum": 1},
+                    "minutes": {"type": "number", "minimum": 0},
+                    "maximum_cost_usd": {"type": "number", "minimum": 0},
+                },
+            },
+            "rollback": {"type": "string", "minLength": 1},
+            "traits": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(TRAITS)},
+            },
+            "health": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": "Per unit override of the repository policy health block. Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+                "properties": {
+                    "interval_seconds": {
+                        "type": "number",
+                        "minimum": 30,
+                        "maximum": 1800,
+                        "default": 120,
+                    },
+                    "flat_checks_for_hang": {
+                        "type": "integer",
+                        "minimum": 2,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                },
+            },
+            "provides": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "description": "Capability tokens used for transitive plan ordering checks.",
+            },
+            "requires": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "description": "Capability tokens used for transitive plan ordering checks.",
+            },
+            "lint_exemptions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["code", "reason"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "code": {"type": "string", "minLength": 1},
+                        "reason": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+        },
+    }
+
+
+def _handoff_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/handoff.schema.json",
+        "title": "Implementation handoff",
+        "type": "object",
+        "required": _spec_list('handoff', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "unit_id": {"type": "string", "pattern": ID_PATTERN},
+            "status": {"type": "string", "enum": list(HANDOFF_STATUSES)},
+            "outcome": {"type": "string"},
+            "files_changed": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths.",
+                },
+            },
+            "behavior": {"type": "string"},
+            "commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": _spec_list('handoff', "nested_required", 'commands[]'),
+                    "properties": {
+                        "command": {"type": "string", "minLength": 1},
+                        "exit_code": {"type": "integer"},
+                        "result": {"type": "string"},
+                        "duration_seconds": {"type": "number", "minimum": 0},
+                    },
+                },
+            },
+            "unresolved_failures": {"type": "array", "items": {"type": "string"}},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "risks": {"type": "array", "items": {"type": "string"}},
+            "next_action": {"type": "string"},
+            "commit": {
+                "type": "object",
+                "required": _spec_list('handoff', "nested_required", 'commit'),
+                "properties": {
+                    "sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+                    "branch": {"type": "string", "minLength": 1},
+                    "worktree": {"type": "string", "minLength": 1},
+                },
+            },
+            "usage": {
+                "type": ["object", "null"],
+                "properties": {
+                    "input_tokens": {"type": "integer", "minimum": 0},
+                    "output_tokens": {"type": "integer", "minimum": 0},
+                    "cost_usd": {"type": ["number", "null"], "minimum": 0},
+                    "model": {"type": ["string", "null"]},
+                    "provider": {"type": ["string", "null"]},
+                },
+            },
+            "user_input_required": {"type": "boolean"},
+            "notes": {"type": "string"},
+        },
+        "description": "Semantic rules enforced in Python: succeeded requires commands all exiting 0 and no unresolved_failures; files_changed must fall inside the unit scope; no secret-looking strings.",
+    }
+
+
+def _repository_policy_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/repository_policy.schema.json",
+        "title": "Repository orchestration policy (.orchestration/config.yaml, JSON compatible)",
+        "type": "object",
+        "required": _spec_list('repository_policy', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "high_risk_paths": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths.",
+                },
+            },
+            "required_checks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "protected_commands": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "allowed_providers": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "enum": list(KNOWN_PROVIDERS)},
+            },
+            "author_providers": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "enum": list(KNOWN_PROVIDERS)},
+                "description": "Providers that may author units (default: every allowed provider whose runner can author). Lets API providers review without authoring while dispatch launches coding CLIs only.",
+            },
+            "review_independence": {
+                "type": "string",
+                "enum": ["provider", "persona"],
+                "default": "provider",
+                "description": "How a review shows independence from its author. provider (default): a different runner, and for strict reviews a different model family. persona: a distinct reviewer persona in its own session, so a single-provider repository can review and merge.",
+            },
+            "budget": {
+                "type": "object",
+                "required": _spec_list('repository_policy', "nested_required", 'budget'),
+                "additionalProperties": {"type": "number", "minimum": 0},
+                "properties": {
+                    "max_cost_usd_per_unit": {"type": "number", "minimum": 0},
+                    "max_cost_usd_total": {"type": "number", "minimum": 0},
+                    "max_minutes_per_unit": {"type": "number", "minimum": 0},
+                },
+            },
+            "model_preferences": {
+                "type": "object",
+                "propertyNames": {"enum": list(KNOWN_PROVIDERS)},
+                "additionalProperties": {
+                    "type": "object",
+                    "propertyNames": {"enum": list(CAPABILITY_CLASSES)},
+                    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                },
+                "description": "Ordered glob patterns per provider and capability class; never fixed ids.",
+            },
+            "cli_models": {
+                "type": "object",
+                "propertyNames": {"enum": list(KNOWN_PROVIDERS)},
+                "additionalProperties": {
+                    "type": "object",
+                    "propertyNames": {"enum": list(CAPABILITY_CLASSES)},
+                    "additionalProperties": {"type": "string", "minLength": 1},
+                },
+            },
+            "retired_model_ids": {"type": "array", "items": {"type": "string"}},
+            "runner_costs": {
+                "type": "object",
+                "propertyNames": {"enum": list(KNOWN_PROVIDERS)},
+                "additionalProperties": {
+                    "type": "object",
+                    "propertyNames": {"enum": list(CAPABILITY_CLASSES)},
+                    "additionalProperties": {"type": "number", "minimum": 0},
+                },
+            },
+            "cost_estimation": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "input_tokens": {"type": "integer", "minimum": 0},
+                    "output_tokens": {"type": "integer", "minimum": 0},
+                },
+            },
+            "circuit_breaker": {
+                "type": "object",
+                "required": ["failure_threshold", "cooldown_seconds"],
+                "properties": {
+                    "failure_threshold": {"type": "integer", "minimum": 1},
+                    "cooldown_seconds": {"type": "number", "minimum": 0},
+                },
+            },
+            "openrouter": {
+                "type": "object",
+                "required": ["approved_models", "data_policy"],
+                "properties": {
+                    "approved_models": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "pattern": "^[^*?\\[]+$"},
+                    },
+                    "data_policy": {"type": "string", "minLength": 1},
+                },
+            },
+            "catalog_max_age_seconds": {"type": "number", "exclusiveMinimum": 0},
+            "health": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": "Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+                "properties": {
+                    "interval_seconds": {
+                        "type": "number",
+                        "minimum": 30,
+                        "maximum": 1800,
+                        "default": 120,
+                    },
+                    "flat_checks_for_hang": {
+                        "type": "integer",
+                        "minimum": 2,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                },
+            },
+            "generated_file_couplings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["source", "generated"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "source": {"type": "string", "minLength": 1},
+                        "generated": {"type": "string", "minLength": 1},
+                    },
+                },
+                "description": "Path-pattern pairs which must be owned by the same work unit.",
+            },
+        },
+        "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block.",
+    }
+
+
+def _routing_decision_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/routing_decision.schema.json",
+        "title": "Routing decision",
+        "type": "object",
+        "required": _spec_list('routing_decision', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "unit_id": {"type": "string", "pattern": ID_PATTERN},
+            "score": {"type": "integer"},
+            "signals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": _spec_list('routing_decision', "nested_required", 'signals[]'),
+                    "properties": {
+                        "name": {"type": "string"},
+                        "points": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "risk": {"type": "string", "enum": list(RISKS)},
+            "minimum_tier": {"type": "integer", "enum": list(TIERS)},
+            "chosen_tier": {"type": "integer", "enum": list(TIERS)},
+            "maximum_tier": {"type": "integer", "enum": list(TIERS)},
+            "review_tier": {"type": "integer", "enum": list(TIERS)},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "runner": {"type": ["string", "null"]},
+            "provider": {"type": ["string", "null"]},
+            "model": {"type": ["string", "null"]},
+            "estimated_cost_usd": {"type": ["number", "null"], "minimum": 0},
+            "decided_at": {"type": "string", "format": "date-time"},
+        },
+    }
+
+
+def _usage_record_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/usage_record.schema.json",
+        "title": "Budget and usage record",
+        "type": "object",
+        "required": _spec_list('usage_record', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "unit_id": {"type": "string", "pattern": ID_PATTERN},
+            "runner": {"type": "string", "minLength": 1},
+            "provider": {"type": ["string", "null"]},
+            "model": {"type": ["string", "null"]},
+            "tier": {"type": "integer", "enum": list(TIERS)},
+            "attempt": {"type": "integer", "minimum": 1},
+            "kind": {"type": "string", "enum": list(USAGE_KINDS)},
+            "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+            "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+            "cost_usd": {"type": "number", "minimum": 0},
+            "elapsed_seconds": {"type": "number", "minimum": 0},
+            "recorded_at": {"type": "string", "format": "date-time"},
+        },
+    }
+
+
+def _run_status_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/run_status.schema.json",
+        "title": "Run status",
+        "type": "object",
+        "required": _spec_list('run_status', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "unit_id": {"type": "string", "pattern": ID_PATTERN},
+            "state": {"type": "string", "enum": list(RUN_STATES)},
+            "tier": {"type": "integer", "enum": list(TIERS)},
+            "attempt": {"type": "integer", "minimum": 0},
+            "updated_at": {"type": "string", "format": "date-time"},
+            "reason": {"type": "string"},
+            "runner": {"type": ["string", "null"]},
+        },
+    }
+
+
+def _verification_result_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/verification_result.schema.json",
+        "title": "Verification result",
+        "type": "object",
+        "required": _spec_list('verification_result', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "unit_id": {"type": "string", "pattern": ID_PATTERN},
+            "passed": {"type": "boolean"},
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": _spec_list('verification_result', "nested_required", 'checks[]'),
+                    "properties": {
+                        "name": {"type": "string"},
+                        "command": {"type": "string"},
+                        "exit_code": {"type": ["integer", "null"]},
+                        "passed": {"type": "boolean"},
+                        "duration_seconds": {"type": "number", "minimum": 0},
+                    },
+                },
+            },
+            "verified_at": {"type": "string", "format": "date-time"},
+            "output_excerpt": {"type": "string"},
+        },
+        "description": "passed true requires every check passed; each check's passed must equal exit_code == 0.",
+    }
+
+
+def _runner_certification_schema() -> dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://openclaw.invalid/schemas/runner_certification.schema.json",
+        "title": "Runner certification record",
+        "type": "object",
+        "required": _spec_list('runner_certification', "required"),
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+            "runner": {"type": "string", "minLength": 1},
+            "provider": {"type": "string", "minLength": 1},
+            "family": {"type": "string"},
+            "kind": {"type": "string", "enum": list(RUNNER_KINDS)},
+            "status": {"type": "string", "enum": list(CERTIFICATION_STATUSES)},
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": _spec_list('runner_certification', "nested_required", 'checks[]'),
+                    "properties": {
+                        "name": {"type": "string", "enum": list(CERTIFICATION_CHECKS)},
+                        "status": {"type": "string", "enum": list(CHECK_STATUSES)},
+                        "reason": {"type": "string"},
+                        "duration_seconds": {"type": "number", "minimum": 0},
+                        "detail": {"type": "string"},
+                    },
+                },
+            },
+            "certified_at": {"type": "string", "format": "date-time"},
+            "expires_at": {"type": ["string", "null"], "format": "date-time"},
+            "version": {"type": ["string", "null"]},
+            "models": {"type": "array", "items": {"type": "string"}},
+            "notes": {"type": "array", "items": {"type": "string"}},
+            "usage": {"type": ["object", "null"]},
+        },
+        "description": "status certified requires every check present and none failing.",
+    }
+
+
+_SCHEMA_BUILDERS = {
+    "work_unit": _work_unit_schema,
+    "handoff": _handoff_schema,
+    "repository_policy": _repository_policy_schema,
+    "routing_decision": _routing_decision_schema,
+    "usage_record": _usage_record_schema,
+    "run_status": _run_status_schema,
+    "verification_result": _verification_result_schema,
+    "runner_certification": _runner_certification_schema,
+}
+
+
+def json_schemas() -> dict[str, dict]:
+    """Return fresh JSON Schema dictionaries keyed by their ``schemas/`` filename.
+
+    Every call builds new objects, so callers may mutate the result freely.
+    """
+    return {spec["file"]: _SCHEMA_BUILDERS[doc_type]()
+            for doc_type, spec in DOCUMENT_SPECS.items()}

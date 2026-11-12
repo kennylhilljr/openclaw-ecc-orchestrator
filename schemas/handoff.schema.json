@@ -1,8 +1,152 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openclaw.invalid/schemas/handoff.schema.json",
-  "title": "Implementation handoff",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Semantic rules enforced in Python: succeeded requires commands all exiting 0 and no unresolved_failures; files_changed must fall inside the unit scope; no secret-looking strings.",
+  "properties": {
+    "assumptions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "behavior": {
+      "type": "string"
+    },
+    "commands": {
+      "items": {
+        "properties": {
+          "command": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "duration_seconds": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "exit_code",
+          "result"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "commit": {
+      "properties": {
+        "branch": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha": {
+          "pattern": "^[0-9a-f]{7,64}$",
+          "type": "string"
+        },
+        "worktree": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha",
+        "branch",
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "files_changed": {
+      "items": {
+        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "risks": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "partial",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "unit_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "unresolved_failures": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "usage": {
+      "properties": {
+        "cost_usd": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "user_input_required": {
+      "type": "boolean"
+    }
+  },
   "required": [
     "schema_version",
     "unit_id",
@@ -19,150 +163,6 @@
     "usage",
     "user_input_required"
   ],
-  "additionalProperties": false,
-  "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "1.0"
-    },
-    "unit_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-    },
-    "status": {
-      "type": "string",
-      "enum": [
-        "succeeded",
-        "failed",
-        "partial",
-        "blocked"
-      ]
-    },
-    "outcome": {
-      "type": "string"
-    },
-    "files_changed": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths."
-      }
-    },
-    "behavior": {
-      "type": "string"
-    },
-    "commands": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": [
-          "command",
-          "exit_code",
-          "result"
-        ],
-        "properties": {
-          "command": {
-            "type": "string",
-            "minLength": 1
-          },
-          "exit_code": {
-            "type": "integer"
-          },
-          "result": {
-            "type": "string"
-          },
-          "duration_seconds": {
-            "type": "number",
-            "minimum": 0
-          }
-        }
-      }
-    },
-    "unresolved_failures": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "assumptions": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "risks": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "next_action": {
-      "type": "string"
-    },
-    "commit": {
-      "type": "object",
-      "required": [
-        "sha",
-        "branch",
-        "worktree"
-      ],
-      "properties": {
-        "sha": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{7,64}$"
-        },
-        "branch": {
-          "type": "string",
-          "minLength": 1
-        },
-        "worktree": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "usage": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "properties": {
-        "input_tokens": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "output_tokens": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "cost_usd": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "minimum": 0
-        },
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provider": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "user_input_required": {
-      "type": "boolean"
-    },
-    "notes": {
-      "type": "string"
-    }
-  },
-  "description": "Semantic rules enforced in Python: succeeded requires commands all exiting 0 and no unresolved_failures; files_changed must fall inside the unit scope; no secret-looking strings."
+  "title": "Implementation handoff",
+  "type": "object"
 }

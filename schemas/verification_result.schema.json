@@ -1,44 +1,18 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openclaw.invalid/schemas/verification_result.schema.json",
-  "title": "Verification result",
-  "type": "object",
-  "required": [
-    "schema_version",
-    "unit_id",
-    "passed",
-    "checks",
-    "verified_at"
-  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "passed true requires every check passed; each check's passed must equal exit_code == 0.",
   "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "1.0"
-    },
-    "unit_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-    },
-    "passed": {
-      "type": "boolean"
-    },
     "checks": {
-      "type": "array",
       "items": {
-        "type": "object",
-        "required": [
-          "name",
-          "command",
-          "exit_code",
-          "passed"
-        ],
         "properties": {
-          "name": {
-            "type": "string"
-          },
           "command": {
             "type": "string"
+          },
+          "duration_seconds": {
+            "minimum": 0,
+            "type": "number"
           },
           "exit_code": {
             "type": [
@@ -46,23 +20,49 @@
               "null"
             ]
           },
+          "name": {
+            "type": "string"
+          },
           "passed": {
             "type": "boolean"
-          },
-          "duration_seconds": {
-            "type": "number",
-            "minimum": 0
           }
-        }
-      }
-    },
-    "verified_at": {
-      "type": "string",
-      "format": "date-time"
+        },
+        "required": [
+          "name",
+          "command",
+          "exit_code",
+          "passed"
+        ],
+        "type": "object"
+      },
+      "type": "array"
     },
     "output_excerpt": {
       "type": "string"
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "unit_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "verified_at": {
+      "format": "date-time",
+      "type": "string"
     }
   },
-  "description": "passed true requires every check passed; each check's passed must equal exit_code == 0."
+  "required": [
+    "schema_version",
+    "unit_id",
+    "passed",
+    "checks",
+    "verified_at"
+  ],
+  "title": "Verification result",
+  "type": "object"
 }
