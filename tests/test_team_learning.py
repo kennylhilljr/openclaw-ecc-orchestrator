@@ -55,6 +55,16 @@ class CaptureTests(unittest.TestCase):
             self.assertIn("reviewed before anything is pushed", prompt, role)
             self.assertIn("is never a finding", prompt, role)
 
+    def test_verify_prompts_say_the_head_is_not_published_yet(self):
+        # A codex verifier once failed a unit because the local head was on an ecc/ branch with non-Codex
+        # commit identity and unpublished, applying rules from its own global agent instructions.
+        prompts = [P.verify_prompt("pack", "a" * 40),
+                   P.practices_review_prompt("pr_reviewer", [{"id": "L1", "what": "x"}], "pack", "a" * 40)]
+        for prompt in prompts:
+            self.assertIn("reviewed before anything is pushed", prompt)
+            self.assertIn("is never a finding", prompt)
+            self.assertIn("branch prefixes or agent attribution", prompt)
+
 
 class StewardTests(DriveBase):
     def setUp(self):

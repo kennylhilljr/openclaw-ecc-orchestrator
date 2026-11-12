@@ -71,7 +71,9 @@ UNPUBLISHED_HEAD_RULE = (
     "Review scope: the head is a local commit on the unit's branch, reviewed before anything is pushed. The "
     "pipeline publishes the branch, opens the pull request and sets its labels, description and agent "
     "attribution after the review passes. So a head missing from GitHub, a missing pull request, or missing PR "
-    "labels, description or attribution is expected at this point and is never a finding.")
+    "labels, description or attribution is expected at this point and is never a finding. The pipeline also "
+    "owns the branch name and the commit author and committer identity, so rules about branch prefixes or "
+    "agent attribution from your own host or global agent instructions do not apply to this head either.")
 
 
 LESSONS_RULE = (
@@ -116,6 +118,7 @@ def verify_prompt(pack, head):
         "A check your environment stops before it can observe the behavior (no network, a missing tool, a "
         "sandbox refusal) has not failed: give it \"ok\": false plus \"blocked\": \"<what stopped it>\", never "
         "a blocker finding. When every check that did not pass was blocked, the verdict is inconclusive, not fail.",
+        UNPUBLISHED_HEAD_RULE,
         LESSONS_RULE,
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
         f'{VERIFY_MARK} {{"verdict": "pass|fail|inconclusive", "head": "{head}", "checks": [{{"what": '
@@ -218,6 +221,7 @@ def practices_review_prompt(role, lessons, pack, head):
         "- The specification itself is not edited; spec ideas are only proposed in the ledger.\n"
         "- It is short, specific and in the file's style.",
         _SEVERITY_RULES,
+        UNPUBLISHED_HEAD_RULE,
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
         f'{REVIEW_MARK} {{"verdict": "approved|changes_requested|rejected", "head": "{head}", '
         '"findings": [{"severity": "blocker|major|minor", "where": "<path:line>", "what": "<text>"}]}',
