@@ -181,6 +181,8 @@ class PreEditTests(unittest.TestCase):
             json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {}}),
             json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": 7}}),
             json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": ""}}),
+            json.dumps({"hook_event_name": "PreToolUse", "tool_name": [], "tool_input": {"file_path": ".env"}}),
+            json.dumps({"hook_event_name": {"a": 1}, "tool_name": "Write", "tool_input": {"file_path": ".env"}}),
         ]
         for text in cases:
             with self.subTest(text=text):
@@ -317,6 +319,32 @@ class PostEditTests(unittest.TestCase):
                 tmpdir = Path(fake.calls[0]["kwargs"]["env"]["TMPDIR"]).resolve()
                 self.assertNotIn(".openclaw", tmpdir.parts)
                 self.assertNotIn(REPO, tmpdir.parents)
+
+    def test_unsafe_tmpdir_never_probed_via_gettempdir(self):
+        with mock.patch.object(self.hook.tempfile, "gettempdir", side_effect=AssertionError("probed")):
+            code, out, _err, fake = self.post("docs/cli.md", env={"TMPDIR": os.path.join(self.tmp, ".openclaw")})
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn("passed", self.context(out))
+
+    def test_cleanup_error_reported(self):
+        real = self.hook.tempfile.TemporaryDirectory
+
+        class Leaky:
+            def __init__(self, **kwargs):
+                self.inner = real(**kwargs)
+                self.name = self.inner.name
+
+            def cleanup(self):
+                self.inner.cleanup()
+                raise PermissionError(13, "denied")
+
+        with mock.patch.object(self.hook.tempfile, "TemporaryDirectory", Leaky):
+            code, out, _err, _fake = self.post("docs/cli.md")
+        self.assertEqual(code, 0)
+        text = self.context(out)
+        self.assertIn("passed", text)
+        self.assertIn("could not remove temporary directory", text)
 
     def test_no_safe_tmpdir_runs_nothing(self):
         fake = FakeRun()

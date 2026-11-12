@@ -68,6 +68,10 @@ def _parse(raw, stderr):
         return None
     event = payload.get("hook_event_name")
     tool = payload.get("tool_name")
+    if not isinstance(event, str) or not isinstance(tool, str):
+        if event is not None or tool is not None:
+            stderr.write("check_edit: hook_event_name or tool_name is not a string; skipping checks\n")
+        return None
     if event not in (PRE, POST) or tool not in EDIT_TOOLS:
         return None
     tool_input = payload.get("tool_input")
@@ -150,17 +154,17 @@ def python_test_modules(parts):
 
 
 def _plan(parts):
-    """Return (label, argv, cwd, python) or a str explaining why nothing runs, or None."""
+    """Return (argv, cwd, add_src_to_pythonpath), a str explaining why nothing runs, or None."""
     root = _resolve(repo_root())
     if tuple(parts) == DOCS_CLI:
-        return ("docs", [sys.executable, "-m", "unittest", "tests.test_cli.DocsTest"], root, True)
+        return ([sys.executable, "-m", "unittest", "tests.test_cli.DocsTest"], root, True)
     if len(parts) > 2 and tuple(parts[:2]) == PLUGIN_PARTS:
-        return ("plugin", ["npm", "test"], root.joinpath(*PLUGIN_PARTS), False)
+        return (["npm", "test"], root.joinpath(*PLUGIN_PARTS), False)
     if parts and parts[0] == "src":
         modules = python_test_modules(parts)
         if not modules:
             return "No test files match {}; ran nothing.".format("/".join(parts))
-        return ("python", [sys.executable, "-m", "unittest"] + modules, root, True)
+        return ([sys.executable, "-m", "unittest"] + modules, root, True)
     return None
 
 
@@ -187,10 +191,15 @@ def _unsafe_tmp_reason(candidate):
 
 def safe_temp_base():
     """A validated system temporary directory outside the repo and .openclaw."""
-    candidates = [os.environ.get("TMPDIR"), tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    # Validate each candidate before use; never call tempfile.gettempdir(),
+    # which would probe an inherited (possibly unsafe) TMPDIR first.
+    candidates = [os.environ.get("TMPDIR"), "/tmp", "/var/tmp"]
     for candidate in candidates:
-        if candidate and _unsafe_tmp_reason(candidate) is None:
-            return str(_resolve(Path(candidate)))
+        try:
+            if candidate and _unsafe_tmp_reason(candidate) is None:
+                return str(_resolve(Path(candidate)))
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -201,7 +210,7 @@ def _tail(text):
     return text
 
 
-def run_check(argv, cwd, python):
+def run_check(argv, cwd, add_src_to_pythonpath):
     """Run one check in a fresh TMPDIR. Returns a report string; never raises."""
     command = " ".join(argv)
     base = safe_temp_base()
@@ -211,10 +220,11 @@ def run_check(argv, cwd, python):
         tmp = tempfile.TemporaryDirectory(prefix="ecc-hook-", dir=base)
     except OSError as exc:
         return "Skipped `{}`: could not create a temporary directory ({}).".format(command, exc.__class__.__name__)
+    cleanup_note = ""
     try:
         env = dict(os.environ)
         env["TMPDIR"] = tmp.name
-        if python:
+        if add_src_to_pythonpath:
             src = str(_resolve(repo_root()) / "src")
             existing = env.get("PYTHONPATH")
             env["PYTHONPATH"] = src + (os.pathsep + existing if existing else "")
@@ -230,18 +240,26 @@ def run_check(argv, cwd, python):
                 timeout=TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            return "Check `{}` timed out after {} seconds.".format(command, TIMEOUT_SECONDS)
+            result = "Check `{}` timed out after {} seconds.".format(command, TIMEOUT_SECONDS)
         except OSError as exc:
-            return "Could not launch `{}`: {}.".format(command, exc.strerror or exc.__class__.__name__)
-        if proc.returncode == 0:
-            return "Check `{}` passed.".format(command)
-        output = _tail((proc.stdout or "") + (proc.stderr or ""))
-        return "Check `{}` FAILED (exit {}):\n{}".format(command, proc.returncode, output)
+            result = "Could not launch `{}`: {}.".format(command, exc.strerror or exc.__class__.__name__)
+        else:
+            result = None
+        if result is not None:
+            pass
+        elif proc.returncode == 0:
+            result = "Check `{}` passed.".format(command)
+        else:
+            output = _tail((proc.stdout or "") + (proc.stderr or ""))
+            result = "Check `{}` FAILED (exit {}):\n{}".format(command, proc.returncode, output)
     finally:
         try:
             tmp.cleanup()
-        except OSError:
-            pass
+        except OSError as exc:
+            cleanup_note = "\nWarning: could not remove temporary directory {} ({}).".format(
+                tmp.name, exc.__class__.__name__
+            )
+    return result + cleanup_note
 
 
 def post_tool_use(file_path, cwd, stdout, stderr):
@@ -255,8 +273,8 @@ def post_tool_use(file_path, cwd, stdout, stderr):
     if isinstance(plan, str):
         _emit_context(stdout, POST, plan)
         return 0
-    _label, argv, run_cwd, python = plan
-    _emit_context(stdout, POST, run_check(argv, run_cwd, python))
+    argv, run_cwd, add_src_to_pythonpath = plan
+    _emit_context(stdout, POST, run_check(argv, run_cwd, add_src_to_pythonpath))
     return 0
 
 
