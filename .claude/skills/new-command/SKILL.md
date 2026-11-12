@@ -5,8 +5,11 @@ description: Add a new gated (mutating) subcommand to the ecc-orchestrator CLI w
 
 # New gated command
 
-Every command that changes state goes through one shared gate,
-`run_gated` in `src/openclaw_ecc_orchestrator/cli/main.py`. It handles dry
+Gated commands (the `GATED` table in `cli/commands.py`, for example
+`create-run`, `dispatch` and `merge`) go through one shared gate, `run_gated`
+in `src/openclaw_ecc_orchestrator/cli/main.py`. A few operator commands such
+as `review-plan`, `approvals process-inbox` and `catalog-refresh` have their own
+handlers; follow this guide when the new command should be gated. It handles dry
 run, reviewed-plan confirmation, destructive authorization, the run lease
 and the stale-plan check. A new command only supplies a plan and an
 executor; do not add a second confirmation path.

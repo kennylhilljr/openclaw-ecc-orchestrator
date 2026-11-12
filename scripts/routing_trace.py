@@ -38,6 +38,24 @@ class InputError(Exception):
     """An input, policy or Git problem; reported with exit code 2."""
 
 
+def _strict_pairs(items):
+    out = {}
+    for key, value in items:
+        if key in out:
+            raise ValueError("duplicate key %r" % key)
+        out[key] = value
+    return out
+
+
+def _reject_constant(name):
+    raise ValueError("non-finite number %s" % name)
+
+
+def strict_json(text: str):
+    """Parse JSON like the CLI does: duplicate keys and NaN/Infinity are refused."""
+    return json.loads(text, object_pairs_hook=_strict_pairs, parse_constant=_reject_constant)
+
+
 def repository_root(repo: str) -> pathlib.Path:
     path = pathlib.Path(repo)
     if not path.is_dir():
@@ -80,8 +98,8 @@ def load_units(path: str) -> list:
     except (OSError, UnicodeDecodeError) as exc:
         raise InputError("cannot read %s: %s" % (path, exc)) from None
     try:
-        data = json.loads(text)
-    except ValueError as exc:
+        data = strict_json(text)
+    except (ValueError, RecursionError) as exc:
         raise InputError("%s is not valid JSON: %s" % (path, exc)) from None
     if isinstance(data, dict) and "units" not in data:
         # A work unit always has an id; anything else is an unsupported container.

@@ -3,7 +3,8 @@
 
     python3 scripts/plan_lint.py PLAN.json [--repo PATH] [--policy FILE]
 
-PLAN.json holds a list of work units or an object with a ``units`` list.
+PLAN.json holds a list of work units or an object with a ``units`` list;
+every unit must be a valid work unit (schemas.validate_work_unit).
 Target paths come from the committed tree at the repository's HEAD
 (``git ls-tree``), never from the working tree, so untracked and
 staged-only files do not count. The policy is ``--policy`` or, when that is
@@ -34,6 +35,24 @@ from openclaw_ecc_orchestrator.runs.plan_lint import lint_plan  # noqa: E402
 
 class InputError(Exception):
     """A plan, policy or Git problem; reported with exit code 2."""
+
+
+def _strict_pairs(items):
+    out = {}
+    for key, value in items:
+        if key in out:
+            raise ValueError("duplicate key %r" % key)
+        out[key] = value
+    return out
+
+
+def _reject_constant(name):
+    raise ValueError("non-finite number %s" % name)
+
+
+def strict_json(text: str):
+    """Parse JSON like the CLI does: duplicate keys and NaN/Infinity are refused."""
+    return json.loads(text, object_pairs_hook=_strict_pairs, parse_constant=_reject_constant)
 
 
 def _git(repo: pathlib.Path, *args: str) -> bytes:
@@ -90,14 +109,26 @@ def load_plan(path: str):
     except (OSError, UnicodeDecodeError) as exc:
         raise InputError("cannot read plan %s: %s" % (path, exc)) from None
     try:
-        plan = json.loads(text)
-    except ValueError as exc:
+        plan = strict_json(text)
+    except (ValueError, RecursionError) as exc:
         raise InputError("plan %s is not valid JSON: %s" % (path, exc)) from None
     if isinstance(plan, list):
-        return plan
-    if isinstance(plan, dict) and isinstance(plan.get("units"), list):
-        return plan
-    raise InputError("plan must be a list of units or an object with a units list")
+        units = plan
+    elif isinstance(plan, dict) and isinstance(plan.get("units"), list):
+        units = plan["units"]
+    else:
+        raise InputError("plan must be a list of units or an object with a units list")
+    problems = []
+    for index, unit in enumerate(units):
+        report = schemas.validate_work_unit(unit)
+        if not report.ok:
+            label = unit.get("id") if isinstance(unit, dict) and isinstance(unit.get("id"), str) \
+                else "#%d" % index
+            details = report.errors + [v["kind"] for v in report.violations]
+            problems.append("unit %s: %s" % (label, "; ".join(details[:5])))
+    if problems:
+        raise InputError("plan has invalid work units: " + " | ".join(problems))
+    return plan
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -121,9 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         result = lint_plan(plan, target_paths=paths, policy=policy)
-    except Exception as exc:  # malformed nested fields the linter cannot read
-        print("error: plan could not be linted, check that every unit is a valid work unit "
-              "(%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
+    except Exception as exc:  # defensive: validated units should never get here
+        print("error: plan could not be linted (%s: %s)" % (type(exc).__name__, exc),
+              file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1

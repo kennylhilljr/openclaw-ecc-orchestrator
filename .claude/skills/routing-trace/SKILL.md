@@ -20,7 +20,8 @@ PYTHONPATH=src python3.11 scripts/routing_trace.py "$ARGUMENTS"
 ```
 
 The script bootstraps `src/` itself, so `python3 scripts/routing_trace.py
-FILE` works too.
+FILE` works from the repository root without `PYTHONPATH`; from elsewhere,
+pass the script's full path.
 
 Policy options:
 

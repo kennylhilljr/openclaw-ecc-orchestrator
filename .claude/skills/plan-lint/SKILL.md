@@ -19,7 +19,11 @@ PYTHONPATH=src python3.11 scripts/plan_lint.py "$ARGUMENTS"
 ```
 
 The script adds `src/` to its import path itself, so plain
-`python3 scripts/plan_lint.py PLAN.json` also works from any directory.
+`python3 scripts/plan_lint.py PLAN.json` also works from the repository root
+without `PYTHONPATH`; from elsewhere, pass the script's full path.
+
+Every unit must be a valid work unit; a schema error, malformed JSON,
+duplicate key or non-finite number is an input error (exit 2).
 
 Optional flags:
 

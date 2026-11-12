@@ -76,6 +76,11 @@ class PlanLintScriptTests(unittest.TestCase):
         path.write_text(json.dumps(plan), encoding="utf-8")
         return path
 
+    def raw_file(self, text, name):
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
     def run_script(self, *args, cwd=None):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
                               cwd=str(cwd or self.repo), env=_env(), capture_output=True,
@@ -174,6 +179,9 @@ class PlanLintScriptTests(unittest.TestCase):
             "malformed scope": [self.plan_file([{"id": "x", "scope": "oops"}], "scope.json")],
             "malformed nested plan": [self.plan_file({"units": [{"id": "x", "scope": "oops"}]},
                                                      "nested.json")],
+            "incomplete unit": [self.plan_file([{"id": "x"}], "incomplete.json")],
+            "duplicate key": [self.raw_file('{"units": [], "units": []}', "dup.json")],
+            "non-finite number": [self.raw_file('{"units": [{"budget": NaN}]}', "nan.json")],
             "invalid policy": [good, "--policy", bad_policy],
             "missing policy": [good, "--policy", self.tmp / "nope.json"],
             "not a repo": [good, "--repo", not_repo],
@@ -185,6 +193,7 @@ class PlanLintScriptTests(unittest.TestCase):
                 result = self.run_script(*args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_repository_without_commits_is_an_error(self):
         empty = self.tmp / "empty"

@@ -72,6 +72,11 @@ class RoutingTraceScriptTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
+    def raw_file(self, text, name):
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
     def run_script(self, *args, cwd=None):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
                               cwd=str(cwd or self.repo), env=_env(), capture_output=True,
@@ -195,6 +200,8 @@ class RoutingTraceScriptTests(unittest.TestCase):
             "unrelated object": [self.json_file({"name": "x"}, "obj.json")],
             "units not a list": [self.json_file({"units": {"id": "x"}}, "units.json")],
             "non-object unit": [self.json_file([unit(), "x"], "mixed.json")],
+            "duplicate key": [self.raw_file('{"id": "a", "id": "b"}', "dup.json")],
+            "non-finite number": [self.raw_file('{"id": "a", "score": Infinity}', "inf.json")],
             "invalid policy": [good, "--policy", bad_policy],
             "missing policy": [good, "--policy", self.tmp / "nope.json"],
             "missing repo": [good, "--repo", self.tmp / "gone"],
@@ -205,6 +212,7 @@ class RoutingTraceScriptTests(unittest.TestCase):
                 result = self.run_script(*args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":
