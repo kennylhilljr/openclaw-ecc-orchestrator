@@ -28,10 +28,15 @@ class LeaseDuringWaitTests(IntegrationBase):
     def test_lease_renewed_while_runner_works(self):
         c, m, _ = self.conductor("c1", lease_ttl=60, lease_renew_interval=0.02)
         self.start(c, self.argv("sleep:0.6"))
+        handle = c._handles[("r1", "u1")]
         stop = threading.Event()
 
-        def tick():  # 20 fake seconds per 50 ms: 240 s over the run, four lease lifetimes
-            while not stop.is_set():
+        # 20 fake seconds per 50 ms: 240 s over the run, four lease lifetimes.
+        # Time races only while the runner works. Completion makes several
+        # store writes without renewing; at this speed a loaded machine let
+        # the lease lapse between them, which says nothing about renewal.
+        def tick():
+            while not stop.is_set() and handle.result is None:
                 self.clock.t += 20
                 time.sleep(0.05)
 
@@ -48,6 +53,128 @@ class LeaseDuringWaitTests(IntegrationBase):
         u = m.load("r1")["units"]["u1"]
         self.assertEqual(u["state"], "failed")
         self.assertEqual(m.load("r1")["lease"]["conductor_id"], "c1")
+
+    def test_lease_lost_during_completion_keeps_unit_retryable(self):
+        """A failed terminal transition must not strand the unit in `running`
+        with its process handle dropped: the wait reports the lost lease and
+        a retry finishes the job."""
+        c, m, _ = self.conductor("c1", lease_ttl=60)
+        self.start(c, self.argv("nohandoff", "a.txt=x"))
+        real = m.transition
+        calls = {"n": 0}
+
+        def lapse_once(run_id, cid, unit_id, target, **kw):
+            if target == "failed" and calls["n"] == 0:
+                calls["n"] += 1
+                self.clock.t += 61  # the lease lapses mid-completion
+            return real(run_id, cid, unit_id, target, **kw)
+
+        with mock.patch.object(m, "transition", side_effect=lapse_once):
+            first = c.wait_unit("r1", "u1")
+            self.assertFalse(first["ok"])
+            self.assertIn("lease_held", self.failed_checks(first))
+            self.assertTrue(first["changed"])  # the exit and usage were recorded
+            self.assertEqual(m.load("r1")["units"]["u1"]["state"], "running")
+            self.assertIn(("r1", "u1"), c._handles)
+            second = c.wait_unit("r1", "u1")
+        self.assertIn("handoff_valid", self.failed_checks(second))
+        self.assertEqual(m.load("r1")["units"]["u1"]["state"], "failed")
+        self.assertNotIn(("r1", "u1"), c._handles)
+
+    def test_store_error_after_terminal_write_finishes_on_retry(self):
+        """The failed state was written but the call raised: the retry still
+        records the failure evidence instead of dropping it."""
+        from openclaw_ecc_orchestrator.runs.store import StoreError
+
+        c, m, _ = self.conductor("c1", lease_ttl=60)
+        self.start(c, self.argv("nohandoff", "a.txt=x"))
+        real = m.transition
+        calls = {"n": 0}
+
+        def write_then_raise(run_id, cid, unit_id, target, **kw):
+            res = real(run_id, cid, unit_id, target, **kw)
+            if target == "failed" and calls["n"] == 0:
+                calls["n"] += 1
+                raise StoreError("event appended, snapshot write failed")
+            return res
+
+        with mock.patch.object(m, "transition", side_effect=write_then_raise):
+            first = c.wait_unit("r1", "u1")
+            self.assertIn("transient_failure", self.failed_checks(first))
+            self.assertEqual(m.load("r1")["units"]["u1"]["state"], "failed")
+            self.assertNotIn("last_failure", m.load("r1")["units"]["u1"]["annotations"])
+            second = c.wait_unit("r1", "u1")
+        self.assertIn("handoff_valid", self.failed_checks(second))
+        unit = m.load("r1")["units"]["u1"]
+        self.assertEqual(unit["annotations"]["last_failure"]["reason"], "handoff_missing")
+        self.assertNotIn(("r1", "u1"), c._handles)
+
+    def test_refused_failure_evidence_is_retried(self):
+        c, m, _ = self.conductor("c1", lease_ttl=60)
+        self.start(c, self.argv("nohandoff", "a.txt=x"))
+        real = m.annotate_unit
+        calls = {"n": 0}
+
+        def refuse_once(run_id, cid, unit_id, key, value):
+            if key == "last_failure" and calls["n"] == 0:
+                calls["n"] += 1
+                return {"ok": False, "checks": [{"name": "lease_held", "ok": False, "detail": "x"}]}
+            return real(run_id, cid, unit_id, key, value)
+
+        with mock.patch.object(m, "annotate_unit", side_effect=refuse_once):
+            first = c.wait_unit("r1", "u1")
+            self.assertIn("failure_recorded", self.failed_checks(first))
+            self.assertEqual(m.load("r1")["units"]["u1"]["state"], "failed")
+            self.assertIn(("r1", "u1"), c._handles)
+            second = c.wait_unit("r1", "u1")
+        self.assertIn("handoff_valid", self.failed_checks(second))
+        unit = m.load("r1")["units"]["u1"]
+        self.assertEqual(unit["annotations"]["last_failure"]["reason"], "handoff_missing")
+        self.assertNotIn(("r1", "u1"), c._handles)
+
+    def test_usage_written_then_raised_is_not_charged_twice(self):
+        from openclaw_ecc_orchestrator.runs.store import StoreError
+
+        c, m, _ = self.conductor("c1")
+        self.start(c, self.argv("write", "a.txt=x"))
+        real = m.record_usage
+        calls = {"n": 0}
+
+        def write_then_raise(*a, **kw):
+            res = real(*a, **kw)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise StoreError("event appended, snapshot write failed")
+            return res
+
+        with mock.patch.object(m, "record_usage", side_effect=write_then_raise):
+            first = c.wait_unit("r1", "u1")
+            self.assertIn("transient_failure", self.failed_checks(first))
+            charged = m.load("r1")["units"]["u1"]["cost_usd"]
+            self.assertGreater(charged, 0)
+            self.ok(c.wait_unit("r1", "u1"))
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(m.load("r1")["units"]["u1"]["cost_usd"], charged)
+
+    def test_refused_verifying_transition_keeps_handle(self):
+        c, m, _ = self.conductor("c1", lease_ttl=60)
+        self.start(c, self.argv("write", "a.txt=x"))
+        real = m.transition
+        calls = {"n": 0}
+
+        def lapse_once(run_id, cid, unit_id, target, **kw):
+            if target == "verifying" and calls["n"] == 0:
+                calls["n"] += 1
+                self.clock.t += 61
+            return real(run_id, cid, unit_id, target, **kw)
+
+        with mock.patch.object(m, "transition", side_effect=lapse_once):
+            first = c.wait_unit("r1", "u1")
+            self.assertFalse(first["ok"])
+            self.assertEqual(m.load("r1")["units"]["u1"]["state"], "running")
+            self.assertIn(("r1", "u1"), c._handles)
+            self.ok(c.wait_unit("r1", "u1"))
+        self.assertEqual(m.load("r1")["units"]["u1"]["state"], "reviewing")
 
     def test_expired_but_unclaimed_lease_is_reacquired(self):
         c, m, _ = self.conductor("c1", lease_ttl=60)

@@ -461,11 +461,12 @@ class Conductor:
                 pass
         try:
             unit = self.manager.load(run_id)["units"][unit_id]
-            self.manager.annotate_unit(run_id, self.id, unit_id, "last_failure", {
+            res = self.manager.annotate_unit(run_id, self.id, unit_id, "last_failure", {
                 "reason": reason, "attempt": unit.get("attempts"), "evidence": evidence, "fix": fix,
                 "at": iso(self.clock())})
         except TRANSIENT_ERRORS:
-            pass
+            return False
+        return bool(res.get("ok"))
 
     def _stop_runner(self, run_id, unit_id, unit, stop, log_text, data):
         """Section 5.3: a failure retrying cannot fix. The unit goes to
@@ -845,9 +846,21 @@ class Conductor:
         except TRANSIENT_ERRORS as exc:
             return envelope(op, ok=False, checks=[check("transient_failure", False, f"{type(exc).__name__}: {exc}")],
                             data=data)
+        if finished and self._still_running(run_id, unit_id, handle):
+            # A path reported the unit finished but its state never left
+            # `running` (a refused transition): keep the handle so a retry can
+            # complete it rather than stranding the unit with no process.
+            finished = False
         if finished:
             self._forget(key)
         return res
+
+    def _still_running(self, run_id, unit_id, handle):
+        try:
+            unit = self.manager.load(run_id)["units"][unit_id]
+        except TRANSIENT_ERRORS:
+            return True  # unknown: keeping the handle is the safe side
+        return unit["state"] == S.RUNNING and (unit.get("process") or {}).get("pid") == handle.pid
 
     # == completion ==
     def _allowed_refs(self, run, unit_id):
@@ -917,6 +930,9 @@ class Conductor:
         run = self.manager.load(run_id)
         unit = run["units"][unit_id]
         proc = unit.get("process") or {}
+        ending = stage.get("ending")
+        if ending and unit["state"] == ending["target"] and proc.get("pid") == handle.pid:
+            return self._finish_ending(run_id, unit_id, data)
         if unit["state"] != S.RUNNING or proc.get("pid") != handle.pid:
             return envelope(op, ok=False, checks=[check("unit_still_ours", False,
                                                         f"state {unit['state']}, pid {proc.get('pid')}")],
@@ -974,22 +990,31 @@ class Conductor:
                 cost = float(value)
         if not cost:
             cost = float((result.get("parsed") or {}).get("cost_usd") or 0.0)
+        if not stage.get("usage"):
+            # Usage is additive. Remember the totals it starts from, so a retry
+            # after a call that wrote the increment and then raised can tell it
+            # already landed and does not charge the attempt twice.
+            before = stage.get("usage_from")
+            if before is not None and (float(unit.get("minutes_used") or 0.0),
+                                       float(unit.get("cost_usd") or 0.0)) != before:
+                stage["usage"] = True
+            else:
+                stage["usage_from"] = (float(unit.get("minutes_used") or 0.0), float(unit.get("cost_usd") or 0.0))
+                usage = self.manager.record_usage(run_id, self.id, unit_id, minutes=result["duration_s"] / 60.0,
+                                                  cost_usd=cost)
+                if not usage["ok"]:  # lease lost or a store refusal: the unit is still running, retry
+                    stage.pop("usage_from", None)
+                    return envelope(op, ok=False, changed=True, checks=usage["checks"],
+                                    required_user_actions=usage["required_user_actions"], data=data), False
+                stage["usage"] = True
         cancel = self._cancel_terminal.get(key)
         if result["cancelled"] and cancel is not None:
             terminal, reason = cancel
             target = S.CANCELLED if terminal else S.FAILED
             res = self.manager.transition(run_id, self.id, unit_id, target, reason=f"cancelled:{reason}")
             if not res["ok"]:
-                return envelope(op, ok=False, checks=res["checks"], data=data), False
-            self.manager.record_usage(run_id, self.id, unit_id, minutes=result["duration_s"] / 60.0, cost_usd=cost)
+                return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), False
             return envelope(op, ok=True, changed=True, checks=res["checks"], data=data), True
-        if not stage.get("usage"):
-            usage = self.manager.record_usage(run_id, self.id, unit_id, minutes=result["duration_s"] / 60.0,
-                                              cost_usd=cost)
-            stage["usage"] = True
-            if not usage["ok"]:
-                return envelope(op, ok=False, changed=True, checks=usage["checks"],
-                                required_user_actions=usage["required_user_actions"], data=data), True
         if result["error"] or result["timed_out"] or result.get("hung") or result["exit_code"] != 0:
             if result.get("hung"):
                 reason = "hung"
@@ -1003,14 +1028,53 @@ class Conductor:
                 stop = R.classify_runner_failure(log_text, result["exit_code"])
             if stop:
                 return self._stop_runner(run_id, unit_id, unit, stop, log_text, data), True
-            res = self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=result["error"] or reason)
-            if not res["ok"]:
-                return envelope(op, ok=False, checks=res["checks"], data=data), False
-            self._note_failure(run_id, unit_id, reason, R.failure_evidence(reason, log_text=log_text))
-            self._record_outcome(run_id, unit_id, False, False, reason, cost)
-            return envelope(op, ok=False, changed=True, checks=[check("runner_succeeded", False, reason)],
-                            data=data), True
+            return self._end_unit(run_id, unit_id, S.FAILED, result["error"] or reason, data,
+                                  [check("runner_succeeded", False, reason)],
+                                  failure=(reason, R.failure_evidence(reason, log_text=log_text)),
+                                  outcome=(reason, cost))
         return self._accept_handoff(run_id, unit_id, doc, missing, cost, data)
+
+    def _end_unit(self, run_id, unit_id, target, reason, data, checks, failure=None, outcome=None):
+        """Move a still-running unit to a terminal state, then record its
+        failure evidence and escalation outcome. Returns (envelope, finished).
+
+        The pending step is staged before the transition. If the transition is
+        refused (the lease lapsed) the unit is still `running`: the handle is
+        kept and the wait can be retried. If it raised after the state was
+        written, the retry finds the unit in `target` and finishes the
+        recording from the stage instead of dropping it."""
+        op = "unit.complete"
+        stage = self._stages.setdefault((run_id, unit_id), {})
+        stage["ending"] = {"target": target, "checks": list(checks), "failure": failure, "outcome": outcome}
+        res = self.manager.transition(run_id, self.id, unit_id, target, reason=reason)
+        if not res["ok"]:
+            stage.pop("ending", None)
+            # The exit and usage are already recorded, so state changed.
+            return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), False
+        return self._finish_ending(run_id, unit_id, data)
+
+    def _finish_ending(self, run_id, unit_id, data):
+        """Record the staged evidence and outcome. Returns (envelope, finished).
+
+        The failure evidence (an idempotent annotation) stays staged until it
+        is written, so a refused or failed write is retried by the next wait.
+        The escalation outcome is recorded at most once: its controller
+        changes in memory before it persists, so it is unstaged first and a
+        retry never feeds the same attempt to it twice."""
+        stage = self._stages.setdefault((run_id, unit_id), {})
+        ending = stage["ending"]
+        if ending["failure"]:
+            if not self._note_failure(run_id, unit_id, *ending["failure"]):
+                return envelope("unit.complete", ok=False, changed=True,
+                                checks=[check("failure_recorded", False, "last_failure not written; retry")],
+                                data=data), False
+            ending["failure"] = None
+        outcome, ending["outcome"] = ending["outcome"], None
+        if outcome:
+            reason, cost = outcome
+            self._record_outcome(run_id, unit_id, False, False, reason, cost)
+        stage.pop("ending", None)
+        return envelope("unit.complete", ok=False, changed=True, checks=ending["checks"], data=data), True
 
     def _accept_handoff(self, run_id, unit_id, doc, missing, cost, data):
         op = "unit.complete"
@@ -1021,12 +1085,11 @@ class Conductor:
             doc, missing = self._repair_handoff(run_id, unit_id, workspace, problems, data)
         head = git_out(["rev-parse", "HEAD"], workspace["path"])
         if missing:
-            self._note_failure(run_id, unit_id, missing, R.failure_evidence(
-                missing, handoff_problems=[missing], log_text=R.read_tail(self._log_paths.get((run_id, unit_id)))))
-            self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason=missing)
-            self._record_outcome(run_id, unit_id, False, False, missing, cost)
-            return envelope(op, ok=False, changed=True, checks=[check("handoff_valid", False, missing)],
-                            data=data), True
+            evidence = R.failure_evidence(missing, handoff_problems=[missing],
+                                          log_text=R.read_tail(self._log_paths.get((run_id, unit_id))))
+            return self._end_unit(run_id, unit_id, S.FAILED, missing, data,
+                                  [check("handoff_valid", False, missing)],
+                                  failure=(missing, evidence), outcome=(missing, cost))
         log = self._lessons(run_id)
         if log is not None and isinstance(doc, dict):
             from ..team.learning import capture_handoff
@@ -1039,18 +1102,17 @@ class Conductor:
         if not res["ok"]:
             summary = data["handoff"] or {}
             if not summary:  # the record itself failed (lease, store): retry later
-                return envelope(op, ok=False, checks=res["checks"], data=data), False
+                # The exit and usage are already recorded, so state changed.
+                return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), False
             wants_user = summary.get("user_input_required") or summary.get("status") == "blocked"
             if wants_user and not summary.get("violations"):
-                self.manager.transition(run_id, self.id, unit_id, S.NEEDS_USER, reason="runner_needs_user")
-            else:
-                reported = doc.get("unresolved_failures") if isinstance(doc, dict) else None
-                self._note_failure(run_id, unit_id, "handoff_invalid", R.failure_evidence(
-                    "handoff_invalid", handoff_problems=list(summary.get("problems") or [])
-                    + [f"unresolved: {f}" for f in (reported or []) if isinstance(f, str)][:10]))
-                self.manager.transition(run_id, self.id, unit_id, S.FAILED, reason="handoff_invalid")
-                self._record_outcome(run_id, unit_id, False, False, "handoff_invalid", cost)
-            return envelope(op, ok=False, changed=True, checks=res["checks"], data=data), True
+                return self._end_unit(run_id, unit_id, S.NEEDS_USER, "runner_needs_user", data, res["checks"])
+            reported = doc.get("unresolved_failures") if isinstance(doc, dict) else None
+            evidence = R.failure_evidence(
+                "handoff_invalid", handoff_problems=list(summary.get("problems") or [])
+                + [f"unresolved: {f}" for f in (reported or []) if isinstance(f, str)][:10])
+            return self._end_unit(run_id, unit_id, S.FAILED, "handoff_invalid", data, res["checks"],
+                                  failure=("handoff_invalid", evidence), outcome=("handoff_invalid", cost))
         with self.lease_heartbeat(run_id):
             self._run_skills_pass(run_id, unit_id)
         return self._verify(run_id, unit_id, data, cost), True
