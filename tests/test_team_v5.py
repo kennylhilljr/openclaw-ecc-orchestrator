@@ -63,6 +63,28 @@ class V5Tests(DriveBase):
         self.assertEqual([uid for uid, _ in healed], ["alpha"])
         self.assertEqual(self.m.load("r1")["units"]["alpha"]["state"], "ready")
 
+    def test_heal_grant_reopens_a_unit_over_its_cost_cap(self):
+        """pr-review-bots#5: a $1 unit stopped at $1.03 after two attempts. The delivery lead's
+        attempt grant must come with cost headroom, or the next assignment is refused at once."""
+        units = self.units2()
+        units[0]["budget"]["maximum_cost_usd"] = 1.0
+        drive = self.make(units)
+        self.ok(self.c.assign_unit("r1", "alpha"))
+        self.m.transition("r1", self.c.id, "alpha", "running", reason="attempt 1")
+        self.ok(self.m.record_usage("r1", self.c.id, "alpha", minutes=1, cost_usd=1.03))
+        self.m.annotate_unit("r1", self.c.id, "alpha", "escalation", {"attempts": [
+            {"attempt": 1, "tier": 0, "kind": "implementation", "passed": False, "objective_failure": True,
+             "reason": "verification_failed", "cost_usd": 0.55}]})
+        self.m.transition("r1", self.c.id, "alpha", "needs_user", reason="escalation_stopped")
+        healed = drive.heal(self.m.load("r1")["units"], ["alpha"])
+        self.assertEqual([uid for uid, _ in healed], ["alpha"])
+        res = self.c.assign_unit("r1", "alpha")
+        self.assertTrue(res["ok"], json.dumps(res, default=str)[:2000])
+        alpha = self.m.load("r1")["units"]["alpha"]
+        self.assertEqual(alpha["state"], "assigned")
+        # The overrun ($0.03) plus the dearest attempt so far ($0.55).
+        self.assertAlmostEqual(alpha["annotations"]["budget_grant"]["cost_usd"], 0.58)
+
     def test_git_state_stop_inside_a_scope_waits_for_the_owner(self):
         self.assertEqual(self.git_state_stop({"shared_git_state_changes": ["ref moved: refs/heads/main a -> b"],
                                               "touches_scope": True, "refs_only": True}), [])
