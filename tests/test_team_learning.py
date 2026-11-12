@@ -48,6 +48,13 @@ class CaptureTests(unittest.TestCase):
         self.assertIn('"lessons"', P.review_prompt("pr_reviewer", "pack", "a" * 40))
         self.assertIn('"lessons"', P.verify_prompt("pack", "a" * 40))
 
+    def test_review_prompts_say_the_head_is_not_published_yet(self):
+        # A codex pr_reviewer once blocked a unit because its local head had no GitHub commit or PR.
+        for role in P.CHECKLISTS:
+            prompt = P.review_prompt(role, "pack", "a" * 40)
+            self.assertIn("reviewed before anything is pushed", prompt, role)
+            self.assertIn("is never a finding", prompt, role)
+
 
 class StewardTests(DriveBase):
     def setUp(self):

@@ -67,6 +67,13 @@ _SEVERITY_RULES = (
     "rejected only when the approach itself is wrong for the design and needs an owner decision.")
 
 
+UNPUBLISHED_HEAD_RULE = (
+    "Review scope: the head is a local commit on the unit's branch, reviewed before anything is pushed. The "
+    "pipeline publishes the branch, opens the pull request and sets its labels, description and agent "
+    "attribution after the review passes. So a head missing from GitHub, a missing pull request, or missing PR "
+    "labels, description or attribution is expected at this point and is never a finding.")
+
+
 LESSONS_RULE = (
     "Lessons (TEAM-DELIVERY v7): if this change shows that the repository's own instructions (AGENTS.md, a skill "
     "in .agents/skills, or the specification) should say something they do not, so that future units avoid what "
@@ -84,6 +91,7 @@ def review_prompt(role, pack, head):
         "Do not modify any file.",
         "Checklist:\n" + checklist,
         _SEVERITY_RULES,
+        UNPUBLISHED_HEAD_RULE,
         LESSONS_RULE,
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
         f'{REVIEW_MARK} {{"verdict": "approved|changes_requested|rejected", "head": "{head}", '
