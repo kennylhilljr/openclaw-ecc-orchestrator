@@ -191,8 +191,11 @@ class BudgetTests(IntegrationBase):
         self.ok(m.assign_unit("r1", "c1", "u1", "w"))
         self.ok(m.transition("r1", "c1", "u1", "running"))
         self.ok(m.record_usage("r1", "c1", "u1", minutes=1, cost_usd=0.6))
-        res = m.record_usage("r1", "c1", "u1", minutes=1, cost_usd=0.6)
-        self.assertFalse(res["ok"])
+        # The finished attempt keeps its state; the next attempt is refused.
+        self.assertTrue(self.ok(m.record_usage("r1", "c1", "u1", minutes=1, cost_usd=0.6))["data"]["over_cost_budget"])
+        self.ok(m.transition("r1", "c1", "u1", "failed", reason="x"))
+        self.ok(m.transition("r1", "c1", "u1", "ready"))
+        self.assertFalse(m.assign_unit("r1", "c1", "u1", "w")["ok"])
         self.assertEqual(m.load("r1")["units"]["u1"]["state"], "needs_user")
 
 
