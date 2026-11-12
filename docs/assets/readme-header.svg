@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" role="img" aria-labelledby="title desc">
+  <title id="title">OpenClaw ECC Orchestrator</title>
+  <desc id="desc">A midnight blue banner. An ECC task plan branches into three isolated Git worktrees, each passing verification and review, which converge into a sequential merge queue that lands on main. A coral OpenClaw claw receives the runtime's events and sends approval decisions back to the merge queue.</desc>
+  <metadata>
+    Original artwork for kennylhilljr/openclaw-ecc-orchestrator.
+    Visual direction: https://github.com/kennylhilljr/ecc-customization/blob/main/docs/assets/readme-header.svg (midnight blue background, grid, mint/blue/violet accents).
+    Consulted for recognizable motifs, not copied: ECC icon https://github.com/affaan-m/ECC/blob/main/assets/ecc-icon.svg (MIT) and OpenClaw lobster https://github.com/openclaw/openclaw/blob/main/docs/assets/pixel-lobster.svg (MIT).
+    ECC and OpenClaw names belong to their projects. No third-party artwork is embedded.
+  </metadata>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1224"/><stop offset="1" stop-color="#182642"/></linearGradient>
+    <linearGradient id="accent"><stop stop-color="#6ee7b7"/><stop offset="1" stop-color="#93c5fd"/></linearGradient>
+    <linearGradient id="coral" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#ff8a70"/><stop offset="1" stop-color="#ef4f40"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#8ba6cf" stroke-opacity=".07"/></pattern>
+    <marker id="arrow-coral" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#ff7a62"/></marker>
+    <marker id="arrow-mint" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#6ee7b7"/></marker>
+    <marker id="arrow-main" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#c1cfe4"/></marker>
+  </defs>
+
+  <rect width="1600" height="480" rx="28" fill="url(#bg)"/>
+  <rect width="1600" height="480" rx="28" fill="url(#grid)"/>
+
+  <!-- Title block -->
+  <path d="M72 70H144" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="72" y="112" fill="#9cb1cf" font-size="16" font-weight="600" letter-spacing="4">ECC PLANS · GIT WORKTREES · OPENCLAW APPROVALS</text>
+    <text x="68" y="184" fill="#f3f7ff" font-size="64" font-weight="750" letter-spacing="-2">OpenClaw ECC Orchestrator</text>
+    <text x="72" y="228" fill="#c1cfe4" font-size="23">Plan, isolate, verify, review, then merge one unit at a time.</text>
+  </g>
+
+  <!-- ECC task plan card -->
+  <g>
+    <rect x="72" y="282" width="184" height="142" rx="16" fill="#152a44" stroke="#6ee7b7" stroke-width="2"/>
+    <rect x="92" y="300" width="58" height="30" rx="8" fill="#1c4b52"/>
+    <text x="121" y="322" text-anchor="middle" fill="#c1fff0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" font-weight="700">ECC</text>
+    <text x="162" y="321" fill="#9cb1cf" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" letter-spacing="2">PLAN</text>
+    <g fill="none" stroke-linecap="round" stroke-width="3">
+      <rect x="94" y="347" width="12" height="12" rx="3" stroke="#6ee7b7" stroke-width="2"/>
+      <path d="M118 353H222" stroke="#6ee7b7" stroke-opacity=".7"/>
+      <rect x="94" y="373" width="12" height="12" rx="3" stroke="#60a5fa" stroke-width="2"/>
+      <path d="M118 379H204" stroke="#60a5fa" stroke-opacity=".7"/>
+      <rect x="94" y="399" width="12" height="12" rx="3" stroke="#a78bfa" stroke-width="2"/>
+      <path d="M118 405H214" stroke="#a78bfa" stroke-opacity=".7"/>
+    </g>
+  </g>
+
+  <!-- Column labels -->
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" letter-spacing="2" fill="#9cb1cf" text-anchor="middle">
+    <text x="440" y="276">WORKTREES</text>
+    <text x="620" y="276">VERIFY</text>
+    <text x="780" y="276">REVIEW</text>
+    <text x="1066" y="318">MERGE QUEUE</text>
+  </g>
+
+  <!-- Branches: plan to worktrees to verify to review, converging on the queue -->
+  <g fill="none" stroke-width="4" stroke-linecap="round">
+    <path d="M256 353C300 353 300 302 344 302H860C920 302 930 353 984 353" stroke="#6ee7b7"/>
+    <path d="M256 353H984" stroke="#60a5fa"/>
+    <path d="M256 353C300 353 300 404 344 404H860C920 404 930 353 984 353" stroke="#a78bfa"/>
+  </g>
+
+  <!-- Worktree nodes (branch glyphs) -->
+  <g stroke-width="3" fill="#0f1a31">
+    <circle cx="440" cy="302" r="11" stroke="#6ee7b7"/>
+    <circle cx="440" cy="353" r="11" stroke="#60a5fa"/>
+    <circle cx="440" cy="404" r="11" stroke="#a78bfa"/>
+  </g>
+
+  <!-- Verify badges -->
+  <g stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="620" cy="302" r="17" fill="#15434c" stroke="#6ee7b7"/>
+    <path d="M611 302L617 308L629 296" fill="none" stroke="#c1fff0"/>
+    <circle cx="620" cy="353" r="17" fill="#193a54" stroke="#60a5fa"/>
+    <path d="M611 353L617 359L629 347" fill="none" stroke="#dbeafe"/>
+    <circle cx="620" cy="404" r="17" fill="#25365a" stroke="#a78bfa"/>
+    <path d="M611 404L617 410L629 398" fill="none" stroke="#ede9fe"/>
+  </g>
+
+  <!-- Review badges (magnifier) -->
+  <g stroke-width="3" stroke-linecap="round" fill="none">
+    <rect x="762" y="284" width="36" height="36" rx="10" fill="#15434c" stroke="#6ee7b7"/>
+    <circle cx="777" cy="299" r="7" stroke="#c1fff0"/>
+    <path d="M782 304L789 311" stroke="#c1fff0"/>
+    <rect x="762" y="335" width="36" height="36" rx="10" fill="#193a54" stroke="#60a5fa"/>
+    <circle cx="777" cy="350" r="7" stroke="#dbeafe"/>
+    <path d="M782 355L789 362" stroke="#dbeafe"/>
+    <rect x="762" y="386" width="36" height="36" rx="10" fill="#25365a" stroke="#a78bfa"/>
+    <circle cx="777" cy="401" r="7" stroke="#ede9fe"/>
+    <path d="M782 406L789 413" stroke="#ede9fe"/>
+  </g>
+
+  <!-- Sequential merge queue -->
+  <g stroke-width="2">
+    <rect x="990" y="334" width="38" height="38" rx="8" fill="#15434c" stroke="#6ee7b7"/>
+    <rect x="1047" y="334" width="38" height="38" rx="8" fill="#193a54" stroke="#60a5fa"/>
+    <rect x="1104" y="334" width="38" height="38" rx="8" fill="#25365a" stroke="#a78bfa"/>
+    <path d="M1028 353H1047M1085 353H1104" stroke="#6985ae" stroke-width="3"/>
+  </g>
+
+  <!-- main -->
+  <g>
+    <path d="M1142 353H1536" stroke="#c1cfe4" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow-main)"/>
+    <circle cx="1240" cy="353" r="9" fill="#0f1a31" stroke="#c1cfe4" stroke-width="3"/>
+    <circle cx="1340" cy="353" r="9" fill="#0f1a31" stroke="#c1cfe4" stroke-width="3"/>
+    <circle cx="1440" cy="353" r="9" fill="#0f1a31" stroke="#c1cfe4" stroke-width="3"/>
+    <text x="1500" y="390" text-anchor="end" fill="#c1cfe4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" font-weight="600">main</text>
+  </g>
+
+  <!-- Events to OpenClaw, approvals back to the runtime -->
+  <g fill="none" stroke-width="3" stroke-linecap="round">
+    <path d="M880 290C920 230 1060 200 1196 176" stroke="#ff7a62" stroke-dasharray="2 9" marker-end="url(#arrow-coral)"/>
+    <path d="M1300 238C1280 300 1170 300 1128 326" stroke="#6ee7b7" stroke-dasharray="10 8" marker-end="url(#arrow-mint)"/>
+  </g>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" letter-spacing="2">
+    <text x="980" y="236" fill="#ff8a70">EVENTS</text>
+    <text x="1262" y="306" fill="#6ee7b7">APPROVALS</text>
+  </g>
+
+  <!-- OpenClaw claw -->
+  <g transform="translate(1340 150)">
+    <circle cx="0" cy="0" r="118" fill="none" stroke="#ff8a70" stroke-opacity=".16" stroke-dasharray="4 12"/>
+    <!-- arm -->
+    <path d="M40 34C58 52 70 70 86 96" fill="none" stroke="#d9443a" stroke-width="24" stroke-linecap="round"/>
+    <circle cx="86" cy="96" r="14" fill="#b8352b"/>
+    <!-- upper (movable) finger -->
+    <path d="M-14 -30C-40 -62 -90 -80 -132 -62C-104 -54 -72 -38 -46 -8Z" fill="url(#coral)"/>
+    <!-- lower (fixed) finger -->
+    <path d="M-30 22C-66 38 -110 22 -134 -30C-104 -10 -72 -6 -40 -14Z" fill="url(#coral)"/>
+    <!-- palm -->
+    <ellipse cx="8" cy="2" rx="58" ry="42" transform="rotate(-20 8 2)" fill="url(#coral)"/>
+    <!-- teeth and highlights -->
+    <path d="M-104 -50L-100 -42M-78 -38L-76 -30M-102 -8L-98 -16M-76 -6L-74 -14" stroke="#3a0a0d" stroke-width="3" stroke-linecap="round"/>
+    <path d="M-20 -26C0 -38 26 -38 42 -26" fill="none" stroke="#ffd2c4" stroke-opacity=".55" stroke-width="5" stroke-linecap="round"/>
+    <text x="0" y="-84" text-anchor="middle" fill="#ff8a70" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" letter-spacing="4">OPENCLAW</text>
+  </g>
+</svg>

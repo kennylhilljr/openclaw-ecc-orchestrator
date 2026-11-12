@@ -1,5 +1,7 @@
 # OpenClaw ECC Orchestrator
 
+![OpenClaw ECC Orchestrator banner: an ECC task plan branches into isolated Git worktrees that pass verification and review, then converge into a sequential merge queue on main, while the OpenClaw claw receives events and sends approvals back](docs/assets/readme-header.svg)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-60a5fa)](pyproject.toml)
 [![Plugin: Node 22+](https://img.shields.io/badge/Plugin-Node%2022%2B-a78bfa)](integrations/openclaw-plugin/package.json)
