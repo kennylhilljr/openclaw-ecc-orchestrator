@@ -220,7 +220,8 @@ class TeamStep:
         author = routing.get("runner")
         author_family = routing.get("family") or (model_family(author, routing.get("model")) if author else None)
         tier, strict = required_review(routing, classification)
-        pack, tokens = E.unit_pack(repo, ws["path"], base, head, punit, verification)
+        pack, tokens = E.unit_pack(repo, ws["path"], base, head, punit, verification,
+                                    plan_units=run["plan"]["units"])
         rotation = self.rotation(run_id)
         record = {"head": head, "reviews": [], "verification": None, "merge": None}
 

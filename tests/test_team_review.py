@@ -51,6 +51,7 @@ class TeamBase(IntegrationBase):
         super().setUp()
         self.policy = make_policy(model_preferences=PREFS)
         self.calls = []          # (role, provider)
+        self.prompts = []        # (role, prompt)
         self.replies = {}        # role -> list of reply builders(head) or verdict strings
         self.verifier_cwds = []
 
@@ -74,6 +75,7 @@ class TeamBase(IntegrationBase):
             self.calls.append((role_of(prompt), runner))
             return [PY, "-c", "import sys; sys.exit(3)"]
         self.calls.append((role_of(prompt), runner))
+        self.prompts.append((role_of(prompt), prompt))
         text = self.reply(role_of(prompt), self.head)
         script = ("import subprocess,sys,os\n"
                   "b=subprocess.run(['git','rev-parse','--abbrev-ref','HEAD'],capture_output=True,text=True).stdout\n"
@@ -86,6 +88,7 @@ class TeamBase(IntegrationBase):
             ((body.get("contents") or [{}])[0].get("parts") or [{}])[0].get("text") or ""
         provider = "gemini" if "googleapis" in url else ("kimi" if "moonshot" in url else "groq")
         self.calls.append((role_of(prompt), provider))
+        self.prompts.append((role_of(prompt), prompt))
         if role_of(prompt) in getattr(self, "slow_roles", ()):
             self.clock.t += 600
         text = self.reply(role_of(prompt), self.head)
@@ -97,12 +100,12 @@ class TeamBase(IntegrationBase):
             data = {"choices": [{"message": {"content": text}}], "model": "m"}
         return HttpResponse(200, json.dumps(data))
 
-    def setup_unit(self, files=("a.txt",), team=None, high_risk=False):
+    def setup_unit(self, files=("a.txt",), team=None, high_risk=False, later=()):
         self.c, self.m, _ = self.conductor("c1", certified_runners=CERTIFIED, catalog=CATALOG, auto_retry=True,
                                            policy=self.policy)
         u = work_unit("u1", files=list(files), commands=[f"{PY} -c pass"], budget={"attempts": 3},
                       routing={"initial_tier": 0, "maximum_tier": 2}, risk="high" if high_risk else "low")
-        self.ok(self.c.create_run({"units": [u]}, run_id="r1"))
+        self.ok(self.c.create_run({"units": [u, *later]}, run_id="r1"))
         specs = [f"{f}=content" for f in files]
         res = self.drive_to_review(self.c, "r1", "u1", self.argv("write", *specs))
         self.ok(res)
@@ -136,6 +139,27 @@ class ReviewFlowTests(TeamBase):
         team = self.unit()["annotations"]["team"]
         self.assertEqual(team["reviews"][0]["verdict"], "approved")
         self.assertEqual(team["verification"]["verdict"], "pass")
+
+    def test_reviewer_is_told_which_later_units_own_deferred_work(self):
+        """Live finding (issue-worker-bots#19, 2026-11-11): the plan gave README.md and DESIGN.md to a later
+        docs unit, but the PR reviewer of the code unit only saw that unit's scope, blocked it for the missing
+        docs four times and the run stopped at needs_owner. The review evidence names the later units and
+        their files, and says their work is not a finding against this unit."""
+        docs = work_unit("docs", deps=["u1"], files=["README.md", "DESIGN.md"])
+        other = work_unit("unrelated", files=["b.txt"])
+        self.setup_unit(later=[docs, other])
+        self.ok(self.step.run("r1", "u1"))
+        prompt = next(p for r, p in self.prompts if r == "pr_reviewer")
+        self.assertIn("## Later units in this plan", prompt)
+        self.assertIn("- docs: unit docs (files: README.md, DESIGN.md)", prompt)
+        self.assertIn("do not report it as a finding here", prompt)
+        self.assertNotIn("- unrelated:", prompt, "only units that run after this one are listed")
+
+    def test_review_evidence_has_no_later_units_section_for_a_last_unit(self):
+        self.setup_unit()
+        self.ok(self.step.run("r1", "u1"))
+        prompt = next(p for r, p in self.prompts if r == "pr_reviewer")
+        self.assertNotIn("Later units", prompt)
 
     def test_wrong_head_is_reasked_then_accepted(self):
         self.setup_unit()

@@ -90,7 +90,32 @@ def diff_text(repo, base, head):
     return stat, _clip(proc.stdout, MAX_DIFF_CHARS, "diff")
 
 
-def unit_pack(repo, worktree, base, head, punit, verification=None, verifier=None):
+def later_units(plan_units, unit_id):
+    """Plan units that depend on unit_id, directly or through other units, in plan order."""
+    later, grew = set(), True
+    while grew:
+        grew = False
+        for u in plan_units or []:
+            if u.get("id") not in later and set(u.get("depends_on") or []) & (later | {unit_id}):
+                later.add(u.get("id"))
+                grew = True
+    return [u for u in plan_units or [] if u.get("id") in later]
+
+
+def later_units_text(plan_units, unit_id):
+    later = later_units(plan_units, unit_id)
+    if not later:
+        return ""
+    lines = [f"- {u.get('id')}: {u.get('title', '')} (files: "
+             + ", ".join((u.get("scope") or {}).get("files") or []) + ")" for u in later]
+    return ("## Later units in this plan\n\n"
+            "These units run after this one and own their own work. A change the plan gives to one of them "
+            "(for example README.md or DESIGN.md updates in a later documentation unit) is not missing from "
+            "this unit: do not report it as a finding here, and do not ask for this unit's scope to grow to "
+            "cover it.\n\n" + "\n".join(lines))
+
+
+def unit_pack(repo, worktree, base, head, punit, verification=None, verifier=None, plan_units=None):
     """(text, estimated_tokens) for one unit's review."""
     stat, diff = diff_text(repo, base, head)
     gates = (verification or {}).get("gates") or []
@@ -102,6 +127,7 @@ def unit_pack(repo, worktree, base, head, punit, verification=None, verifier=Non
         "Scope (files the unit may change): " + ", ".join((punit.get("scope") or {}).get("files") or []),
         "Acceptance commands: " + "; ".join((punit.get("acceptance") or {}).get("commands") or []),
         f"Base commit: {base}\nVerified head: {head}",
+        *filter(None, [later_units_text(plan_units, punit.get("id"))]),
         "## Repository rules\n\n" + (repo_rules(worktree) or "(none found)"),
         "## Design references\n\n" + (design_references(worktree, punit.get("description")) or "(none found)"),
         "## Gate results (run by the orchestrator on the verified head)\n\n" + ("\n".join(gate_lines) or "(none)"),
