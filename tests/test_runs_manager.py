@@ -329,6 +329,17 @@ class BudgetTests(ManagerBase):
         self.assertTrue(res["ok"])
         self.assertEqual(self.mgr.load(run_id)["units"]["a"]["attempts"], 2)
 
+    def test_cost_grant_extends_cost_budget(self):
+        run_id = self.create([unit("a", budget={"attempts": 3, "maximum_cost_usd": 1.0})])
+        self.drive(run_id, "a", ["assigned", "running"])
+        self.mgr.record_usage(run_id, "c1", "a", minutes=1, cost_usd=1.03)
+        self.drive(run_id, "a", ["failed", "ready"])
+        self.mgr.annotate_unit(run_id, "c1", "a", "budget_grant", {"attempts": 1})
+        self.assertFalse(self.mgr.assign_unit(run_id, "c1", "a", "w1")["ok"])
+        self.drive(run_id, "a", ["ready"])
+        self.mgr.annotate_unit(run_id, "c1", "a", "budget_grant", {"attempts": 1, "cost_usd": 0.5})
+        self.assertTrue(self.mgr.assign_unit(run_id, "c1", "a", "w1")["ok"])
+
     def test_minutes_budget_is_advisory(self):
         run_id = self.create([unit("a", budget={"minutes": 10})])
         self.drive(run_id, "a", ["assigned", "running"])

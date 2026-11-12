@@ -206,6 +206,25 @@ class Drive:
                 continue
         return {}
 
+    @staticmethod
+    def _cost_headroom(unit, grant):
+        """The cost grant that lets a granted attempt run. A unit at its cost cap
+        refuses every attempt, so an attempt grant alone fails at once and the
+        drive stops needs_owner (live finding, pr-review-bots#5: a $1 unit at
+        $1.03 got two attempt grants, each refused as budget_exhausted). Grants
+        the overrun plus the unit's dearest attempt so far; the policy's per
+        unit and per drive ceilings still apply."""
+        granted = max(0.0, float(grant.get("cost_usd") or 0.0))
+        cap = (unit.get("budget") or {}).get("maximum_cost_usd")
+        if not isinstance(cap, (int, float)):
+            return granted
+        spent = float(unit.get("cost_usd") or 0.0)
+        if spent < float(cap) + granted:
+            return granted
+        attempts = ((unit.get("annotations") or {}).get("escalation") or {}).get("attempts") or []
+        dearest = max([float(a.get("cost_usd") or 0.0) for a in attempts if isinstance(a, dict)] or [0.0])
+        return round(spent - float(cap) + (dearest or float(cap)), 4)
+
     def heal(self, units, order):
         """Try the recoveries the delivery lead may apply on its own before the
         owner is interrupted. Returns the units healed (empty when none)."""
@@ -239,9 +258,12 @@ class Drive:
                 if not (self._heal_once(uid, kind) and (kind == "grant" or self._heal_once(uid, "grant"))):
                     continue
                 grant = ann.get("budget_grant") or {}
-                m.annotate_unit(self.run_id, self.c.id, uid, "budget_grant", {
-                    "attempts": int(grant.get("attempts") or 0) + 1, "by": "delivery_lead", "reason": reason,
-                    "at": iso(self.clock())})
+                doc = {"attempts": int(grant.get("attempts") or 0) + 1, "by": "delivery_lead", "reason": reason,
+                       "at": iso(self.clock())}
+                cost = self._cost_headroom(u, grant)
+                if cost:
+                    doc["cost_usd"] = cost
+                m.annotate_unit(self.run_id, self.c.id, uid, "budget_grant", doc)
                 if reason == "runner_needs_user":
                     h = self._latest_handoff(uid)
                     problems = [f"you reported: {x}" for x in (h.get("unresolved_failures") or [])

@@ -24,7 +24,7 @@ from ..merge_queue.dispatch import ConflictError, assert_parallel_safe
 from ..plugin.approvals import plan_digest
 from ..plugin.inbox import DecisionInbox
 from ..routing.classify import classify
-from ..routing.escalation import AttemptOutcome, EscalationController, owner_grant, replay
+from ..routing.escalation import AttemptOutcome, EscalationController, cost_grant, owner_grant, replay
 from ..routing.selection import select_runner
 from ..runs import state as S
 from ..runs.dag import plan_sha256
@@ -167,7 +167,8 @@ def predict_routing(ctx, op, run, unit_id):
                        "detail": "fix the unit's routing or policy"}])
     ctrl = EscalationController(punit, classification, tier_costs=ctx.rt.tier_costs(), clock=ctx.clock, policy=policy)
     record = (run["units"][unit_id].get("annotations") or {}).get("escalation") or {}
-    replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]))
+    replay(ctrl, record.get("attempts"), owner_grant(run["units"][unit_id]),
+               cost_grant(run["units"][unit_id]))
     action = ctrl.next_action()
     if action["action"] in ("stop", "done"):
         fail(op, "escalation_allows_attempt", action["reason"],
@@ -707,7 +708,8 @@ def plan_resume(ctx):
                                  check("verified_head", True, head)], extra={"policy": run.get("policy")})
     if extra:
         run = copy.deepcopy(run)
-        run["units"][a.unit].setdefault("annotations", {})["budget_grant"] = {"attempts": granted + extra}
+        ann = run["units"][a.unit].setdefault("annotations", {})
+        ann["budget_grant"] = dict(ann.get("budget_grant") or {}, attempts=granted + extra)
     ctrl = ctx.rt.conductor(run.get("policy"), op)._controller(run, a.unit)
     if ctrl is None:
         fail(op, "routing_valid", f"unit {a.unit} does not classify under the current policy")
@@ -728,8 +730,11 @@ def execute_resume(ctx, plan):
     doc = plan.doc
     c = ctx.rt.conductor(plan.extra["policy"], "resume")
     if doc.get("budget_grant"):
+        unit = c.manager.load(doc["run_id"])["units"][doc["unit_id"]]
+        kept = {k: v for k, v in ((unit.get("annotations") or {}).get("budget_grant") or {}).items()
+                if k == "cost_usd"}
         res = c.manager.annotate_unit(doc["run_id"], c.id, doc["unit_id"], "budget_grant",
-                                      {"attempts": doc["budget_grant"], "by": "owner", "at": iso(ctx.clock())})
+                                      dict(kept, attempts=doc["budget_grant"], by="owner", at=iso(ctx.clock())))
         if not res.get("ok", True) or doc["target"] is None:
             res["operation"] = "resume"
             return res

@@ -107,6 +107,19 @@ class EscalationTests(unittest.TestCase):
         low = replay(controller(unit(attempts=3, initial=0, maximum=1)), failed[:2], grant=1)
         self.assertEqual((low.tier, low.next_action()["action"], low.reserve_grant), (1, "escalate", 1))
 
+    def test_cost_grant_raises_the_cap_up_to_the_policy_ceiling(self):
+        """pr-review-bots#5: a granted attempt on a unit over its cost cap also gets dollars."""
+        failed = [{"passed": False, "objective_failure": True, "cost_usd": 0.55, "reason": "review"}] * 2
+        ctl = replay(controller(unit(attempts=2, cost=1.0, initial=2, maximum=2)), failed, grant=1, extra_cost=0.58)
+        self.assertEqual((ctl.max_cost, ctl.next_action()["action"]), (1.58, "repair"))
+        capped = replay(controller(unit(attempts=2, cost=1.0, initial=2, maximum=2),
+                                   policy={"schema_version": "1.0", "high_risk_paths": [], "required_checks": [],
+                                           "protected_commands": [], "allowed_providers": ["codex"],
+                                           "budget": {"max_cost_usd_per_unit": 1.2, "max_cost_usd_total": 10,
+                                                      "max_minutes_per_unit": 60}}),
+                        failed, grant=1, extra_cost=0.58)
+        self.assertEqual(capped.max_cost, 1.2)
+
     def test_single_attempt_budget_escalates_without_repair(self):
         ctl = controller(unit(attempts=1))
         self.assertEqual(ctl.record(FAIL)["action"], "escalate")

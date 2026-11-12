@@ -281,15 +281,19 @@ class RunManager:
         """Attempts and cost are hard limits. `minutes` is advisory: a long
         running unit gets `long_running` attention events, never a stop."""
         per_tier, total, _minutes, cost = self._budget_limits(unit)
-        grant = max(0, int((((unit.get("annotations") or {}).get("budget_grant") or {})
-                            .get("attempts") or 0)))
+        grant_doc = (unit.get("annotations") or {}).get("budget_grant") or {}
+        grant = max(0, int(grant_doc.get("attempts") or 0))
         used = int((unit.get("attempts_by_tier") or {}).get(str(tier), 0)) if tier is not None else unit["attempts"]
         if per_tier is not None and used >= int(per_tier) + grant:
             return f"attempts {used}/{int(per_tier) + grant} at tier {tier}"
         if total is not None and unit["attempts"] >= int(total) + grant:
             return f"attempts {unit['attempts']}/{int(total) + grant}"
-        if cost is not None and float(unit.get("cost_usd", 0.0)) >= float(cost):
-            return f"cost {unit.get('cost_usd', 0.0)}/{cost} USD"
+        if cost is not None:
+            # A grant may add dollars as well as attempts: an attempt grant alone
+            # cannot reopen a unit that is over its cost cap (pr-review-bots#5).
+            cost = float(cost) + max(0.0, float(grant_doc.get("cost_usd") or 0.0))
+            if float(unit.get("cost_usd", 0.0)) >= cost:
+                return f"cost {unit.get('cost_usd', 0.0)}/{cost} USD"
         return None
 
     # == public API ==

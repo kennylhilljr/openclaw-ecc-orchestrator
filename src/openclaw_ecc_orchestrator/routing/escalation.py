@@ -49,11 +49,25 @@ def owner_grant(unit_record: Mapping[str, Any] | None) -> int:
     return max(0, int(grant.get("attempts") or 0))
 
 
-def replay(ctrl: "EscalationController", attempts, grant: int = 0) -> "EscalationController":
+def cost_grant(unit_record: Mapping[str, Any] | None) -> float:
+    """Extra dollars granted with the attempts (``budget_grant.cost_usd``), so a
+    unit stopped at its cost cap can use its granted attempt."""
+    grant = ((unit_record or {}).get("annotations") or {}).get("budget_grant") or {}
+    try:
+        return max(0.0, float(grant.get("cost_usd") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def replay(ctrl: "EscalationController", attempts, grant: int = 0,
+           extra_cost: float = 0.0) -> "EscalationController":
     """Rebuild a controller from its persisted attempts. An owner grant is held
     in reserve and spent at the first stop (during the replay or later, live),
-    so the plan's budget stays as approved and the replayed path is unchanged."""
+    so the plan's budget stays as approved and the replayed path is unchanged.
+    A granted cost raises the cost cap, never above the policy ceiling."""
     ctrl.reserve_grant = grant
+    if extra_cost:
+        ctrl.max_cost = min(ctrl.max_cost + float(extra_cost), ctrl.cost_ceiling)
     for attempt in attempts or []:
         if ctrl.finished:
             break
@@ -83,8 +97,10 @@ class EscalationController:
         self.owner_extra = 0
         self.reserve_grant = 0
         self.max_cost = float(budget["maximum_cost_usd"])
+        self.cost_ceiling = float("inf")
         if isinstance(ceilings.get("max_cost_usd_per_unit"), (int, float)):
-            self.max_cost = min(self.max_cost, float(ceilings["max_cost_usd_per_unit"]))
+            self.cost_ceiling = float(ceilings["max_cost_usd_per_unit"])
+            self.max_cost = min(self.max_cost, self.cost_ceiling)
         self.max_seconds = float(budget["minutes"]) * 60.0
         if isinstance(ceilings.get("max_minutes_per_unit"), (int, float)):
             self.max_seconds = min(self.max_seconds, float(ceilings["max_minutes_per_unit"]) * 60)
