@@ -79,6 +79,10 @@ runs the Python tests, the plugin unit tests and the secret scan.
   no double hyphen, em dash or en dash; `tests/test_cli.py` (`DocsTest`)
   enforces this.
 - Add a regression test with each bug fix.
+- Claude Code hooks (`.claude/settings.json` calling `.claude/hooks/check_edit.py`)
+  block writes to `.env*` files, warn on direct `schemas/*.json` edits, and after
+  an edit run only the matching `tests/test_<module>*.py`, `DocsTest` for
+  `docs/cli.md`, or `npm test` for the plugin; `tests/test_claude_hooks.py` tests them.
 
 ## Safety
 
