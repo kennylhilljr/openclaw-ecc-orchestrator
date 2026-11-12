@@ -13,6 +13,10 @@ try:
     from ._units import work_unit
 except ImportError:  # discovered as a top level module
     from _units import work_unit
+try:
+    from ._ps import ps_permitted
+except ImportError:  # discovered as a top level module
+    from _ps import ps_permitted
 
 
 class FakeClock:
@@ -231,6 +235,7 @@ class LeaseTests(ManagerBase):
 
 
 class ResumeTests(ManagerBase):
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_resume_marks_dead_process_interrupted_and_keeps_live(self):
         run_id = self.create([unit("a"), unit("b")])
         self.drive(run_id, "a", ["assigned", "running"])
