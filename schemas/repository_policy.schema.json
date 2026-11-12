@@ -1,8 +1,289 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openclaw.invalid/schemas/repository_policy.schema.json",
-  "title": "Repository orchestration policy (.orchestration/config.yaml, JSON compatible)",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block.",
+  "properties": {
+    "allowed_providers": {
+      "items": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ],
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "author_providers": {
+      "description": "Providers that may author units (default: every allowed provider whose runner can author). Lets API providers review without authoring while dispatch launches coding CLIs only.",
+      "items": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ],
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "budget": {
+      "additionalProperties": {
+        "minimum": 0,
+        "type": "number"
+      },
+      "properties": {
+        "max_cost_usd_per_unit": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "max_cost_usd_total": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "max_minutes_per_unit": {
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_cost_usd_per_unit",
+        "max_cost_usd_total",
+        "max_minutes_per_unit"
+      ],
+      "type": "object"
+    },
+    "catalog_max_age_seconds": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "circuit_breaker": {
+      "properties": {
+        "cooldown_seconds": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "failure_threshold": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "failure_threshold",
+        "cooldown_seconds"
+      ],
+      "type": "object"
+    },
+    "cli_models": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "type": "object"
+      },
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "type": "object"
+    },
+    "cost_estimation": {
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "generated_file_couplings": {
+      "description": "Path-pattern pairs which must be owned by the same work unit.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "generated": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "generated"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "health": {
+      "additionalProperties": false,
+      "description": "Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
+      "properties": {
+        "flat_checks_for_hang": {
+          "default": 5,
+          "maximum": 20,
+          "minimum": 2,
+          "type": "integer"
+        },
+        "interval_seconds": {
+          "default": 120,
+          "maximum": 1800,
+          "minimum": 30,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "high_risk_paths": {
+      "items": {
+        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "model_preferences": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "type": "object"
+      },
+      "description": "Ordered glob patterns per provider and capability class; never fixed ids.",
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "type": "object"
+    },
+    "openrouter": {
+      "properties": {
+        "approved_models": {
+          "items": {
+            "pattern": "^[^*?\\[]+$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "data_policy": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "approved_models",
+        "data_policy"
+      ],
+      "type": "object"
+    },
+    "protected_commands": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "required_checks": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "retired_model_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "review_independence": {
+      "default": "provider",
+      "description": "How a review shows independence from its author. provider (default): a different runner, and for strict reviews a different model family. persona: a distinct reviewer persona in its own session, so a single-provider repository can review and merge.",
+      "enum": [
+        "provider",
+        "persona"
+      ],
+      "type": "string"
+    },
+    "runner_costs": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "propertyNames": {
+          "enum": [
+            "economical",
+            "standard",
+            "advanced"
+          ]
+        },
+        "type": "object"
+      },
+      "propertyNames": {
+        "enum": [
+          "claude",
+          "codex",
+          "gemini",
+          "groq",
+          "openrouter",
+          "kimi"
+        ]
+      },
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    }
+  },
   "required": [
     "schema_version",
     "high_risk_paths",
@@ -11,287 +292,6 @@
     "allowed_providers",
     "budget"
   ],
-  "additionalProperties": false,
-  "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "1.0"
-    },
-    "high_risk_paths": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "description": "Repository relative POSIX path or glob; no '..' segments, no absolute or home paths."
-      }
-    },
-    "required_checks": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
-    },
-    "protected_commands": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
-    },
-    "allowed_providers": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "string",
-        "enum": [
-          "claude",
-          "codex",
-          "gemini",
-          "groq",
-          "openrouter",
-          "kimi"
-        ]
-      }
-    },
-    "author_providers": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "string",
-        "enum": [
-          "claude",
-          "codex",
-          "gemini",
-          "groq",
-          "openrouter",
-          "kimi"
-        ]
-      },
-      "description": "Providers that may author units (default: every allowed provider whose runner can author). Lets API providers review without authoring while dispatch launches coding CLIs only."
-    },
-    "review_independence": {
-      "type": "string",
-      "enum": [
-        "provider",
-        "persona"
-      ],
-      "default": "provider",
-      "description": "How a review shows independence from its author. provider (default): a different runner, and for strict reviews a different model family. persona: a distinct reviewer persona in its own session, so a single-provider repository can review and merge."
-    },
-    "budget": {
-      "type": "object",
-      "required": [
-        "max_cost_usd_per_unit",
-        "max_cost_usd_total",
-        "max_minutes_per_unit"
-      ],
-      "additionalProperties": {
-        "type": "number",
-        "minimum": 0
-      },
-      "properties": {
-        "max_cost_usd_per_unit": {
-          "type": "number",
-          "minimum": 0
-        },
-        "max_cost_usd_total": {
-          "type": "number",
-          "minimum": 0
-        },
-        "max_minutes_per_unit": {
-          "type": "number",
-          "minimum": 0
-        }
-      }
-    },
-    "model_preferences": {
-      "type": "object",
-      "propertyNames": {
-        "enum": [
-          "claude",
-          "codex",
-          "gemini",
-          "groq",
-          "openrouter",
-          "kimi"
-        ]
-      },
-      "additionalProperties": {
-        "type": "object",
-        "propertyNames": {
-          "enum": [
-            "economical",
-            "standard",
-            "advanced"
-          ]
-        },
-        "additionalProperties": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "description": "Ordered glob patterns per provider and capability class; never fixed ids."
-    },
-    "cli_models": {
-      "type": "object",
-      "propertyNames": {
-        "enum": [
-          "claude",
-          "codex",
-          "gemini",
-          "groq",
-          "openrouter",
-          "kimi"
-        ]
-      },
-      "additionalProperties": {
-        "type": "object",
-        "propertyNames": {
-          "enum": [
-            "economical",
-            "standard",
-            "advanced"
-          ]
-        },
-        "additionalProperties": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "retired_model_ids": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "runner_costs": {
-      "type": "object",
-      "propertyNames": {
-        "enum": [
-          "claude",
-          "codex",
-          "gemini",
-          "groq",
-          "openrouter",
-          "kimi"
-        ]
-      },
-      "additionalProperties": {
-        "type": "object",
-        "propertyNames": {
-          "enum": [
-            "economical",
-            "standard",
-            "advanced"
-          ]
-        },
-        "additionalProperties": {
-          "type": "number",
-          "minimum": 0
-        }
-      }
-    },
-    "cost_estimation": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "input_tokens": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "output_tokens": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "circuit_breaker": {
-      "type": "object",
-      "required": [
-        "failure_threshold",
-        "cooldown_seconds"
-      ],
-      "properties": {
-        "failure_threshold": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "cooldown_seconds": {
-          "type": "number",
-          "minimum": 0
-        }
-      }
-    },
-    "openrouter": {
-      "type": "object",
-      "required": [
-        "approved_models",
-        "data_policy"
-      ],
-      "properties": {
-        "approved_models": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "pattern": "^[^*?\\[]+$"
-          }
-        },
-        "data_policy": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "catalog_max_age_seconds": {
-      "type": "number",
-      "exclusiveMinimum": 0
-    },
-    "health": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Hang detection. A running process is checked every interval_seconds; it is cancelled as hung only after flat_checks_for_hang consecutive checks in which CPU time, output, stream events, the worktree and the process set all stayed still. There is no wall clock limit.",
-      "properties": {
-        "interval_seconds": {
-          "type": "number",
-          "minimum": 30,
-          "maximum": 1800,
-          "default": 120
-        },
-        "flat_checks_for_hang": {
-          "type": "integer",
-          "minimum": 2,
-          "maximum": 20,
-          "default": 5
-        }
-      }
-    },
-    "generated_file_couplings": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": [
-          "source",
-          "generated"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "source": {
-            "type": "string",
-            "minLength": 1
-          },
-          "generated": {
-            "type": "string",
-            "minLength": 1
-          }
-        }
-      },
-      "description": "Path-pattern pairs which must be owned by the same work unit."
-    }
-  },
-  "description": "Retired providers (windsurf, pi, openai-api) are rejected. openrouter in allowed_providers requires the openrouter block."
+  "title": "Repository orchestration policy (.orchestration/config.yaml, JSON compatible)",
+  "type": "object"
 }
