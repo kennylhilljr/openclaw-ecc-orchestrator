@@ -269,9 +269,10 @@ class GatedContractBase(S.CliTestBase):
 
 class Fixtures(GatedContractBase):
     """Each fixture prepares real state and returns a description of the
-    command: {"cmd": argv, "approve": callable or None, "after": callable or
-    None}. `approve(ctx, spec, plan, digest)` obtains real broker approvals
-    and returns the command to rebuild before authorizing."""
+    command: {"cmd": argv, "approve": callable or None, "check": callable or
+    None}. `approve(cmd)` obtains real broker approvals and returns the
+    command to rebuild before authorizing; `check(result)` asserts on the
+    executor's result after the envelope checks."""
 
     def fx_create_run_new(self):
         return {"cmd": ("create-run", "--run-id", self.RUN_ID, "--plan", self.plan_path)}
@@ -349,8 +350,11 @@ class Fixtures(GatedContractBase):
             with open(os.path.join(path, "notes.local"), "w") as fh:
                 fh.write("uncommitted notes\n")
         cmd = ("cleanup", "--run-id", self.RUN_ID, "--unit", "alpha") + (("--archive",) if archive else ())
+        # The archives this fixture must produce, fixed by its setup rather
+        # than read back from the executor's result.
+        expected = {"bundle": commits and archive, "ignored_archive": ignored and archive}
         return {"cmd": cmd, "approve": self.approve_cleanup if (commits or ignored) and archive else None,
-                "check": self.check_cleanup}
+                "check": lambda result: self.check_cleanup(result, expected)}
 
     def fx_cleanup_neither(self):
         return self._cleanup(commits=False, ignored=False, archive=False)
@@ -424,17 +428,19 @@ class Fixtures(GatedContractBase):
     def check_team_review(self, result):
         self.assertTrue(result["ok"], json.dumps(result, indent=1, default=str)[:3000])
 
-    def check_cleanup(self, result):
+    def check_cleanup(self, result, expected):
         self.assertTrue(result["ok"], json.dumps(result, indent=1, default=str)[:3000])
-        data = result.get("data") or {}
-        if not (data.get("bundle") or data.get("ignored_archive")):
-            return
         rb = result["rollback_checkpoint"]
-        self.assertIsNotNone(rb, "an archiving cleanup returned no rollback checkpoint")
-        if data.get("bundle"):
-            self.assertTrue(os.path.isfile(rb["bundle"]), rb)
-        if data.get("ignored_archive"):
-            self.assertTrue(os.path.isfile(rb["ignored_archive"]), rb)
+        if not any(expected.values()):
+            self.assertIsNone(rb, "a cleanup with nothing to archive returned a checkpoint")
+            return
+        self.assertIsInstance(rb, dict, "an archiving cleanup returned no rollback checkpoint")
+        for key, wanted in expected.items():
+            if wanted:
+                self.assertIn(key, rb)
+                self.assertTrue(os.path.isfile(rb[key]), f"{key} missing: {rb}")
+            else:
+                self.assertNotIn(key, rb)
 
 
 class GatedEnvelopeContractTest(Fixtures):
