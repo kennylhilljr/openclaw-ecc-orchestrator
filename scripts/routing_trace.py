@@ -131,7 +131,12 @@ def main(argv: list[str] | None = None) -> int:
     except InputError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    result = trace(units, policy)
+    try:
+        result = trace(units, policy)
+    except Exception as exc:  # malformed fields the classifier cannot read
+        print("error: units could not be classified (%s: %s)" % (type(exc).__name__, exc),
+              file=sys.stderr)
+        return 2
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1
 

@@ -119,7 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     except InputError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    result = lint_plan(plan, target_paths=paths, policy=policy)
+    try:
+        result = lint_plan(plan, target_paths=paths, policy=policy)
+    except Exception as exc:  # malformed nested fields the linter cannot read
+        print("error: plan could not be linted, check that every unit is a valid work unit "
+              "(%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
+        return 2
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1
 

@@ -169,6 +169,14 @@ class RoutingTraceScriptTests(unittest.TestCase):
         self.assertFalse(out["classifications"][0]["ok"])
         self.assertIsNone(out["classifications"][0]["chosen_tier"])
 
+    def test_malformed_nested_fields_are_reported_not_raised(self):
+        item = {"id": "x", "scope": "oops", "routing": "r", "acceptance": 3}
+        out = self.trace([item], code=1)
+        entry = out["classifications"][0]
+        self.assertFalse(entry["ok"])
+        self.assertTrue(entry["errors"])
+        self.assertIsNone(entry["initial_tier"])
+
     def test_runs_without_pythonpath(self):
         result = subprocess.run([sys.executable, "-I", str(SCRIPT), str(self.json_file(unit())),
                                  "--repo", str(self.repo)], cwd=str(self.tmp), env=_env(),
