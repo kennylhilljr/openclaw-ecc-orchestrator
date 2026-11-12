@@ -9,6 +9,10 @@ import unittest
 
 from openclaw_ecc_orchestrator.process import health as H
 from openclaw_ecc_orchestrator.process.supervisor import Supervisor
+try:
+    from ._ps import ps_permitted
+except ImportError:  # discovered as a top level module
+    from _ps import ps_permitted
 
 PY = sys.executable
 
@@ -200,6 +204,7 @@ class SignalSourceTests(unittest.TestCase):
         with self.assertRaises(OSError):
             H.group_snapshot(1, platform="darwin", ps_runner=runner)
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_real_group_snapshot_sees_self_group(self):
         proc = subprocess.Popen([PY, "-c", "import time; time.sleep(5)"], start_new_session=True)
         try:
@@ -256,6 +261,7 @@ class RealProcessTests(unittest.TestCase):
         res = self.sup.run([PY, "-c", code], cwd=self.tmp, health=cfg)
         return res, seen, time.monotonic() - start
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_sleeping_silent_child_becomes_hung(self):
         res, seen, took = self.run_child("import time; time.sleep(60)")
         self.assertLess(took, 20)

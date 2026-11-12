@@ -7,6 +7,10 @@ import unittest
 from openclaw_ecc_orchestrator.gates.runner import is_protected, parse_command, run_gates
 from openclaw_ecc_orchestrator.process.health import HealthSettings
 from openclaw_ecc_orchestrator.process.supervisor import Supervisor
+try:
+    from ._ps import ps_permitted
+except ImportError:  # discovered as a top level module
+    from _ps import ps_permitted
 
 PY = shlex.quote(sys.executable)
 
@@ -105,6 +109,7 @@ class GateTests(unittest.TestCase):
         self.assertTrue(res["gates"][0]["timed_out"])
         self.assertEqual(res["gates"][0]["status"], "timeout")
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_hung_gate_is_cancelled_by_health_checks(self):
         seen = []
         res = self.gates([f"{PY} -c 'import time; time.sleep(60)'"],

@@ -11,6 +11,10 @@ try:
 except ImportError:  # discovered as a top level module
     from _integration import IntegrationBase
     from _units import work_unit
+try:
+    from ._ps import ps_permitted
+except ImportError:  # discovered as a top level module
+    from _ps import ps_permitted
 
 
 def plan(*units):
@@ -53,6 +57,7 @@ class ConductorHealthTests(IntegrationBase):
         self.assertIn("runner", data)
         self.assertIn("tier", data)
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_hung_runner_is_cancelled_and_failed_with_reason_hung(self):
         c, m, _ = self.conductor_with_health()
         self.ok(c.create_run(plan(work_unit("u1", files=["a.txt"])), run_id="r1"))
@@ -95,6 +100,7 @@ class ConductorHealthTests(IntegrationBase):
         self.assertEqual(multiples[0], 1)
         self.assertEqual(self.attention("budget_exhausted"), [])
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_hung_gate_fails_verification_with_events(self):
         c, m, _ = self.conductor_with_health(checks=2)
         c.repo_checks = {"required": ["stuck"],

@@ -15,6 +15,7 @@ from openclaw_ecc_orchestrator.runners.cli_adapters import (CANCEL_ATTEMPTS, EXE
                                                             ClaudeAdapter, CodexAdapter)
 from tests.test_runners_probes import (CLAUDE_JSON, CODEX_JSONL, STREAMED, FakeCommands, UnitTestRuns,
                                        claude_rules, codex_rules, ctx, ok, reasons, statuses)
+from tests._ps import ps_permitted
 
 PY = sys.executable
 
@@ -374,6 +375,7 @@ class DefaultCancelRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(res.members_before, 1)
         self.assertIsNotNone(res.event_seconds)
 
+    @unittest.skipUnless(ps_permitted(), "ps is not permitted in this sandbox")
     def test_kills_grandchildren_and_skips_non_event_lines(self):
         res = default_cancel_runner([PY, "-c", GRANDCHILD], 30.0)
         self.assertTrue(res.event_seen, res)
