@@ -35,6 +35,7 @@ from ..runs.fsutil import FileLock, atomic_write_json, read_json
 from ..runs.store import iso
 from ..worktrees.git import GitError, git_out, run_git, toplevel
 from ..worktrees.manager import validate_root
+from ..worktrees.shared_skills import SharedSkillsError, init_shared_skills
 from .conflicts import diff_stats, out_of_scope_changes
 
 _HEX = set("0123456789abcdef")
@@ -72,6 +73,7 @@ def merge_check(repo, target, branch, scratch_root, force_fallback=False, config
     path = tempfile.mkdtemp(prefix="check-", dir=scratch_root)
     try:
         run_git(["worktree", "add", "--detach", path, target], repo)
+        init_shared_skills(path)  # SUB-5: raises SharedSkillsError with the check's reason
         proc = run_git(["merge", "--no-commit", "--no-ff", branch], path, check=False, config=config)
         conflicts = []
         if proc.returncode != 0:
@@ -287,10 +289,24 @@ class MergeQueue:
             return "stale", proc.stderr.strip()
         return "merged", None
 
+    def _shared_skills_failed(self, st, item, base, exc, dry_run):
+        """The shared skills submodule failed its check in a merge worktree
+        (SUB-5, SUB-6): the item stops with the check's reason."""
+        detail = f"{exc.reason}: {exc.detail}" if exc.detail else exc.reason
+        data = dict(base, status="shared_skills_failed", detail=detail)
+        self._finish(st, item, "shared_skills_failed", dry_run, data)
+        warnings = [] if dry_run else self._emit("attention.required", item["run_id"], item["unit_id"],
+                                                 {"reason": "shared_skills_failed", "detail": detail})
+        return envelope("merge_queue.process", ok=False, changed=not dry_run,
+                        checks=[check("shared_skills", False, detail)], warnings=warnings, data=data,
+                        required_user_actions=[{"kind": "fix_shared_skills", "run_id": item["run_id"],
+                                                "unit_id": item["unit_id"], "detail": detail}])
+
     def _finish(self, st, item, status, dry_run, data, warnings=(), keep=False):
         record = dict(item, status=status, processed_at=iso(self.clock()))
         record.pop("unit", None)
-        record.update({k: v for k, v in data.items() if k in ("merged_commit", "previous_commit", "conflicts", "detail")})
+        record.update({k: v for k, v in data.items()
+                       if k in ("merged_commit", "previous_commit", "conflicts", "detail", "shared_skills_commit")})
         if not dry_run:
             if not keep:
                 st["items"].pop(0)
@@ -320,7 +336,10 @@ class MergeQueue:
                                 warnings=warnings, data=data,
                                 required_user_actions=[{"kind": "reverify_and_reapprove", "run_id": run_id,
                                                         "unit_id": unit_id, "detail": detail}])
-            mc = merge_check(self.repo, target_oid, tip, self.scratch, self.force_fallback, self.config)
+            try:
+                mc = merge_check(self.repo, target_oid, tip, self.scratch, self.force_fallback, self.config)
+            except SharedSkillsError as exc:
+                return self._shared_skills_failed(st, item, base, exc, dry_run)
             if not mc["clean"]:
                 data = dict(base, status="conflict", conflicts=mc["conflicts"], merge_check=mc)
                 self._finish(st, item, "conflict", dry_run, data)
@@ -341,6 +360,12 @@ class MergeQueue:
             path = tempfile.mkdtemp(prefix=f"merge-{unit_id}-", dir=self.scratch)
             try:
                 run_git(["worktree", "add", "--detach", path, target_oid], self.repo)
+                try:
+                    shared_commit = init_shared_skills(path)  # SUB-5, before the gates run
+                except SharedSkillsError as exc:
+                    return self._shared_skills_failed(st, item, base, exc, False)
+                if shared_commit:
+                    base["shared_skills_commit"] = shared_commit
                 proc = run_git(["merge", "--no-edit", tip], path, check=False, config=self.config)
                 if proc.returncode != 0:
                     data = dict(base, status="conflict", conflicts=["<merge failed>"], detail=proc.stderr.strip())

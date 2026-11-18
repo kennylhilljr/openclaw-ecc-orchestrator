@@ -223,6 +223,45 @@ delete the marker. The envelope's `rollback_checkpoint` names the bundle and
 a restore command (a git fetch from the bundle into the branch). Every
 mutating call accepts `dry_run=True` and then only reports its plan.
 
+### Shared skills submodule
+
+A consumer repository may carry the skills catalog as a git submodule at
+`.agents/skills/shared` (skills-catalog SPEC SUB-5, SUB-10, SUB-15; DESIGN
+4.2 and 4.5). `git worktree add` does not initialize submodules, so
+`worktrees/shared_skills.py` does it in the harness, never in an agent:
+
+- `init_shared_skills(worktree)` runs right after `worktree add` in the
+  preflight worktree (`cli/preflight.py`), the merge check fallback and the
+  merge worktree (`merge_queue/queue.py`) and the verifier checkout
+  (`team/review.py`), before any runner or gate starts. It checks that the
+  `.gitmodules` URL is exactly `https://github.com/kennylhilljr/skills-catalog.git`,
+  then runs `git submodule update --init --depth 1 -- .agents/skills/shared`
+  with `protocol.allow=never`, `protocol.https.allow=always`,
+  `protocol.file.allow=never`, `protocol.ext.allow=never`,
+  `submodule.recurse=false` and the URL pinned on the command line. A failed
+  fetch is retried once with an empty credential helper and no extra auth
+  header.
+- `check_shared_skills(worktree)` then requires `catalog.json` in the
+  submodule and a `git submodule status` line with neither `-` nor `+`. It
+  fails with `submodule URL not allowed` or `shared skills missing` and
+  returns the pinned catalog commit. The commit is recorded as
+  `shared_skills_commit` in the preflight result, the merge queue history,
+  the unit's `merge` annotation and its `team` annotation.
+- After a unit's runner exits and before its handoff is accepted, the
+  conductor runs `git -C <wt>/.agents/skills/shared status --porcelain`
+  (`dirty_shared_skills`). Output, a moved submodule commit, or files in an
+  uninitialized submodule folder fail the unit with
+  `edit inside shared skills`: such an edit makes no diff in the parent and
+  would be lost.
+- `submodule` stays in `GIT_REFUSED_SUBCOMMANDS` (`gates/runner.py`), so an
+  agent's gate command cannot initialize or update it.
+
+Without an `.agents/skills/shared` entry in `.gitmodules` none of this runs.
+A failed check fails the step: preflight reports a `shared_skills` check,
+the merge queue item ends `shared_skills_failed` (the unit is blocked), and
+the verifier step stops the unit for the owner with `shared_skills_failed`.
+Unit worktrees created by `WorktreeManager.create` are not initialized yet.
+
 ## Runner supervision
 
 * argv lists only; each runner gets its own session and process group.

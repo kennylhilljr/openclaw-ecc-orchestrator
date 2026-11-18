@@ -20,6 +20,7 @@ from ..runs import repair as R
 from ..runs.conductor import HANDOFF_ENV, UNIT_ENV, fill_handoff_tokens
 from ..runs.envelope import check, envelope
 from ..worktrees.git import git_out, run_git
+from ..worktrees.shared_skills import SharedSkillsError, init_shared_skills
 from .commands import _with_handoff_dir, runner_prompt
 
 PROMPT_TOKEN = "{ECC_PROMPT}"
@@ -54,6 +55,13 @@ def preflight_runner(*, repo, target_branch, worktree_root, logs_dir, runner, ad
     base = git_out(["rev-parse", f"refs/heads/{target_branch}"], repo)
     run_git(["worktree", "add", "-q", "-b", branch, path, base], repo)
     try:
+        try:
+            result["shared_skills_commit"] = init_shared_skills(path)
+        except SharedSkillsError as exc:
+            checks.append(check("shared_skills", False, f"{exc.reason}: {exc.detail}"))
+            result["checks"] = checks
+            result["ok"] = False
+            return result
         prompt = runner_prompt(PREFLIGHT_UNIT)
         if argv_override is not None:
             argv = [prompt if a == PROMPT_TOKEN else a for a in argv_override]
