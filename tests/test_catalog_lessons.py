@@ -189,6 +189,70 @@ class OwnershipTests(unittest.TestCase):
         self.assertIn("L0001 [skill verify-change, unit U1]: y", prompt)
 
 
+class ReviewFixTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.root = os.path.join(self.tmp, "tree")
+        make_consumer(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_ledger_path_must_stay_in_the_tree_and_out_of_the_submodule(self):
+        self.assertEqual(CL.ledger_target(self.root, ".agents/LESSONS.md", [self.root]),
+                         os.path.join(self.root, ".agents/LESSONS.md"))
+        outside = os.path.join(self.tmp, "host.md")
+        os.symlink(outside, os.path.join(self.root, "linked.md"))
+        for bad in (outside, "../host.md", "a/../../host.md", SHARED_FILE, CL.SHARED_ROOT + "/LESSONS.md",
+                    LINK + "/LESSONS.md", "linked.md", ""):
+            self.assertIsNone(CL.ledger_target(self.root, bad, [self.root]), bad)
+        self.assertFalse(os.path.exists(outside))
+
+    def test_snapshot_covers_the_operator_checkout_too(self):
+        """An absolute link in the steward worktree can reach the operator checkout's submodule."""
+        other = os.path.join(self.tmp, "worktree")
+        os.makedirs(os.path.join(other, ".claude/skills"))
+        os.symlink(os.path.join(self.root, CL.SHARED_SKILLS, "verify-change"), os.path.join(other, LINK))
+        before = CL.shared_state([other, self.root])
+        with open(os.path.join(other, LINK, "SKILL.md"), "w") as fh:
+            fh.write("written through an absolute link\n")
+        self.assertEqual(CL.shared_snapshot(other), {})
+        self.assertNotEqual(CL.shared_state([other, self.root]), before)
+
+    def test_lessons_sharing_a_long_prefix_both_stay(self):
+        log = L.Lessons(os.path.join(self.tmp, "state"), "r1")
+        head = "x" * 1200
+        a = log.add(source="review", role="coder", unit="U1", what=head + " first ending")
+        b = log.add(source="review", role="coder", unit="U1", what=head + " second ending")
+        c = log.add(source="review", role="coder", unit="U1", what=head + "  first   ending")
+        self.assertTrue(a and b and a != b)
+        self.assertIsNone(c)  # the same text, spaced differently, is still one lesson
+
+    def test_unit_links_only_for_pushed_commits(self):
+        repo = os.path.join(self.tmp, "repo")
+        remote = os.path.join(self.tmp, "remote.git")
+        os.makedirs(repo)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "Test")
+        git(repo, "commit", "-q", "--allow-empty", "-m", "one")
+        sha = git(repo, "rev-parse", "HEAD").strip()
+        ref = CL.commit_ref(repo, "example/consumer", sha)
+        self.assertFalse(ref.startswith("https://"), ref)
+        self.assertIn(sha[:12], ref)
+        body = CL.issue_body("example/consumer", "M3", "verify-change",
+                             [{"id": "L0001", "unit": "U1", "skill": "verify-change", "lesson": "x"}],
+                             lambda u: ref)
+        self.assertIn("`U1` (commit " + sha[:12], body)
+        subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+        git(repo, "remote", "add", "origin", remote)
+        git(repo, "push", "-q", "origin", "main")
+        self.assertEqual(CL.commit_ref(repo, "example/consumer", sha),
+                         f"https://github.com/example/consumer/commit/{sha}")
+        self.assertIsNone(CL.commit_ref(repo, "example/consumer", None))
+
+
 class IssueTests(unittest.TestCase):
     ENTRIES = [
         {"id": "L0001", "skill": "verify-change", "unit": "U1", "lesson": "Run every acceptance command."},
@@ -374,7 +438,9 @@ class DriveFlowTests(DriveBase):
         self.assertIn("> Run the acceptance commands verbatim", issue["body"])
         self.assertIn("> Quote the failing output", issue["body"])
         self.assertNotIn("Project overlay rule", issue["body"])
-        self.assertIn("https://github.com/example/consumer/commit/", issue["body"])
+        # The merge commits are not pushed in this repository, so the units carry the commit id, not a link.
+        self.assertNotIn("https://github.com/example/consumer/commit/", issue["body"])
+        self.assertIn("not on a pushed branch when this issue was opened", issue["body"])
         self.assertIn("<!-- catalog-lesson: example/consumer M3 verify-change -->", issue["body"])
         # The ledger on main lists them under Proposed for the catalog; the overlay lesson went to the steward.
         ledger = git(self.repo, "show", "main:.agents/LESSONS.md")

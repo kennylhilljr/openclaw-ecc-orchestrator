@@ -274,7 +274,41 @@ def shared_snapshot(root):
     return out
 
 
+def shared_state(roots):
+    """`shared_snapshot` of every root: the steward's worktree and the operator's
+    checkout, since an absolute or chained link can reach either submodule."""
+    return {r: shared_snapshot(r) for r in dict.fromkeys(os.path.abspath(x) for x in roots or ())}
+
+
 # == the ledger section (SUB-11) ==
+def ledger_target(tree, rel, roots):
+    """The absolute path the harness may write the ledger at, or None. `rel`
+    must be a relative path inside `tree`, outside the submodule and the
+    shared links, with no symlink on the way (so the write cannot land on the
+    host or inside a shared skill)."""
+    raw = str(rel or "")
+    p = _norm(raw)
+    if not p or os.path.isabs(raw) or p == ".." or p.startswith("../") or "/../" in "/" + p + "/":
+        return None
+    if is_shared_path(p, protected(list(roots or ()) + [tree])):
+        return None
+    tree_real = os.path.realpath(tree)
+    cur = tree
+    for part in p.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return None
+    full = os.path.join(tree, p)
+    real = os.path.realpath(full)
+    if not (real == tree_real or real.startswith(tree_real + os.sep)):
+        return None
+    for r in list(roots or ()) + [tree]:
+        shared_real = os.path.realpath(os.path.join(r, SHARED_ROOT))
+        if real == shared_real or real.startswith(shared_real + os.sep):
+            return None
+    return full
+
+
 def ledger_line(entry, at=None):
     text = "\n  ".join(str(entry["lesson"]).splitlines() or [""])  # continuation lines stay in the list item
     run = f", run {entry['run']}" if entry.get("run") else ""
@@ -340,7 +374,10 @@ def issue_body(repo, milestone, skill, entries, unit_link=None):
              f"{milestone}. They are quoted verbatim. Each one names the unit it came from.", ""]
     for e in entries:
         link = (unit_link or (lambda u: None))(e.get("unit"))
-        unit = f"[{e.get('unit')}]({link})" if link else f"`{e.get('unit') or '-'}`"
+        if link and str(link).startswith("https://"):
+            unit = f"[{e.get('unit')}]({link})"
+        else:
+            unit = f"`{e.get('unit') or '-'}`" + (f" ({link})" if link else "")
         lines += [f"### {e['id']}, unit {unit}", ""] + [f"> {ln}" for ln in str(e["lesson"]).splitlines() or [""]] + [""]
     lines += ["Opened by the orchestrator's practices steward (skills-catalog SUB-12). It makes no edit inside "
               "the submodule; the change reaches consumers through the next bump PR.", "",
@@ -424,6 +461,29 @@ class GhIssues:
         out = self._gh(["issue", "create", "-R", self.repo, "--label", label, "--title", title,
                         "--body-file", "-"], stdin=body)
         return out.strip().splitlines()[-1] if out.strip() else ""
+
+
+def published(repo, commit):
+    """True when `commit` is on a remote-tracking branch of `repo`, so a link to
+    it resolves for someone reading the issue."""
+    try:
+        proc = subprocess.run(["git", "-C", repo, "for-each-ref", "--contains", commit, "--count", "1",
+                               "--format", "%(refname)", "refs/remotes"], capture_output=True, text=True,
+                              timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                               "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def commit_ref(repo, repo_name, commit):
+    """A unit's reference in an issue: the GitHub commit URL once the merge commit
+    is pushed, else its short id marked as not pushed yet (a link would 404)."""
+    if not commit:
+        return None
+    if "/" in str(repo_name or "") and published(repo, commit):
+        return f"https://github.com/{repo_name}/commit/{commit}"
+    return f"commit {str(commit)[:12]}, not on a pushed branch when this issue was opened"
 
 
 def repo_slug(repo, origin_url=None):

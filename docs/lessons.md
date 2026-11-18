@@ -30,7 +30,8 @@ the catalog as issues instead (`team/catalog_lessons.py`):
    `.agents/skills/**` keeps covering the project's own skills.
 2. **Applier guard.** The steward's change is rejected when it touches the
    submodule gitlink, a path under it or a shared link, or when any file in
-   the submodule folder of the steward's checkout changed (git does not show
+   the submodule folder of the steward's worktree or of the operator's
+   checkout changed (git does not show
    such writes in the parent's diff).
 3. **Ledger section.** A lesson whose `practice` resolves to a shared skill
    (a path under `.agents/skills/shared/skills/<name>/`, a shared
@@ -38,12 +39,16 @@ the catalog as issues instead (`team/catalog_lessons.py`):
    that is a shared skill name and the project has no folder of that name) is
    not given to the steward. The harness writes it under "Proposed for the
    catalog" in the ledger with the lesson id, date, unit, skill name and the
-   lesson text verbatim, and commits that on the practices branch. The
+   lesson text verbatim, and commits that on a branch of its own. The ledger
+   path must be a relative path inside the worktree with no symlink on the
+   way and outside the shared skills, else nothing is written. The
    steward prompt names the section and forbids editing shared skills.
 4. **Lesson issues.** At milestone end the entries are grouped by skill, and
    one issue per skill is opened on the catalog with the label `lesson`, the
    title `lesson: <skill>: <n> lessons from <repo> <milestone>`, the lessons
-   quoted verbatim, a link to each unit's merge commit, and the marker
+   quoted verbatim (up to 4000 characters each), a link to each unit's merge
+   commit once that commit is on a pushed branch (until then its short id,
+   marked as not pushed), and the marker
    `<!-- catalog-lesson: <repo> <milestone> <skill> -->`. Before opening, the
    catalog's `lesson` issues (open and closed) are searched for the marker,
    and the drive state records what it opened, so a rerun opens nothing new.

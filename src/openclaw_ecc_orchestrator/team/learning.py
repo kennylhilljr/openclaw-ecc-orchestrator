@@ -108,8 +108,10 @@ class Lessons:
         if not what:
             return None
         existing = self.all()
-        key = (role, unit, what)
-        if any((x.get("role"), x.get("unit"), x.get("what")) == key for x in existing):
+        # Compared on the whole text, so two lessons sharing their first 1000 characters both stay.
+        key = (role, unit, " ".join(raw.split()))
+        if any((x.get("role"), x.get("unit"), " ".join(str(x.get("text") or x.get("what") or "").split())) == key
+               for x in existing):
             return None  # the same lesson from the same persona on the same unit is recorded once
         entry = {"id": "L%04d" % (len(existing) + 1), "source": source, "role": role, "unit": unit,
                  "severity": severity, "where": where, "practice": practice, "provider": provider,
@@ -260,7 +262,7 @@ class Steward:
         run_git(["worktree", "add", "-q", "-b", branch, path, tip], repo)
         try:
             ownership = self._ownership(roles, path)
-            before = CL.shared_snapshot(path)
+            before = CL.shared_state([path, repo])
             prompt = P.steward_prompt(rest, ownership, self.cfg["ledger"], ", ".join(self.cfg["spec_paths"]),
                                       catalog=catalog)
             self.d.progress(f"practices {n}: steward ({choice['runner']}) on {len(rest)} lesson(s)")
@@ -272,7 +274,7 @@ class Steward:
                           proposed=report.get("proposed"), skipped=report.get("skipped"))
             if turn.get("error"):
                 return self._record(dict(record, status=f"steward error: {turn['error']}"))
-            if CL.shared_snapshot(path) != before:
+            if CL.shared_state([path, repo]) != before:
                 return self._record(dict(record, status="rejected: wrote inside the shared skills",
                                          files=[CL.SHARED_ROOT]))
             if head == tip:
@@ -319,8 +321,11 @@ class Steward:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         run_git(["worktree", "add", "-q", "-b", branch, path, tip], repo)
         try:
-            added = CL.write_ledger(os.path.join(path, self.cfg["ledger"]), entries, iso(self.d.clock())[:10])
-            if added:
+            target = CL.ledger_target(path, self.cfg["ledger"], [repo])
+            added = CL.write_ledger(target, entries, iso(self.d.clock())[:10]) if target else []
+            if not target:
+                record["status"] = "refused: the ledger path is outside the worktree or in the shared skills"
+            elif added:
                 run_git(["add", "--", self.cfg["ledger"]], path)
                 run_git(["commit", "-q", "-m", f"Practices: proposed for the catalog ({', '.join(added)})"], path)
                 record = self._merge(record, branch, git_out(["rev-parse", "HEAD"], path))
@@ -363,9 +368,7 @@ class Steward:
 
         def link(uid):
             commit = (((units.get(uid) or {}).get("annotations") or {}).get("merge") or {}).get("merged_commit")
-            if commit and "/" in repo_name:
-                return f"https://github.com/{repo_name}/commit/{commit}"
-            return None
+            return CL.commit_ref(self.d.c.worktrees.repo, repo_name, commit)
         return link
 
     def file_catalog_lessons(self):
