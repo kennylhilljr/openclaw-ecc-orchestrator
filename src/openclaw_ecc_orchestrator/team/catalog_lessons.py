@@ -62,11 +62,14 @@ def shared_links(roots):
                 continue
             try:
                 dest = os.readlink(full)
+                real = os.path.realpath(full)
             except OSError:
                 continue
-            if os.path.isabs(dest):
-                continue
-            if _inside(_norm(os.path.join(LINK_DIR, dest)), SHARED_ROOT):
+            shared_real = os.path.realpath(os.path.join(root, SHARED_ROOT))
+            # Relative links by their text (they may dangle without the submodule), and any
+            # link (absolute or chained) by where it resolves.
+            if (not os.path.isabs(dest) and _inside(_norm(os.path.join(LINK_DIR, dest)), SHARED_ROOT)) or \
+                    real == shared_real or real.startswith(shared_real + os.sep):
                 out[name] = f"{LINK_DIR}/{name}"
     return out
 
@@ -125,13 +128,14 @@ def shared_skill(practice, roots):
     return name
 
 
-def catalog_entries(lessons, roots):
-    """Ledger entries for the lessons that belong to the catalog, in lesson order."""
+def catalog_entries(lessons, roots, run=None):
+    """Ledger entries for the lessons that belong to the catalog, in lesson order.
+    `run` is the drive's run id: lesson ids restart in every run."""
     out = []
     for x in lessons or []:
         skill = shared_skill(x.get("practice"), roots)
         if skill:
-            out.append({"id": x.get("id"), "skill": skill, "lesson": x.get("text") or x.get("what"),
+            out.append({"id": x.get("id"), "run": run, "skill": skill, "lesson": x.get("text") or x.get("what"),
                         "unit": x.get("unit")})
     return out
 
@@ -261,6 +265,10 @@ def shared_snapshot(root):
                                   text=True, timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                                                               "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
             out[" git status"] = proc.stdout if proc.returncode == 0 else f"status failed {proc.returncode}"
+            head = subprocess.run(["git", "-C", top, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                                   "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+            out[" git head"] = head.stdout.strip() if head.returncode == 0 else f"head failed {head.returncode}"
         except (OSError, subprocess.SubprocessError):
             out[" git status"] = "status failed"
     return out
@@ -269,7 +277,8 @@ def shared_snapshot(root):
 # == the ledger section (SUB-11) ==
 def ledger_line(entry, at=None):
     text = "\n  ".join(str(entry["lesson"]).splitlines() or [""])  # continuation lines stay in the list item
-    return (f"- {entry['id']}{' ' + at if at else ''}, unit {entry.get('unit') or '-'}, skill "
+    run = f", run {entry['run']}" if entry.get("run") else ""
+    return (f"- {entry['id']}{' ' + at if at else ''}{run}, unit {entry.get('unit') or '-'}, skill "
             f"`{entry['skill']}`: {text}")
 
 
@@ -297,8 +306,12 @@ def write_ledger(path, entries, at=None):
             end = n
             break
     section = lines[start + 1:end]
-    listed = {m.group(1) for ln in section for m in [re.match(r"^- (L\d+)\b", ln)] if m}
-    new = [e for e in entries if e.get("id") not in listed]
+    listed = set()
+    for ln in section:
+        m = re.match(r"^- (L\d+)\b(?:[^,]*)(?:, run ([^,]+))?", ln)
+        if m:
+            listed.add((m.group(1), m.group(2)))
+    new = [e for e in entries if (e.get("id"), e.get("run")) not in listed]
     if not new:
         return []
     while section and not section[-1].strip():

@@ -154,6 +154,32 @@ class OwnershipTests(unittest.TestCase):
         body = CL.issue_body("o/r", "M3", "verify-change", entries)
         self.assertIn("> Run the commands verbatim:\n>   - first  `make test`\n>   - then `make lint`", body)
 
+    def test_ledger_keeps_same_ids_from_different_runs(self):
+        """Lesson ids restart in each run, so the ledger keys entries by id and run."""
+        ledger = os.path.join(self.root, "LESSONS.md")
+        a = {"id": "L0001", "run": "r1", "skill": "verify-change", "unit": "U1", "lesson": "first"}
+        b = {"id": "L0001", "run": "r2", "skill": "cross-review", "unit": "U9", "lesson": "second"}
+        self.assertEqual(CL.write_ledger(ledger, [a]), ["L0001"])
+        self.assertEqual(CL.write_ledger(ledger, [b]), ["L0001"])
+        self.assertEqual(CL.write_ledger(ledger, [a, b]), [])
+        with open(ledger) as fh:
+            text = fh.read()
+        self.assertIn("run r1, unit U1, skill `verify-change`: first", text)
+        self.assertIn("run r2, unit U9, skill `cross-review`: second", text)
+
+    def test_absolute_links_and_submodule_commits_are_seen(self):
+        os.symlink(os.path.join(self.root, CL.SHARED_SKILLS, "cross-review"),
+                   os.path.join(self.root, ".claude/skills/cross-review"))
+        self.assertIn("cross-review", CL.shared_links([self.root]))
+        self.assertIn(".claude/skills/cross-review", CL.refused_paths([".claude/skills/cross-review"], [self.root]))
+        sub = os.path.join(self.root, CL.SHARED_ROOT)
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"), ("config", "user.name", "T"),
+                     ("add", "-A"), ("commit", "-qm", "one", "--allow-empty")):
+            git(sub, *args)
+        before = CL.shared_snapshot(self.root)
+        git(sub, "commit", "--allow-empty", "-qm", "same tree")
+        self.assertNotEqual(CL.shared_snapshot(self.root), before)
+
     def test_steward_prompt_names_the_section(self):
         prompt = P.steward_prompt([{"id": "L0004", "role": "coder", "what": "x"}], {"coder": ["AGENTS.md"]},
                                   ".agents/LESSONS.md", "docs/spec/**",

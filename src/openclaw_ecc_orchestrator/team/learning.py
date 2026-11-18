@@ -238,7 +238,7 @@ class Steward:
         # Lessons about shared skills go to the catalog, not to the steward (SUB-11). The
         # harness writes them to the ledger on a branch of their own first, so a rejected
         # steward change cannot drop them.
-        catalog = CL.catalog_entries(lessons, [repo])
+        catalog = CL.catalog_entries(lessons, [repo], self.d.run_id)
         if catalog:
             known = {e["id"] for e in self.state["catalog"]["entries"]}
             self.state["catalog"]["entries"] += [e for e in catalog if e["id"] not in known]
