@@ -152,7 +152,7 @@ def parse_verdict(text, mark, head):
         return None, f"verdict names head {doc.get('head')!r}, not the verified head"
     findings = [f for f in (doc.get("findings") or []) if isinstance(f, dict)]
     doc["findings"] = findings
-    doc["lessons"] = [{"practice": str(x.get("practice") or "")[:200], "lesson": str(x["lesson"])[:1000]}
+    doc["lessons"] = [{"practice": str(x.get("practice") or "")[:200], "lesson": str(x["lesson"])[:4000]}
                       for x in (doc.get("lessons") or []) if isinstance(x, dict) and x.get("lesson")][:10]
     if mark == REVIEW_MARK and doc["verdict"] == "approved" and any(f.get("severity") == "blocker"
                                                                      for f in findings):

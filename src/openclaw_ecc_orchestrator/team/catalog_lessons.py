@@ -131,7 +131,8 @@ def catalog_entries(lessons, roots):
     for x in lessons or []:
         skill = shared_skill(x.get("practice"), roots)
         if skill:
-            out.append({"id": x.get("id"), "skill": skill, "lesson": x.get("what"), "unit": x.get("unit")})
+            out.append({"id": x.get("id"), "skill": skill, "lesson": x.get("text") or x.get("what"),
+                        "unit": x.get("unit")})
     return out
 
 
@@ -189,6 +190,15 @@ def _not(ch):
     return "[!" + ch + "]"  # target paths hold only letters, digits, ".", "-", "_" and "/"
 
 
+def _safe(glob, targets):
+    """True when neither `glob` nor the folder form the applier also accepts
+    (`learning.Steward._matches`: the glob without trailing "/" and "*", plus
+    "/*") can match a target."""
+    wide = glob.rstrip("/*").rstrip("/")
+    forms = [glob] + ([wide + "/*"] if wide else ["*"])
+    return all(_exclude(f, t) == [f] for f in forms for t in targets)
+
+
 def exclude_shared(globs, targets):
     out = []
     for g in globs or []:
@@ -196,7 +206,7 @@ def exclude_shared(globs, targets):
         for t in targets:
             parts = [x for p in parts for x in _exclude(p, t)]
         for p in parts:
-            if p not in out:
+            if p not in out and _safe(p, targets):
                 out.append(p)
     return out
 
@@ -215,32 +225,52 @@ def refused_paths(changed, roots):
 
 
 def shared_snapshot(root):
-    """{relative path: sha256} of the files under the submodule folder, so a
-    write the parent repository cannot see (DESIGN 4.5) is still caught."""
+    """{relative path: fingerprint} of everything under the submodule folder
+    (content, mode, link targets, empty folders), so a write the parent
+    repository cannot see (DESIGN 4.5) is still caught. An initialized
+    submodule's own `git status --porcelain` is included too."""
     out = {}
     top = os.path.join(root, SHARED_ROOT)
     for dirpath, dirnames, filenames in os.walk(top):
-        dirnames[:] = [d for d in dirnames if d != ".git"]
-        for name in filenames:
-            if name == ".git":
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        try:
+            out[rel + "/"] = "dir:%o" % os.lstat(dirpath).st_mode
+        except OSError:
+            out[rel + "/"] = "unreadable"
+        for name in list(dirnames) + filenames:
+            if name == ".git" and dirpath == top:
                 continue
             full = os.path.join(dirpath, name)
+            key = os.path.relpath(full, root).replace(os.sep, "/")
             try:
+                st = os.lstat(full)
                 if os.path.islink(full):
-                    digest = "link:" + os.readlink(full)
+                    out[key] = "link:" + os.readlink(full)
+                elif os.path.isdir(full):
+                    continue  # walked on its own
                 else:
                     with open(full, "rb") as fh:
-                        digest = hashlib.sha256(fh.read()).hexdigest()
+                        out[key] = "%o:%s" % (st.st_mode, hashlib.sha256(fh.read()).hexdigest())
             except OSError:
-                digest = "unreadable"
-            out[os.path.relpath(full, root).replace(os.sep, "/")] = digest
+                out[key] = "unreadable"
+    if os.path.exists(os.path.join(top, ".git")):
+        try:
+            proc = subprocess.run(["git", "-C", top, "status", "--porcelain", "--ignored"], capture_output=True,
+                                  text=True, timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                                              "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+            out[" git status"] = proc.stdout if proc.returncode == 0 else f"status failed {proc.returncode}"
+        except (OSError, subprocess.SubprocessError):
+            out[" git status"] = "status failed"
     return out
 
 
 # == the ledger section (SUB-11) ==
 def ledger_line(entry, at=None):
+    text = "\n  ".join(str(entry["lesson"]).splitlines() or [""])  # continuation lines stay in the list item
     return (f"- {entry['id']}{' ' + at if at else ''}, unit {entry.get('unit') or '-'}, skill "
-            f"`{entry['skill']}`: {entry['lesson']}")
+            f"`{entry['skill']}`: {text}")
 
 
 def write_ledger(path, entries, at=None):
@@ -289,7 +319,7 @@ def marker(repo, milestone, skill):
 
 
 def issue_title(repo, milestone, skill, n):
-    return f"lesson: {skill}: {n} lesson{'' if n == 1 else 's'} from {repo} {milestone}"
+    return f"lesson: {skill}: {n} lessons from {repo} {milestone}"  # the SUB-12 template, also for n == 1
 
 
 def issue_body(repo, milestone, skill, entries, unit_link=None):

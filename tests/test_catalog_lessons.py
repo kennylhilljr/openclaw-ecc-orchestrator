@@ -69,6 +69,7 @@ class OwnershipTests(unittest.TestCase):
         configs = [L.settings({})["ownership"],
                    L.settings({"learning": {"ownership": {
                        "coder": [".agents/skills/**"], "gates": [".agents/**", ".claude/**"],
+                       "verifier": [".agents/skills/*/**", ".agents/**/SKILL.md", ".claude/*/**", ".*/**"],
                        "architect": ["**"], "designer": [".agents/skills/s*/**", ".agents/skills/?hared/**",
                                                          ".agents/skills/shared", ".claude/skills/verify-change"],
                    }}})["ownership"]]
@@ -96,7 +97,18 @@ class OwnershipTests(unittest.TestCase):
         before = CL.shared_snapshot(self.root)
         with open(os.path.join(self.root, SHARED_FILE), "w") as fh:
             fh.write("edited\n")
-        self.assertNotEqual(CL.shared_snapshot(self.root), before)
+        after_write = CL.shared_snapshot(self.root)
+        self.assertNotEqual(after_write, before)
+        os.chmod(os.path.join(self.root, SHARED_FILE), 0o755)  # a mode flip git would see
+        after_mode = CL.shared_snapshot(self.root)
+        self.assertNotEqual(after_mode, after_write)
+        alias = os.path.join(self.root, CL.SHARED_SKILLS, "alias")
+        os.symlink("verify-change", alias)
+        after_link = CL.shared_snapshot(self.root)
+        self.assertNotEqual(after_link, after_mode)
+        os.remove(alias)
+        os.symlink("cross-review", alias)  # a folder link retargeted
+        self.assertNotEqual(CL.shared_snapshot(self.root), after_link)
 
     def test_shared_lessons_land_in_the_catalog_section(self):
         """SUB-11: shared skill practices resolve; overlay skills and other files do not."""
@@ -126,6 +138,22 @@ class OwnershipTests(unittest.TestCase):
         self.assertNotIn("Project rule.", text)
         self.assertIn("- L0008 x", text.split("## Proposed for the catalog")[0])
 
+    def test_lesson_text_stays_verbatim(self):
+        """SUB-12: the text as the persona wrote it reaches the entry, with its line breaks and spacing."""
+        log = L.Lessons(self.root, "r1")
+        text = "Run the commands verbatim:\n  - first  `make test`\n  - then `make lint`"
+        log.add(source="lesson", role="verifier", unit="U1", practice=SHARED_FILE, what=text)
+        log.add(source="lesson", role="verifier", unit="U2", practice=SHARED_FILE, what="One line.")
+        entries = CL.catalog_entries(log.all(), [self.root])
+        self.assertEqual([e["lesson"] for e in entries], [text, "One line."])
+        self.assertEqual(log.all()[0]["what"], "Run the commands verbatim: - first `make test` - then `make lint`")
+        ledger = os.path.join(self.root, "LESSONS.md")
+        CL.write_ledger(ledger, entries)
+        with open(ledger) as fh:
+            self.assertIn("`verify-change`: Run the commands verbatim:\n    - first  `make test`\n", fh.read())
+        body = CL.issue_body("o/r", "M3", "verify-change", entries)
+        self.assertIn("> Run the commands verbatim:\n>   - first  `make test`\n>   - then `make lint`", body)
+
     def test_steward_prompt_names_the_section(self):
         prompt = P.steward_prompt([{"id": "L0004", "role": "coder", "what": "x"}], {"coder": ["AGENTS.md"]},
                                   ".agents/LESSONS.md", "docs/spec/**",
@@ -153,7 +181,7 @@ class IssueTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in res], ["opened", "opened"])
         self.assertEqual([o["title"] for o in fake.opened],
                          ["lesson: verify-change: 2 lessons from example/consumer M3",
-                          "lesson: cross-review: 1 lesson from example/consumer M3"])
+                          "lesson: cross-review: 1 lessons from example/consumer M3"])
         self.assertEqual({o["label"] for o in fake.opened}, {"lesson"})
         body = fake.opened[0]["body"]
         self.assertIn("> Run every acceptance command.", body)
@@ -357,6 +385,25 @@ class DriveFlowTests(DriveBase):
         self.assertTrue(runs and all(r["status"] == "rejected: outside the practice files" and LINK in r["files"]
                             for r in runs), runs)
         self.assertEqual(os.readlink(os.path.join(self.repo, LINK)), "../../.agents/skills/shared/skills/verify-change")
+
+    def test_issue_waits_until_the_ledger_line_is_on_the_target(self):
+        """SUB-11 before SUB-12: no issue while the ledger merge fails; the next milestone end retries both."""
+        d = self.drive()
+        real = d.steward._merge
+        d.steward._merge = lambda record, branch, head: (
+            dict(record, status="gates failed") if str(record["n"]).startswith("catalog") else
+            real(record, branch, head))
+        res = d.go()
+        self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
+        self.assertEqual(self.fake.opened, [])
+        self.assertNotIn("Proposed for the catalog", git(self.repo, "show", "main:.agents/LESSONS.md")
+                         if "LESSONS.md" in git(self.repo, "ls-tree", "-r", "--name-only", "main") else "")
+        d.steward._merge = real
+        self.assertTrue(d.steward.due(final=True))
+        d.steward.run(final=True)
+        self.assertIn("Proposed for the catalog", git(self.repo, "show", "main:.agents/LESSONS.md"))
+        self.assertEqual(len(self.fake.opened), 1)
+        self.assertFalse(d.steward.due(final=True))
 
     def test_milestone_without_catalog_lessons_opens_nothing(self):
         self.LESSONS = [self.LESSONS[2]]

@@ -84,6 +84,9 @@ def settings(team_cfg):
     return cfg
 
 
+MAX_LESSON_CHARS = 4000
+
+
 class Lessons:
     """Append-only lessons log for one run: <state>/lessons/<run>.jsonl."""
 
@@ -100,7 +103,8 @@ class Lessons:
 
     def add(self, *, source, role, what, unit=None, severity=None, where=None, practice=None, provider=None,
             at=None):
-        what = " ".join(str(what or "").split())[:1000]
+        raw = str(what or "").strip()[:MAX_LESSON_CHARS]
+        what = " ".join(raw.split())[:1000]
         if not what:
             return None
         existing = self.all()
@@ -109,7 +113,9 @@ class Lessons:
             return None  # the same lesson from the same persona on the same unit is recorded once
         entry = {"id": "L%04d" % (len(existing) + 1), "source": source, "role": role, "unit": unit,
                  "severity": severity, "where": where, "practice": practice, "provider": provider,
-                 "what": what, "at": at}
+                 "what": what, "at": at,
+                 # The text as the persona wrote it, kept when `what` normalized it (catalog issues quote it).
+                 "text": raw if raw != what else None}
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({k: v for k, v in entry.items() if v is not None}) + "\n")
@@ -172,7 +178,7 @@ class Steward:
             return False
         new = self.pending()
         if final:
-            return bool(new) or bool(self._unfiled())
+            return bool(new) or bool(self._unfiled()) or bool(self._unledgered())
         merged = sum(1 for u in self.d.run()["units"].values() if u["state"] == "merged")
         return (merged - int(self.state.get("merged_at_last", 0)) >= int(self.cfg["after_merged_units"])
                 and len(new) >= int(self.cfg["min_new_lessons"]))
@@ -216,6 +222,8 @@ class Steward:
     def run(self, final=False):
         lessons = self.pending()
         record = self._pass(lessons, final) if lessons else None
+        if self._unledgered():
+            self._catalog_ledger()  # retries a ledger merge that failed earlier
         if final:
             self.file_catalog_lessons()
         return record
@@ -227,16 +235,22 @@ class Steward:
         self.state["seen"] = int(self.state.get("seen", 0)) + len(lessons)
         self.state["merged_at_last"] = sum(1 for u in self.d.run()["units"].values() if u["state"] == "merged")
         record = {"n": n, "at": iso(self.d.clock()), "lessons": [x["id"] for x in lessons], "final": final}
-        # Lessons about shared skills go to the catalog, not to the steward (SUB-11).
+        # Lessons about shared skills go to the catalog, not to the steward (SUB-11). The
+        # harness writes them to the ledger on a branch of their own first, so a rejected
+        # steward change cannot drop them.
         catalog = CL.catalog_entries(lessons, [repo])
         if catalog:
             known = {e["id"] for e in self.state["catalog"]["entries"]}
             self.state["catalog"]["entries"] += [e for e in catalog if e["id"] not in known]
             record["catalog"] = [e["id"] for e in catalog]
+            self.d._save()
+            record["catalog_ledger"] = self._catalog_ledger().get("status")
         rest = [x for x in lessons if x["id"] not in {e["id"] for e in catalog}]
+        if not rest:
+            return self._record(dict(record, status="catalog only"))
         role = self.cfg["steward_role"]
-        choice = self._choice(role) if rest else None
-        if rest and choice is None and not catalog:
+        choice = self._choice(role)
+        if choice is None:
             return self._record(dict(record, status="skipped: no coding runner for the steward"))
         roles = sorted({x.get("role") for x in rest if x.get("role")})
         tip = git_out(["rev-parse", f"refs/heads/{target}"], repo)
@@ -245,60 +259,82 @@ class Steward:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         run_git(["worktree", "add", "-q", "-b", branch, path, tip], repo)
         try:
-            if catalog:
-                added = CL.write_ledger(os.path.join(path, self.cfg["ledger"]), catalog, iso(self.d.clock())[:10])
-                if added:
-                    run_git(["add", "--", self.cfg["ledger"]], path)
-                    run_git(["commit", "-q", "-m", f"Practices: proposed for the catalog ({', '.join(added)})"],
-                            path)
-            base = git_out(["rev-parse", "HEAD"], path)
-            if rest and choice is None:
-                record["skipped_steward"] = "no coding runner for the steward"
-            if rest and choice is not None:
-                ownership = self._ownership(roles, path)
-                before = CL.shared_snapshot(path)
-                prompt = P.steward_prompt(rest, ownership, self.cfg["ledger"], ", ".join(self.cfg["spec_paths"]),
-                                          catalog=catalog)
-                self.d.progress(f"practices {n}: steward ({choice['runner']}) on {len(rest)} lesson(s)")
-                turn = self.d.step._turn("steward", choice, prompt, path, True, self.d.run_id, f"_practices-{n}",
-                                         float(self.cfg["timeout_minutes"]) * 60)
-                head = git_out(["rev-parse", "HEAD"], path)
-                report = _steward_line(turn.get("text"))
-                record.update(steward=choice["runner"], branch=branch, head=head, applied=report.get("applied"),
-                              proposed=report.get("proposed"), skipped=report.get("skipped"))
-                if turn.get("error"):
-                    return self._record(dict(record, status=f"steward error: {turn['error']}"))
-                if CL.shared_snapshot(path) != before:
-                    return self._record(dict(record, status="rejected: wrote inside the shared skills",
-                                             files=[CL.SHARED_ROOT]))
+            ownership = self._ownership(roles, path)
+            before = CL.shared_snapshot(path)
+            prompt = P.steward_prompt(rest, ownership, self.cfg["ledger"], ", ".join(self.cfg["spec_paths"]),
+                                      catalog=catalog)
+            self.d.progress(f"practices {n}: steward ({choice['runner']}) on {len(rest)} lesson(s)")
+            turn = self.d.step._turn("steward", choice, prompt, path, True, self.d.run_id, f"_practices-{n}",
+                                     float(self.cfg["timeout_minutes"]) * 60)
             head = git_out(["rev-parse", "HEAD"], path)
-            record.update(branch=branch, head=head)
+            report = _steward_line(turn.get("text"))
+            record.update(steward=choice["runner"], branch=branch, head=head, applied=report.get("applied"),
+                          proposed=report.get("proposed"), skipped=report.get("skipped"))
+            if turn.get("error"):
+                return self._record(dict(record, status=f"steward error: {turn['error']}"))
+            if CL.shared_snapshot(path) != before:
+                return self._record(dict(record, status="rejected: wrote inside the shared skills",
+                                         files=[CL.SHARED_ROOT]))
             if head == tip:
                 return self._record(dict(record, status="no change"))
-            changed = [f for f in git_out(["diff", "--name-only", base, head], path).splitlines() if f]
+            changed = [f for f in git_out(["diff", "--name-only", tip, head], path).splitlines() if f]
             shared = CL.refused_paths(changed, [path, repo])
             outside = [f for f in changed if f not in shared and not self._matches(f, self._allowed(roles, path))]
             spec = [f for f in changed if self._matches(f, self.cfg["spec_paths"])]
             if shared or outside or spec:
                 return self._record(dict(record, status="rejected: outside the practice files",
                                          files=shared + outside + spec))
-            if head != base:
-                stat, diff = E.diff_text(path, tip, head)
-                pack = f"## Files\n\n```\n{stat}\n```\n\n## Diff\n\n```diff\n{diff}\n```"
-                reviewers = sorted({REVIEWER_FOR.get(r, "pr_reviewer") for r in roles}) or ["pr_reviewer"]
-                verdicts = []
-                for rv in reviewers:
-                    cited = [x for x in rest if REVIEWER_FOR.get(x.get("role"), "pr_reviewer") == rv]
-                    res = self._review(rv, cited, pack, head, path, choice["runner"])
-                    verdicts.append({k: res.get(k) for k in ("role", "provider", "verdict", "findings",
-                                                             "independence")})
-                    if res.get("verdict") != "approved":
-                        return self._record(dict(record, status=f"not approved by {rv}", reviews=verdicts))
-                record["reviews"] = verdicts
-            # Only the harness's own ledger lines changed: nothing for a persona to review.
+            stat, diff = E.diff_text(path, tip, head)
+            pack = f"## Files\n\n```\n{stat}\n```\n\n## Diff\n\n```diff\n{diff}\n```"
+            reviewers = sorted({REVIEWER_FOR.get(r, "pr_reviewer") for r in roles}) or ["pr_reviewer"]
+            verdicts = []
+            for rv in reviewers:
+                cited = [x for x in rest if REVIEWER_FOR.get(x.get("role"), "pr_reviewer") == rv]
+                res = self._review(rv, cited, pack, head, path, choice["runner"])
+                verdicts.append({k: res.get(k) for k in ("role", "provider", "verdict", "findings", "independence")})
+                if res.get("verdict") != "approved":
+                    return self._record(dict(record, status=f"not approved by {rv}", reviews=verdicts))
+            record["reviews"] = verdicts
             return self._record(self._merge(record, branch, head))
         finally:
             run_git(["worktree", "remove", "--force", path], repo, check=False)
+
+    def _unledgered(self):
+        return [e for e in (self.state.get("catalog") or {}).get("entries") or [] if not e.get("ledger")]
+
+    def _catalog_ledger(self):
+        """Write the catalog entries not yet on the target under "Proposed for the
+        catalog" in the ledger, commit, run the gates and fast-forward the target.
+        Entries are marked once their line is on the target (SUB-11)."""
+        entries = self._unledgered()
+        if not entries:
+            return {"status": "nothing to write"}
+        repo = self.d.c.worktrees.repo
+        cat = self.state["catalog"]
+        k = len(cat.setdefault("ledger_runs", [])) + 1
+        record = {"n": f"catalog-{k}", "at": iso(self.d.clock()), "lessons": [e["id"] for e in entries]}
+        tip = git_out(["rev-parse", f"refs/heads/{self.d.c.target}"], repo)
+        branch = f"ecc/{self.d.run_id}/catalog-ledger-{k}"
+        path = os.path.join(self.d.step.worktree_root, "_practices", f"{self.d.run_id}-catalog-{k}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        run_git(["worktree", "add", "-q", "-b", branch, path, tip], repo)
+        try:
+            added = CL.write_ledger(os.path.join(path, self.cfg["ledger"]), entries, iso(self.d.clock())[:10])
+            if added:
+                run_git(["add", "--", self.cfg["ledger"]], path)
+                run_git(["commit", "-q", "-m", f"Practices: proposed for the catalog ({', '.join(added)})"], path)
+                record = self._merge(record, branch, git_out(["rev-parse", "HEAD"], path))
+            else:
+                record["status"] = "already in the ledger"
+        finally:
+            run_git(["worktree", "remove", "--force", path], repo, check=False)
+        if record.get("status") in ("merged", "already in the ledger"):
+            for e in entries:
+                e["ledger"] = True
+        cat["ledger_runs"].append(record)
+        self.d._save()
+        self.d.progress(f"practices: catalog ledger {record['status']} ({', '.join(record['lessons'])})")
+        return record
 
     # == lesson issues on the catalog (SUB-12) ==
     def _unfiled(self):
@@ -307,7 +343,10 @@ class Steward:
         cat = self.state.get("catalog") or {}
         repo_name, milestone = self._names()
         filed = cat.get("filed") or {}
-        return [e for e in cat.get("entries") or [] if CL.marker(repo_name, milestone, e["skill"]) not in filed]
+        # Only skills whose every entry is on the target in the ledger; the rest wait for a retry.
+        waiting = {e["skill"] for e in cat.get("entries") or [] if not e.get("ledger")}
+        return [e for e in cat.get("entries") or [] if e["skill"] not in waiting
+                and CL.marker(repo_name, milestone, e["skill"]) not in filed]
 
     def _names(self):
         repo_name = self.state.setdefault("catalog", {}).get("repo")
