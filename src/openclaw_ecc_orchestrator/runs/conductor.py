@@ -55,6 +55,7 @@ from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.cli_adapters import git_write_dir
 from ..runners.registry import model_family
 from ..worktrees.git import git_out, rev_exists, run_git
+from ..worktrees.shared_skills import dirty_shared_skills
 from . import repair as R
 from . import state as S
 from .envelope import SCHEMA_VERSION, check, envelope
@@ -1032,6 +1033,18 @@ class Conductor:
                                   [check("runner_succeeded", False, reason)],
                                   failure=(reason, R.failure_evidence(reason, log_text=log_text)),
                                   outcome=(reason, cost))
+        workspace = unit.get("workspace") or {}
+        dirty = None
+        if workspace.get("path"):
+            reference = run_git(["merge-base", "HEAD", f"refs/heads/{self.target}"], workspace["path"],
+                                check=False).stdout.strip() or workspace.get("base_commit")
+            dirty = dirty_shared_skills(workspace["path"], reference)
+        if dirty:  # SUB-10: an edit inside the submodule is lost silently, so it fails the unit
+            reason, detail = dirty
+            data["shared_skills_dirty"] = detail
+            return self._end_unit(run_id, unit_id, S.FAILED, reason, data, [check("shared_skills_clean", False, detail)],
+                                  failure=(reason, R.failure_evidence(reason, files=[detail])),
+                                  outcome=(reason, cost))
         return self._accept_handoff(run_id, unit_id, doc, missing, cost, data)
 
     def _end_unit(self, run_id, unit_id, target, reason, data, checks, failure=None, outcome=None):
@@ -1326,11 +1339,13 @@ class Conductor:
         if status in (None, "empty", "would_merge"):
             return res
         run_id, unit_id = data["run_id"], data["unit_id"]
-        summary = {k: data.get(k) for k in ("status", "merged_commit", "previous_commit", "conflicts", "detail")}
+        summary = {k: data.get(k) for k in ("status", "merged_commit", "previous_commit", "conflicts", "detail",
+                                            "shared_skills_commit")}
         self.manager.annotate_unit(run_id, self.id, unit_id, "merge", copy.deepcopy(summary))
         if status == "merged" and data.get("previous_commit") and data.get("merged_commit"):
             self._note_own_ref_move(f"refs/heads/{self.target}", data["previous_commit"], data["merged_commit"])
-        target = {"merged": S.MERGED, "conflict": S.BLOCKED, "stale": S.BLOCKED, "gate_failed": S.FAILED}.get(status)
+        target = {"merged": S.MERGED, "conflict": S.BLOCKED, "stale": S.BLOCKED, "gate_failed": S.FAILED,
+                  "shared_skills_failed": S.BLOCKED}.get(status)
         if target:
             moved = self.manager.transition(run_id, self.id, unit_id, target, reason=f"merge:{status}")
             if not moved["ok"]:

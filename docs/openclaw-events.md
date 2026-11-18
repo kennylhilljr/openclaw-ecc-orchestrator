@@ -101,7 +101,8 @@ Notes:
   `out_of_scope_changes`, `review_insufficient`, `no_qualified_reviewer`,
   `escalation_stopped`, `no_eligible_runner`, `routing_invalid`,
   `runner_needs_user`, `merge_conflict`, `merge_stale`,
-  `merged_result_failed_gates`, and the health and time reasons below.
+  `merged_result_failed_gates`, `shared_skills_failed`, and the health and
+  time reasons below.
 * Health and time reasons of `attention.required` (the unit keeps running
   unless the reason says otherwise):
 

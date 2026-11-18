@@ -14,6 +14,7 @@ from ..runs import state as S
 from ..runs.envelope import check, envelope
 from ..runs.store import iso
 from ..worktrees.git import git_out, run_git
+from ..worktrees.shared_skills import SharedSkillsError, init_shared_skills
 from . import config as TC
 from . import evidence as E
 from . import invoke as I
@@ -269,13 +270,18 @@ class TeamStep:
 
         vspec = self.cfg["roles"]["verifier"]
         vtier = TC.CLASS_TIER[TC.role_class(self.cfg, "verifier")]
-        vres = self._play_preferring_other_providers(
-            "verifier", P.VERIFY_MARK, lambda: P.verify_prompt(pack, head), avoid={author} if author else set(),
-            strict_candidates=self.candidates(vtier, classification.risk, author, author_family, False),
-            open_candidates=self.candidates(vtier, classification.risk, None, None, False),
-            run_id=run_id, unit_id=unit_id, rotation=rotation, panel=TC.panel_for(self.cfg, "verifier", None),
-            pack_tokens=0, head=head, cwd_fn=lambda: self._scratch(repo, head, run_id, unit_id), writable=True,
-            timeout=float(vspec.get("timeout_minutes", 30)) * 60, require_kind="coding_cli")
+        try:
+            vres = self._play_preferring_other_providers(
+                "verifier", P.VERIFY_MARK, lambda: P.verify_prompt(pack, head), avoid={author} if author else set(),
+                strict_candidates=self.candidates(vtier, classification.risk, author, author_family, False),
+                open_candidates=self.candidates(vtier, classification.risk, None, None, False),
+                run_id=run_id, unit_id=unit_id, rotation=rotation, panel=TC.panel_for(self.cfg, "verifier", None),
+                pack_tokens=0, head=head, cwd_fn=lambda: self._scratch(repo, head, run_id, unit_id, record),
+                writable=True, timeout=float(vspec.get("timeout_minutes", 30)) * 60, require_kind="coding_cli")
+        except SharedSkillsError as exc:
+            save()
+            return c._needs_user(run_id, unit_id, "shared_skills_failed",
+                                 f"{exc.reason}: {exc.detail}" if exc.detail else exc.reason, op)
         record["verification"] = vres
         L.capture_verdict(L.Lessons(self.state_dir, run_id), unit_id, vres, at=iso(self.clock()))
         save()
@@ -324,13 +330,20 @@ class TeamStep:
             res.setdefault("data", {})["team"] = record
         return res
 
-    def _scratch(self, repo, head, run_id, unit_id):
+    def _scratch(self, repo, head, run_id, unit_id, record=None):
         path = os.path.join(self.worktree_root, "_verify", f"{run_id}-{unit_id}-{int(self.clock() * 1000)}")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         run_git(["worktree", "add", "-q", "--detach", path, head], repo)
 
         def cleanup():
             run_git(["worktree", "remove", "--force", path], repo, check=False)
+        try:  # SUB-5: before the verifier starts
+            commit = init_shared_skills(path)
+        except BaseException:
+            cleanup()
+            raise
+        if commit and record is not None:
+            record["shared_skills_commit"] = commit
         return path, cleanup
 
     def _approve_and_merge(self, run_id, unit_id, pr, vres, head, record, op):
