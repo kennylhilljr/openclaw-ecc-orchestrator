@@ -223,8 +223,10 @@ def filter_ownership(ownership, roots):
 
 
 # == the applier's guard ==
-def refused_paths(changed, roots):
-    targets = protected(roots)
+def refused_paths(changed, roots, known=()):
+    """The changed paths inside the shared skills. `known` adds targets taken
+    before the steward ran, so a link it deleted or retargeted still counts."""
+    targets = list(dict.fromkeys(list(known or ()) + protected(roots)))
     return [f for f in changed or [] if is_shared_path(f, targets)]
 
 
@@ -278,6 +280,24 @@ def shared_state(roots):
     """`shared_snapshot` of every root: the steward's worktree and the operator's
     checkout, since an absolute or chained link can reach either submodule."""
     return {r: shared_snapshot(r) for r in dict.fromkeys(os.path.abspath(x) for x in roots or ())}
+
+
+def restore_shared(root, before):
+    """Put the initialized submodule at `root` back to the state `before` (a
+    `shared_snapshot`) when that state was a clean checkout, which makes the
+    restore lossless. Returns True when the snapshot matches `before` again."""
+    top = os.path.join(root, SHARED_ROOT)
+    head = (before or {}).get(" git head")
+    if not os.path.exists(os.path.join(top, ".git")) or (before or {}).get(" git status") != "" or \
+            not re.fullmatch(r"[0-9a-f]{40,64}", str(head or "")):
+        return False
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
+    try:
+        for args in (["reset", "-q", "--hard", head], ["clean", "-qfdx"]):
+            subprocess.run(["git", "-C", top] + args, capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return shared_snapshot(root) == before
 
 
 # == the ledger section (SUB-11) ==
@@ -464,11 +484,11 @@ class GhIssues:
 
 
 def published(repo, commit):
-    """True when `commit` is on a remote-tracking branch of `repo`, so a link to
-    it resolves for someone reading the issue."""
+    """True when `commit` is on a remote-tracking branch of `origin` (the remote
+    the issue links name), so a link to it resolves for someone reading the issue."""
     try:
         proc = subprocess.run(["git", "-C", repo, "for-each-ref", "--contains", commit, "--count", "1",
-                               "--format", "%(refname)", "refs/remotes"], capture_output=True, text=True,
+                               "--format", "%(refname)", "refs/remotes/origin"], capture_output=True, text=True,
                               timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                                                "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):

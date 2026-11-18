@@ -31,8 +31,11 @@ the catalog as issues instead (`team/catalog_lessons.py`):
 2. **Applier guard.** The steward's change is rejected when it touches the
    submodule gitlink, a path under it or a shared link, or when any file in
    the submodule folder of the steward's worktree or of the operator's
-   checkout changed (git does not show
-   such writes in the parent's diff).
+   checkout changed (git does not show such writes in the parent's diff).
+   Links are taken before the steward runs, so deleting or retargeting one
+   is refused too. When the operator's submodule was a clean checkout before
+   the turn, it is reset to that state; otherwise the change is reported in
+   the drive progress for the operator to fix.
 3. **Ledger section.** A lesson whose `practice` resolves to a shared skill
    (a path under `.agents/skills/shared/skills/<name>/`, a shared
    `.claude/skills/<name>` link, or `.agents/skills/<name>` or `<name>` when

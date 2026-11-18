@@ -263,6 +263,7 @@ class Steward:
         try:
             ownership = self._ownership(roles, path)
             before = CL.shared_state([path, repo])
+            known = CL.protected([path, repo])  # the links as they were, in case the steward removes one
             prompt = P.steward_prompt(rest, ownership, self.cfg["ledger"], ", ".join(self.cfg["spec_paths"]),
                                       catalog=catalog)
             self.d.progress(f"practices {n}: steward ({choice['runner']}) on {len(rest)} lesson(s)")
@@ -272,15 +273,22 @@ class Steward:
             report = _steward_line(turn.get("text"))
             record.update(steward=choice["runner"], branch=branch, head=head, applied=report.get("applied"),
                           proposed=report.get("proposed"), skipped=report.get("skipped"))
-            if turn.get("error"):
-                return self._record(dict(record, status=f"steward error: {turn['error']}"))
             if CL.shared_state([path, repo]) != before:
+                # The worktree is discarded below; the operator's checkout is put back when that is lossless.
+                main = os.path.abspath(repo)
+                if CL.shared_state([repo]).get(main) != before.get(main):
+                    ok = CL.restore_shared(repo, before.get(main))
+                    record["operator_checkout"] = "restored" if ok else "changed, not restored"
+                    self.d.progress(f"practices {n}: the steward changed {CL.SHARED_ROOT} in the operator checkout"
+                                    + ("; restored" if ok else "; NOT restored, check it by hand"))
                 return self._record(dict(record, status="rejected: wrote inside the shared skills",
                                          files=[CL.SHARED_ROOT]))
+            if turn.get("error"):
+                return self._record(dict(record, status=f"steward error: {turn['error']}"))
             if head == tip:
                 return self._record(dict(record, status="no change"))
             changed = [f for f in git_out(["diff", "--name-only", tip, head], path).splitlines() if f]
-            shared = CL.refused_paths(changed, [path, repo])
+            shared = CL.refused_paths(changed, [path, repo], known)
             outside = [f for f in changed if f not in shared and not self._matches(f, self._allowed(roles, path))]
             spec = [f for f in changed if self._matches(f, self.cfg["spec_paths"])]
             if shared or outside or spec:

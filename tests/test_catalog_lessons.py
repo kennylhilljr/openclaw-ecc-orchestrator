@@ -220,6 +220,49 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(CL.shared_snapshot(other), {})
         self.assertNotEqual(CL.shared_state([other, self.root]), before)
 
+    def test_refused_paths_keep_links_known_before_the_run(self):
+        known = CL.protected([self.root])
+        os.remove(os.path.join(self.root, LINK))
+        self.assertEqual(CL.refused_paths([LINK], [self.root]), [])
+        self.assertEqual(CL.refused_paths([LINK], [self.root], known), [LINK])
+
+    def test_operator_checkout_is_restored_when_it_was_clean(self):
+        cat = os.path.join(self.tmp, "cat")
+        os.makedirs(os.path.join(cat, "skills", "verify-change"))
+        git(cat, "init", "-q", "-b", "main")
+        git(cat, "config", "user.email", "test@example.invalid")
+        git(cat, "config", "user.name", "Test")
+        with open(os.path.join(cat, "skills/verify-change/SKILL.md"), "w") as fh:
+            fh.write("# verify-change\n")
+        git(cat, "add", "-A")
+        git(cat, "commit", "-q", "-m", "catalog")
+        repo = os.path.join(self.tmp, "consumer")
+        os.makedirs(repo)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "Test")
+        git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", cat, CL.SHARED_ROOT)
+        before = CL.shared_snapshot(repo)
+        skill = os.path.join(repo, CL.SHARED_SKILLS, "verify-change", "SKILL.md")
+        with open(skill, "w") as fh:
+            fh.write("corrupted\n")
+        with open(os.path.join(repo, CL.SHARED_SKILLS, "new.md"), "w") as fh:
+            fh.write("new\n")
+        self.assertNotEqual(CL.shared_snapshot(repo), before)
+        self.assertTrue(CL.restore_shared(repo, before))
+        with open(skill) as fh:
+            self.assertEqual(fh.read(), "# verify-change\n")
+        self.assertEqual(CL.shared_snapshot(repo), before)
+        # A checkout that was dirty before is never reset.
+        with open(skill, "w") as fh:
+            fh.write("operator edit\n")
+        dirty = CL.shared_snapshot(repo)
+        with open(skill, "a") as fh:
+            fh.write("steward edit\n")
+        self.assertFalse(CL.restore_shared(repo, dirty))
+        with open(skill) as fh:
+            self.assertEqual(fh.read(), "operator edit\nsteward edit\n")
+
     def test_lessons_sharing_a_long_prefix_both_stay(self):
         log = L.Lessons(os.path.join(self.tmp, "state"), "r1")
         head = "x" * 1200
@@ -246,8 +289,11 @@ class ReviewFixTests(unittest.TestCase):
                              lambda u: ref)
         self.assertIn("`U1` (commit " + sha[:12], body)
         subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+        git(repo, "remote", "add", "fork", remote)
+        git(repo, "push", "-q", "fork", "main")
+        self.assertFalse(CL.commit_ref(repo, "example/consumer", sha).startswith("https://"))  # not on origin
         git(repo, "remote", "add", "origin", remote)
-        git(repo, "push", "-q", "origin", "main")
+        git(repo, "fetch", "-q", "origin")
         self.assertEqual(CL.commit_ref(repo, "example/consumer", sha),
                          f"https://github.com/example/consumer/commit/{sha}")
         self.assertIsNone(CL.commit_ref(repo, "example/consumer", None))
