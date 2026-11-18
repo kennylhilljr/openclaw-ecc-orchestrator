@@ -234,6 +234,30 @@ class ReviewFixTests(unittest.TestCase):
             fh.write("[submodule]\n")
         self.assertNotEqual(CL.shared_state([self.root]), before)
 
+    def test_link_guard_sees_chains_and_special_files_and_ignores_project_links(self):
+        # Retargeting a project link is not a shared-skills change.
+        before = CL.shared_state([self.root])
+        proj = os.path.join(self.root, ".claude/skills/security-review-proj")
+        os.remove(proj)
+        os.symlink("../../AGENTS.md", proj)
+        self.assertEqual(CL.shared_state([self.root]), before)
+        # A chained shared link retargeted through its intermediate link is seen.
+        hop = os.path.join(self.root, "hop")
+        os.symlink(".agents/skills/shared/skills/verify-change", hop)
+        os.remove(os.path.join(self.root, LINK))
+        os.symlink("../../hop", os.path.join(self.root, LINK))
+        before = CL.shared_state([self.root])
+        os.remove(hop)
+        os.symlink(".agents/skills/shared/skills/cross-review", hop)
+        self.assertNotEqual(CL.shared_state([self.root]), before)
+        # A FIFO is fingerprinted by type, never opened.
+        before = CL.shared_state([self.root])
+        os.mkfifo(os.path.join(self.root, ".gitmodules"))
+        os.mkfifo(os.path.join(self.root, CL.SHARED_SKILLS, "pipe"))
+        after = CL.shared_state([self.root])
+        self.assertNotEqual(after, before)
+        self.assertIn(".gitmodules", CL.state_diff(before, after))
+
     def test_refused_paths_keep_links_known_before_the_run(self):
         known = CL.protected([self.root])
         os.remove(os.path.join(self.root, LINK))

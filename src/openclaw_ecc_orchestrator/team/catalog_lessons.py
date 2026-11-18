@@ -22,6 +22,7 @@ import collections
 import hashlib
 import os
 import re
+import stat
 import subprocess
 
 from ..worktrees.git import run_git
@@ -259,6 +260,8 @@ def shared_snapshot(root):
                     out[key] = "link:" + os.readlink(full)
                 elif os.path.isdir(full):
                     continue  # walked on its own
+                elif not stat.S_ISREG(st.st_mode):
+                    out[key] = "type:%o" % st.st_mode  # never opened: a FIFO would block
                 else:
                     with open(full, "rb") as fh:
                         out[key] = "%o:%s" % (st.st_mode, hashlib.sha256(fh.read()).hexdigest())
@@ -266,7 +269,8 @@ def shared_snapshot(root):
                 out[key] = "unreadable"
     if os.path.exists(os.path.join(top, ".git")):
         try:
-            proc = run_git(["status", "--porcelain", "--ignored"], top, check=False, timeout=60)
+            proc = run_git(["status", "--porcelain", "--ignored", "--untracked-files=all"], top, check=False,
+                           timeout=60)
             out[" git status"] = proc.stdout if proc.returncode == 0 else f"status failed {proc.returncode}"
             head = run_git(["rev-parse", "HEAD"], top, check=False, timeout=60)
             out[" git head"] = head.stdout.strip() if head.returncode == 0 else f"head failed {head.returncode}"
@@ -276,24 +280,32 @@ def shared_snapshot(root):
 
 
 def _links(root):
-    """{".claude/skills/<name>": link text or kind} for every entry there, plus `.gitmodules`."""
+    """{".claude/skills/<name>": link text and where it resolves} for the links
+    that resolve into the submodule, plus the type, mode and content of
+    `.gitmodules`. Project links are left out: retargeting one is allowed."""
     out = {}
-    base = os.path.join(root, LINK_DIR)
-    try:
-        names = sorted(os.listdir(base))
-    except OSError:
-        names = []
-    for name in names:
-        full = os.path.join(base, name)
+    for name, rel in shared_links([root]).items():
+        full = os.path.join(root, rel)
         try:
-            out[f"{LINK_DIR}/{name}"] = "link:" + os.readlink(full) if os.path.islink(full) else "entry"
+            out[rel] = "link:" + os.readlink(full) + " -> " + os.path.realpath(full)
         except OSError:
-            out[f"{LINK_DIR}/{name}"] = "unreadable"
+            out[rel] = "unreadable"
+    gm = os.path.join(root, ".gitmodules")
     try:
-        with open(os.path.join(root, ".gitmodules"), "rb") as fh:
-            out[".gitmodules"] = hashlib.sha256(fh.read()).hexdigest()
+        st = os.lstat(gm)
     except OSError:
         out[".gitmodules"] = None
+        return out
+    if os.path.islink(gm):
+        out[".gitmodules"] = "link:" + os.readlink(gm)
+    elif not stat.S_ISREG(st.st_mode):
+        out[".gitmodules"] = "type:%o" % st.st_mode  # never opened: a FIFO would block
+    else:
+        try:
+            with open(gm, "rb") as fh:
+                out[".gitmodules"] = "%o:%s" % (st.st_mode, hashlib.sha256(fh.read(1 << 20)).hexdigest())
+        except OSError:
+            out[".gitmodules"] = "unreadable"
     return out
 
 
