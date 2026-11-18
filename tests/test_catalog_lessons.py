@@ -9,6 +9,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 try:
     from ._integration import PY, git
@@ -21,6 +22,7 @@ from openclaw_ecc_orchestrator.runners.discovery import HttpResponse
 from openclaw_ecc_orchestrator.team import catalog_lessons as CL
 from openclaw_ecc_orchestrator.team import learning as L
 from openclaw_ecc_orchestrator.team import personas as P
+from openclaw_ecc_orchestrator.worktrees import shared_skills as SS
 
 PRACTICES = "changed the repository's practice files"
 SHARED_FILE = ".agents/skills/shared/skills/verify-change/SKILL.md"
@@ -258,6 +260,27 @@ class ReviewFixTests(unittest.TestCase):
         self.assertNotEqual(after, before)
         self.assertIn(".gitmodules", CL.state_diff(before, after))
 
+    def test_cross_checkout_links_and_gitmodules_contents_are_seen(self):
+        other = os.path.join(self.tmp, "worktree")
+        os.makedirs(os.path.join(other, ".claude/skills"))
+        link = os.path.join(other, LINK)
+        os.symlink(os.path.join(self.root, CL.SHARED_SKILLS, "verify-change"), link)
+        self.assertEqual(CL.refused_paths([LINK], [other, self.root]), [LINK])
+        before = CL.shared_state([other, self.root])
+        os.remove(link)
+        os.symlink(os.path.join(self.root, CL.SHARED_SKILLS, "cross-review"), link)
+        self.assertIn(LINK, CL.state_diff(before, CL.shared_state([other, self.root])))
+        # A .gitmodules link is followed, and the whole file is hashed.
+        real = os.path.join(self.tmp, "modules")
+        with open(real, "w") as fh:
+            fh.write("x" * (3 << 20))
+        os.symlink(real, os.path.join(self.root, ".gitmodules"))
+        before = CL.shared_state([self.root])
+        with open(real, "r+") as fh:
+            fh.seek(2 << 20)
+            fh.write("y")
+        self.assertIn(".gitmodules", CL.state_diff(before, CL.shared_state([self.root])))
+
     def test_refused_paths_keep_links_known_before_the_run(self):
         known = CL.protected([self.root])
         os.remove(os.path.join(self.root, LINK))
@@ -443,7 +466,13 @@ class DriveFlowTests(DriveBase):
         git(cat, "add", "-A")
         git(cat, "commit", "-q", "-m", "catalog")
         self.catalog = cat
-        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", cat, CL.SHARED_ROOT)
+        url = "file://" + cat
+        # The worktree submodule check (SUB-5) only accepts the catalog URL; its test seam allows this one.
+        for attr, value in (("ALLOWED_URL", url), ("ALLOW_FILE_PROTOCOL", True)):
+            patcher = mock.patch.object(SS, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", url, CL.SHARED_ROOT)
         os.makedirs(os.path.join(self.repo, ".claude/skills"))
         os.symlink("../../.agents/skills/shared/skills/verify-change", os.path.join(self.repo, LINK))
         os.makedirs(os.path.join(self.repo, ".agents/skills/security-review-proj"))

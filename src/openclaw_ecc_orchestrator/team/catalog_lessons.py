@@ -49,31 +49,43 @@ def _inside(path, target):
 
 
 # == what is shared ==
-def shared_links(roots):
-    """{name: ".claude/skills/<name>"} for every link under `.claude/skills` in
-    any of `roots` that resolves into the shared submodule."""
+def _shared_reals(roots):
+    return [os.path.realpath(os.path.join(r, SHARED_ROOT)) for r in roots or ()]
+
+
+def _links_in(root, reals):
+    """{name: ".claude/skills/<name>"} for the links under `root` that point into
+    any of the submodule folders `reals` (this checkout's or another's)."""
     out = {}
-    for root in roots or ():
-        base = os.path.join(root, LINK_DIR)
+    base = os.path.join(root, LINK_DIR)
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in names:
+        full = os.path.join(base, name)
+        if not os.path.islink(full):
+            continue
         try:
-            names = sorted(os.listdir(base))
+            dest = os.readlink(full)
+            real = os.path.realpath(full)
         except OSError:
             continue
-        for name in names:
-            full = os.path.join(base, name)
-            if not os.path.islink(full):
-                continue
-            try:
-                dest = os.readlink(full)
-                real = os.path.realpath(full)
-            except OSError:
-                continue
-            shared_real = os.path.realpath(os.path.join(root, SHARED_ROOT))
-            # Relative links by their text (they may dangle without the submodule), and any
-            # link (absolute or chained) by where it resolves.
-            if (not os.path.isabs(dest) and _inside(_norm(os.path.join(LINK_DIR, dest)), SHARED_ROOT)) or \
-                    real == shared_real or real.startswith(shared_real + os.sep):
-                out[name] = f"{LINK_DIR}/{name}"
+        # Relative links by their text (they may dangle without the submodule), and any
+        # link (absolute or chained) by where it resolves.
+        if (not os.path.isabs(dest) and _inside(_norm(os.path.join(LINK_DIR, dest)), SHARED_ROOT)) or \
+                any(real == s or real.startswith(s + os.sep) for s in reals):
+            out[name] = f"{LINK_DIR}/{name}"
+    return out
+
+
+def shared_links(roots):
+    """{name: ".claude/skills/<name>"} for every link under `.claude/skills` in
+    any of `roots` that resolves into the shared submodule of any of them."""
+    reals = _shared_reals(roots)
+    out = {}
+    for root in roots or ():
+        out.update(_links_in(root, reals))
     return out
 
 
@@ -279,12 +291,21 @@ def shared_snapshot(root):
     return out
 
 
-def _links(root):
+def _hash_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _links(root, reals):
     """{".claude/skills/<name>": link text and where it resolves} for the links
-    that resolve into the submodule, plus the type, mode and content of
-    `.gitmodules`. Project links are left out: retargeting one is allowed."""
+    that resolve into a shared submodule, plus the type, mode and content of
+    `.gitmodules` (followed when it is a link). Project links are left out:
+    retargeting one is allowed."""
     out = {}
-    for name, rel in shared_links([root]).items():
+    for rel in _links_in(root, reals).values():
         full = os.path.join(root, rel)
         try:
             out[rel] = "link:" + os.readlink(full) + " -> " + os.path.realpath(full)
@@ -292,20 +313,23 @@ def _links(root):
             out[rel] = "unreadable"
     gm = os.path.join(root, ".gitmodules")
     try:
-        st = os.lstat(gm)
+        lst = os.lstat(gm)
     except OSError:
         out[".gitmodules"] = None
         return out
-    if os.path.islink(gm):
-        out[".gitmodules"] = "link:" + os.readlink(gm)
-    elif not stat.S_ISREG(st.st_mode):
-        out[".gitmodules"] = "type:%o" % st.st_mode  # never opened: a FIFO would block
-    else:
-        try:
-            with open(gm, "rb") as fh:
-                out[".gitmodules"] = "%o:%s" % (st.st_mode, hashlib.sha256(fh.read(1 << 20)).hexdigest())
-        except OSError:
-            out[".gitmodules"] = "unreadable"
+    prefix = ("link:" + os.readlink(gm) + " -> ") if stat.S_ISLNK(lst.st_mode) else ""
+    try:
+        st = os.stat(gm)
+    except OSError:
+        out[".gitmodules"] = prefix + "dangling"
+        return out
+    if not stat.S_ISREG(st.st_mode):
+        out[".gitmodules"] = prefix + "type:%o" % st.st_mode  # never opened: a FIFO would block
+        return out
+    try:
+        out[".gitmodules"] = prefix + "%o:%s" % (st.st_mode, _hash_file(gm))
+    except OSError:
+        out[".gitmodules"] = prefix + "unreadable"
     return out
 
 
@@ -313,8 +337,9 @@ def shared_state(roots):
     """`shared_snapshot` of every root plus its `.claude/skills` entries and
     `.gitmodules`: the steward's worktree and the operator's checkout, since an
     absolute or chained link (or a direct write) can reach either."""
-    return {r: dict(shared_snapshot(r), **{" links": _links(r)})
-            for r in dict.fromkeys(os.path.abspath(x) for x in roots or ())}
+    roots = list(dict.fromkeys(os.path.abspath(x) for x in roots or ()))
+    reals = _shared_reals(roots)
+    return {r: dict(shared_snapshot(r), **{" links": _links(r, reals)}) for r in roots}
 
 
 def state_diff(before, after):
