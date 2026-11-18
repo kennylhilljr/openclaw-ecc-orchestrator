@@ -339,7 +339,7 @@ class TeamStep:
             run_git(["worktree", "remove", "--force", path], repo, check=False)
         try:  # SUB-5: before the verifier starts
             commit = init_shared_skills(path)
-        except SharedSkillsError:
+        except BaseException:
             cleanup()
             raise
         if commit and record is not None:

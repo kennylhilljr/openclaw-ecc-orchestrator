@@ -73,14 +73,17 @@ def merge_check(repo, target, branch, scratch_root, force_fallback=False, config
     path = tempfile.mkdtemp(prefix="check-", dir=scratch_root)
     try:
         run_git(["worktree", "add", "--detach", path, target], repo)
-        init_shared_skills(path)  # SUB-5: raises SharedSkillsError with the check's reason
+        shared_commit = init_shared_skills(path)  # SUB-5: raises SharedSkillsError with the check's reason
         proc = run_git(["merge", "--no-commit", "--no-ff", branch], path, check=False, config=config)
         conflicts = []
         if proc.returncode != 0:
             out = git_out(["diff", "--name-only", "--diff-filter=U"], path)
             conflicts = sorted(set(line for line in out.splitlines() if line)) or ["<unknown>"]
         run_git(["merge", "--abort"], path, check=False)
-        return {"clean": proc.returncode == 0, "conflicts": conflicts, "strategy": "worktree", "tree": None}
+        result = {"clean": proc.returncode == 0, "conflicts": conflicts, "strategy": "worktree", "tree": None}
+        if shared_commit:
+            result["shared_skills_commit"] = shared_commit
+        return result
     finally:
         _remove_throwaway(repo, path)
 
@@ -340,6 +343,8 @@ class MergeQueue:
                 mc = merge_check(self.repo, target_oid, tip, self.scratch, self.force_fallback, self.config)
             except SharedSkillsError as exc:
                 return self._shared_skills_failed(st, item, base, exc, dry_run)
+            if mc.get("shared_skills_commit"):
+                base["shared_skills_commit"] = mc["shared_skills_commit"]
             if not mc["clean"]:
                 data = dict(base, status="conflict", conflicts=mc["conflicts"], merge_check=mc)
                 self._finish(st, item, "conflict", dry_run, data)

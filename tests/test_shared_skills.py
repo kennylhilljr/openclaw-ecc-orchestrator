@@ -111,6 +111,44 @@ class ModuleTests(CatalogMixin, IntegrationBase):
         self.assertEqual(ctx.exception.reason, "submodule URL not allowed")
         self.assertFalse(os.path.exists(os.path.join(wt, CATALOG_JSON)), "nothing was fetched")
 
+    def test_duplicate_entries_for_the_path_fail_submodule_url_not_allowed(self):
+        """A second entry mapping the same path cannot slip past the URL check."""
+        self.consumer(self.repo)
+        other = self.make_catalog(name="other")
+        with open(os.path.join(self.repo, ".gitmodules"), "a") as fh:
+            fh.write(f'[submodule "evil"]\n\tpath = {SS.SHARED_PATH}\n\turl = {other}\n')
+        git(self.repo, "commit", "-q", "-am", "second entry")
+        wt = self.worktree(self.repo, "dup")
+        with self.assertRaises(SS.SharedSkillsError) as ctx:
+            SS.init_shared_skills(wt)
+        self.assertEqual(ctx.exception.reason, "submodule URL not allowed")
+
+    def test_unreadable_gitmodules_naming_the_path_fails_closed(self):
+        with open(os.path.join(self.repo, ".gitmodules"), "w") as fh:
+            fh.write(f'[submodule "x"\n\tpath = {SS.SHARED_PATH}\n')
+        git(self.repo, "add", ".gitmodules")
+        git(self.repo, "commit", "-q", "-m", "broken")
+        wt = self.worktree(self.repo, "broken")
+        for fn in (SS.init_shared_skills, SS.check_shared_skills):
+            with self.assertRaises(SS.SharedSkillsError) as ctx:
+                fn(wt)
+            self.assertEqual(ctx.exception.reason, "shared skills missing")
+
+    def test_fetch_timeout_fails_shared_skills_missing(self):
+        self.consumer(self.repo)
+        wt = self.worktree(self.repo, "slow")
+
+        def fake(args, cwd, **kw):
+            if "update" in args:
+                raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+            return G.run_git(args, cwd, **kw)
+
+        with mock.patch.object(SS, "run_git", fake):
+            with self.assertRaises(SS.SharedSkillsError) as ctx:
+                SS.init_shared_skills(wt)
+        self.assertEqual(ctx.exception.reason, "shared skills missing")
+        self.assertIn("timed out", ctx.exception.detail)
+
     def test_missing_catalog_json_fails_shared_skills_missing(self):
         self.consumer(self.repo, with_catalog_json=False)
         wt = self.worktree(self.repo, "c")
@@ -168,6 +206,10 @@ class ModuleTests(CatalogMixin, IntegrationBase):
             self.assertEqual(argv[-7:], ["submodule", "update", "--init", "--depth", "1", "--", SS.SHARED_PATH])
         self.assertIn("credential.helper=", calls[1])
         self.assertIn("http.extraHeader=", calls[1])
+        for scope in ("https://github.com", SS.CATALOG_URL):
+            self.assertIn(f"credential.{scope}.helper=", calls[1])
+            self.assertIn(f"http.{scope}.extraHeader=", calls[1])
+        self.assertNotIn("credential.helper=", calls[0][len(G.safety_args()) + 1:])
 
 
 class DirtyCheckTests(CatalogMixin, IntegrationBase):
@@ -270,6 +312,15 @@ class MergeQueuePathTests(CatalogMixin, QueueBase):
             res = Q.merge_check(self.repo, "main", "ok", self.scratch, force_fallback=True)
         self.assertTrue(res["clean"])
         self.assertEqual(returned, [self.pinned], "initialized and checked in the throwaway worktree")
+
+    def test_fallback_conflict_still_records_the_commit(self):
+        self.branch("ecc/r1/a", {"README.md": "theirs\n"})
+        self.commit("README.md", "ours\n")
+        self.assertTrue(self.enqueue("a", "ecc/r1/a", unit=queue_unit("a", files=["README.md"]))["ok"])
+        self.q = self.new_queue(force_fallback=True)
+        out = self.q.process_next()
+        self.assertEqual(out["data"]["status"], "conflict", out)
+        self.assertEqual(self.q.state()["history"][-1]["shared_skills_commit"], self.pinned)
 
     def test_merge_stops_with_the_reason(self):
         self.branch("ecc/r1/a", {"a.txt": "a\n"})

@@ -22,8 +22,9 @@ return None and run nothing.
 """
 
 import os
+import subprocess
 
-from .git import GitError, run_git
+from .git import run_git
 
 SHARED_PATH = ".agents/skills/shared"
 CATALOG_URL = "https://github.com/kennylhilljr/skills-catalog.git"
@@ -56,17 +57,37 @@ def submodule_entry(worktree):
     path = os.path.join(worktree, ".gitmodules")
     if not os.path.isfile(path):
         return None
-    proc = run_git(["config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], worktree,
-                   check=False)
+    proc = _git(["config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], worktree)
+    if proc.returncode not in (0, 1):  # 1 is "no match"; anything else is an unreadable file
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                mentioned = SHARED_PATH in fh.read()
+        except OSError:
+            mentioned = True
+        if mentioned:  # fail closed rather than run without the shared skills
+            raise SharedSkillsError(MISSING, f".gitmodules cannot be read: {proc.stderr.strip()[-200:]}")
+        return None
+    names = []
     for line in proc.stdout.splitlines():
         key, _, value = line.partition(" ")
-        if value.strip().strip("/") != SHARED_PATH:
-            continue
-        name = key[len("submodule."):-len(".path")]
-        url = run_git(["config", "--file", ".gitmodules", "--get", f"submodule.{name}.url"], worktree,
-                      check=False).stdout.strip()
-        return name, url
-    return None
+        if value.strip().strip("/") == SHARED_PATH:
+            names.append(key[len("submodule."):-len(".path")])
+    if not names:
+        return None
+    if len(names) > 1:
+        # Ambiguous: git may map the path to a different entry than the one checked.
+        return names[0], "<duplicate .gitmodules entries for the path>"
+    urls = _git(["config", "--file", ".gitmodules", "--get-all", f"submodule.{names[0]}.url"],
+                worktree).stdout.splitlines()
+    return names[0], urls[0].strip() if len(urls) == 1 else "<missing or repeated url>"
+
+
+def _git(args, cwd, timeout=60, **kw):
+    """run_git that reports a timeout as a failed process instead of raising."""
+    try:
+        return run_git(args, cwd, check=False, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout} s")
 
 
 def _check_url(entry):
@@ -96,6 +117,9 @@ def update_argv(name, fallback=False):
     args += ["-c", f"submodule.{name}.url={ALLOWED_URL}"]
     if fallback:
         args += ["-c", "credential.helper=", "-c", "http.extraHeader="]
+        host = ALLOWED_URL.split("//", 1)[-1].split("/", 1)[0]
+        for scope in (f"https://{host}", f"https://{host}/", ALLOWED_URL):
+            args += ["-c", f"credential.{scope}.helper=", "-c", f"http.{scope}.extraHeader="]
     return args + ["submodule", "update", "--init", "--depth", "1", "--", SHARED_PATH]
 
 
@@ -107,20 +131,19 @@ def init_shared_skills(worktree):
     if entry is None:
         return None
     _check_url(entry)
-    proc = run_git(update_argv(entry[0]), worktree, check=False, timeout=UPDATE_TIMEOUT)
+    proc = _git(update_argv(entry[0]), worktree, timeout=UPDATE_TIMEOUT)
     if proc.returncode != 0:
-        proc = run_git(update_argv(entry[0], fallback=True), worktree, check=False, timeout=UPDATE_TIMEOUT)
+        proc = _git(update_argv(entry[0], fallback=True), worktree, timeout=UPDATE_TIMEOUT)
     if proc.returncode != 0:
         raise SharedSkillsError(MISSING, (proc.stderr or proc.stdout).strip()[-300:])
     return check_shared_skills(worktree)
 
 
 def _status_line(worktree):
-    try:
-        out = run_git(["submodule", "status", "--", SHARED_PATH], worktree, check=True,
-                      config={"submodule.recurse": "false"}).stdout
-    except GitError as exc:
-        raise SharedSkillsError(MISSING, exc.stderr.strip()[-300:]) from None
+    proc = _git(["submodule", "status", "--", SHARED_PATH], worktree, config={"submodule.recurse": "false"})
+    if proc.returncode != 0:
+        raise SharedSkillsError(MISSING, f"git submodule status: {proc.stderr.strip()[-300:]}")
+    out = proc.stdout
     lines = [line for line in out.splitlines() if line.strip()]
     return lines[0] if lines else ""
 
@@ -155,7 +178,7 @@ def dirty_shared_skills(worktree):
         if os.path.isdir(sub) and os.listdir(sub):
             return DIRTY, f"{SHARED_PATH} holds files but is not a checkout"
         return None
-    proc = run_git(["status", "--porcelain"], sub, check=False)
+    proc = _git(["status", "--porcelain"], sub)
     if proc.returncode != 0:
         return DIRTY, f"git status failed in {SHARED_PATH}: {proc.stderr.strip()[-200:]}"
     if proc.stdout.strip():
