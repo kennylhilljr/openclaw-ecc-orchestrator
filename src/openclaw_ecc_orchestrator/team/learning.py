@@ -273,16 +273,20 @@ class Steward:
             report = _steward_line(turn.get("text"))
             record.update(steward=choice["runner"], branch=branch, head=head, applied=report.get("applied"),
                           proposed=report.get("proposed"), skipped=report.get("skipped"))
-            if CL.shared_state([path, repo]) != before:
+            after = CL.shared_state([path, repo])
+            if after != before:
                 # The worktree is discarded below; the operator's checkout is put back when that is lossless.
                 main = os.path.abspath(repo)
                 if CL.shared_state([repo]).get(main) != before.get(main):
-                    ok = CL.restore_shared(repo, before.get(main))
-                    record["operator_checkout"] = "restored" if ok else "changed, not restored"
-                    self.d.progress(f"practices {n}: the steward changed {CL.SHARED_ROOT} in the operator checkout"
-                                    + ("; restored" if ok else "; NOT restored, check it by hand"))
+                    stash = CL.restore_shared(repo, before.get(main))
+                    ok = CL.shared_state([repo]).get(main) == before.get(main)
+                    record["operator_checkout"] = f"restored (changes kept in its git stash: {stash})" if ok \
+                        else "changed, not restored"
+                    self.d.progress(f"practices {n}: the steward changed the shared skills in the operator checkout"
+                                    + (f"; restored, changes stashed in {CL.SHARED_ROOT} as {stash!r}" if ok
+                                       else "; NOT restored, check it by hand"))
                 return self._record(dict(record, status="rejected: wrote inside the shared skills",
-                                         files=[CL.SHARED_ROOT]))
+                                         files=CL.state_diff(before, after) or [CL.SHARED_ROOT]))
             if turn.get("error"):
                 return self._record(dict(record, status=f"steward error: {turn['error']}"))
             if head == tip:

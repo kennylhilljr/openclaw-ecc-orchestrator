@@ -220,6 +220,20 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(CL.shared_snapshot(other), {})
         self.assertNotEqual(CL.shared_state([other, self.root]), before)
 
+    def test_gitmodules_and_operator_links_are_guarded(self):
+        self.assertEqual(CL.refused_paths([".gitmodules", "AGENTS.md"], [self.root]), [".gitmodules"])
+        for globs in CL.filter_ownership({"architect": ["**"], "gates": ["*"], "coder": [".git*"]},
+                                         [self.root]).values():
+            self.assertFalse(owned(".gitmodules", globs), globs)
+        before = CL.shared_state([self.root])
+        os.remove(os.path.join(self.root, LINK))
+        os.symlink("../../AGENTS.md", os.path.join(self.root, LINK))
+        self.assertNotEqual(CL.shared_state([self.root]), before)
+        before = CL.shared_state([self.root])
+        with open(os.path.join(self.root, ".gitmodules"), "w") as fh:
+            fh.write("[submodule]\n")
+        self.assertNotEqual(CL.shared_state([self.root]), before)
+
     def test_refused_paths_keep_links_known_before_the_run(self):
         known = CL.protected([self.root])
         os.remove(os.path.join(self.root, LINK))
@@ -253,13 +267,21 @@ class ReviewFixTests(unittest.TestCase):
         with open(skill) as fh:
             self.assertEqual(fh.read(), "# verify-change\n")
         self.assertEqual(CL.shared_snapshot(repo), before)
+        # Nothing is lost: the write sits in the submodule's stash.
+        sub = os.path.join(repo, CL.SHARED_ROOT)
+        self.assertIn("rejected practices steward write", git(sub, "stash", "list"))
+        git(sub, "stash", "pop", "-q")
+        with open(skill) as fh:
+            self.assertEqual(fh.read(), "corrupted\n")
+        git(sub, "checkout", "-q", "--", ".")
+        git(sub, "clean", "-qfd")
         # A checkout that was dirty before is never reset.
         with open(skill, "w") as fh:
             fh.write("operator edit\n")
         dirty = CL.shared_snapshot(repo)
         with open(skill, "a") as fh:
             fh.write("steward edit\n")
-        self.assertFalse(CL.restore_shared(repo, dirty))
+        self.assertIsNone(CL.restore_shared(repo, dirty))
         with open(skill) as fh:
             self.assertEqual(fh.read(), "operator edit\nsteward edit\n")
 
@@ -520,7 +542,9 @@ class DriveFlowTests(DriveBase):
         res = self.drive().go()
         self.assertTrue(res["ok"], json.dumps(res, indent=1, default=str)[:3000])
         runs = self.runs()
-        self.assertTrue(runs and all(r["status"] == "rejected: outside the practice files" and LINK in r["files"]
+        self.assertTrue(runs and all(r["status"] in ("rejected: outside the practice files",
+                                                     "rejected: wrote inside the shared skills")
+                                     and LINK in r["files"]
                             for r in runs), runs)
         self.assertEqual(os.readlink(os.path.join(self.repo, LINK)), "../../.agents/skills/shared/skills/verify-change")
 

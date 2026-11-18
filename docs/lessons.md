@@ -32,10 +32,13 @@ the catalog as issues instead (`team/catalog_lessons.py`):
    submodule gitlink, a path under it or a shared link, or when any file in
    the submodule folder of the steward's worktree or of the operator's
    checkout changed (git does not show such writes in the parent's diff).
+   `.gitmodules` is protected the same way, and the `.claude/skills` entries
+   and `.gitmodules` of both checkouts are compared before and after the turn.
    Links are taken before the steward runs, so deleting or retargeting one
-   is refused too. When the operator's submodule was a clean checkout before
-   the turn, it is reset to that state; otherwise the change is reported in
-   the drive progress for the operator to fix.
+   is refused too. When the operator's submodule was a clean checkout at an
+   unchanged commit, whatever changed in it is moved into that submodule's
+   git stash (`git stash list` there; nothing is deleted); any other change is
+   reported in the drive progress for the operator to fix.
 3. **Ledger section.** A lesson whose `practice` resolves to a shared skill
    (a path under `.agents/skills/shared/skills/<name>/`, a shared
    `.claude/skills/<name>` link, or `.agents/skills/<name>` or `<name>` when

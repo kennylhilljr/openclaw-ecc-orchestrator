@@ -24,6 +24,8 @@ import os
 import re
 import subprocess
 
+from ..worktrees.git import run_git
+
 SHARED_ROOT = ".agents/skills/shared"
 SHARED_SKILLS = SHARED_ROOT + "/skills"
 LINK_DIR = ".claude/skills"
@@ -87,8 +89,9 @@ def shared_names(roots):
 
 
 def protected(roots):
-    """Paths the steward may never change: the submodule and the shared links."""
-    return [SHARED_ROOT] + sorted(shared_links(roots).values())
+    """Paths the steward may never change: the submodule, `.gitmodules` (DESIGN
+    4.5) and the shared links."""
+    return [SHARED_ROOT, ".gitmodules"] + sorted(shared_links(roots).values())
 
 
 def is_shared_path(path, targets):
@@ -263,41 +266,80 @@ def shared_snapshot(root):
                 out[key] = "unreadable"
     if os.path.exists(os.path.join(top, ".git")):
         try:
-            proc = subprocess.run(["git", "-C", top, "status", "--porcelain", "--ignored"], capture_output=True,
-                                  text=True, timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                                                              "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+            proc = run_git(["status", "--porcelain", "--ignored"], top, check=False, timeout=60)
             out[" git status"] = proc.stdout if proc.returncode == 0 else f"status failed {proc.returncode}"
-            head = subprocess.run(["git", "-C", top, "rev-parse", "HEAD"], capture_output=True, text=True,
-                                  timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                                                   "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+            head = run_git(["rev-parse", "HEAD"], top, check=False, timeout=60)
             out[" git head"] = head.stdout.strip() if head.returncode == 0 else f"head failed {head.returncode}"
         except (OSError, subprocess.SubprocessError):
             out[" git status"] = "status failed"
     return out
 
 
+def _links(root):
+    """{".claude/skills/<name>": link text or kind} for every entry there, plus `.gitmodules`."""
+    out = {}
+    base = os.path.join(root, LINK_DIR)
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        names = []
+    for name in names:
+        full = os.path.join(base, name)
+        try:
+            out[f"{LINK_DIR}/{name}"] = "link:" + os.readlink(full) if os.path.islink(full) else "entry"
+        except OSError:
+            out[f"{LINK_DIR}/{name}"] = "unreadable"
+    try:
+        with open(os.path.join(root, ".gitmodules"), "rb") as fh:
+            out[".gitmodules"] = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        out[".gitmodules"] = None
+    return out
+
+
 def shared_state(roots):
-    """`shared_snapshot` of every root: the steward's worktree and the operator's
-    checkout, since an absolute or chained link can reach either submodule."""
-    return {r: shared_snapshot(r) for r in dict.fromkeys(os.path.abspath(x) for x in roots or ())}
+    """`shared_snapshot` of every root plus its `.claude/skills` entries and
+    `.gitmodules`: the steward's worktree and the operator's checkout, since an
+    absolute or chained link (or a direct write) can reach either."""
+    return {r: dict(shared_snapshot(r), **{" links": _links(r)})
+            for r in dict.fromkeys(os.path.abspath(x) for x in roots or ())}
+
+
+def state_diff(before, after):
+    """The paths that differ between two `shared_state` results, for the record."""
+    out = set()
+    for r in set(before or {}) | set(after or {}):
+        a, b = (before or {}).get(r) or {}, (after or {}).get(r) or {}
+        for k in set(a) | set(b):
+            if k == " links":
+                la, lb = a.get(k) or {}, b.get(k) or {}
+                out.update(x for x in set(la) | set(lb) if la.get(x) != lb.get(x))
+            elif a.get(k) != b.get(k):
+                out.add(SHARED_ROOT if k.startswith(" ") else k.rstrip("/"))
+    return sorted(out)
 
 
 def restore_shared(root, before):
-    """Put the initialized submodule at `root` back to the state `before` (a
-    `shared_snapshot`) when that state was a clean checkout, which makes the
-    restore lossless. Returns True when the snapshot matches `before` again."""
+    """Move whatever changed in the initialized submodule at `root` since `before`
+    (a `shared_snapshot` of a clean checkout) into a git stash of that submodule,
+    so the checkout is back as it was and nothing is lost: an edit the operator
+    made meanwhile is recoverable with `git stash pop`. Returns the stash
+    message when the snapshot matches `before` again, else None."""
     top = os.path.join(root, SHARED_ROOT)
     head = (before or {}).get(" git head")
     if not os.path.exists(os.path.join(top, ".git")) or (before or {}).get(" git status") != "" or \
             not re.fullmatch(r"[0-9a-f]{40,64}", str(head or "")):
-        return False
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
+        return None
+    msg = "ecc-orchestrator: rejected practices steward write"
     try:
-        for args in (["reset", "-q", "--hard", head], ["clean", "-qfdx"]):
-            subprocess.run(["git", "-C", top] + args, capture_output=True, text=True, timeout=120, env=env)
+        now = run_git(["rev-parse", "HEAD"], top, check=False, timeout=60).stdout.strip()
+        if now != head:
+            return None  # the submodule moved; leave it for the operator
+        run_git(["-c", "user.name=ecc-orchestrator", "-c", "user.email=ecc-orchestrator@localhost",
+                 "stash", "push", "--all", "-q", "-m", msg], top, check=False, timeout=120)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return shared_snapshot(root) == before
+        return None
+    return msg if shared_snapshot(root) == {k: v for k, v in before.items() if k != " links"} else None
 
 
 # == the ledger section (SUB-11) ==
@@ -487,10 +529,8 @@ def published(repo, commit):
     """True when `commit` is on a remote-tracking branch of `origin` (the remote
     the issue links name), so a link to it resolves for someone reading the issue."""
     try:
-        proc = subprocess.run(["git", "-C", repo, "for-each-ref", "--contains", commit, "--count", "1",
-                               "--format", "%(refname)", "refs/remotes/origin"], capture_output=True, text=True,
-                              timeout=60, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                                               "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+        proc = run_git(["for-each-ref", "--contains", commit, "--count", "1", "--format", "%(refname)",
+                        "refs/remotes/origin"], repo, check=False, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0 and bool(proc.stdout.strip())
