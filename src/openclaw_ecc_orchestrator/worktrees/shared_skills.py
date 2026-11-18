@@ -167,11 +167,34 @@ def check_shared_skills(worktree):
     return commit
 
 
-def dirty_shared_skills(worktree):
-    """The post-unit check (SUB-10). Returns DIRTY with a detail when the
-    agent wrote inside the submodule or moved its commit, else None."""
-    if submodule_entry(worktree) is None:
-        return None
+def _gitlink(worktree, rev=None):
+    """The commit pinned at SHARED_PATH in `rev`'s tree, or in the index
+    when `rev` is None; None when there is no gitlink there."""
+    args = ["ls-tree", rev, "--", SHARED_PATH] if rev else ["ls-files", "-s", "--", SHARED_PATH]
+    for line in _git(args, worktree).stdout.splitlines():
+        fields = line.split("\t", 1)[0].split()
+        if fields and fields[0] == "160000":
+            return fields[2] if rev else fields[1]
+    return None
+
+
+def dirty_shared_skills(worktree, reference=None):
+    """The post-unit check (SUB-10). Returns (DIRTY, detail) when the agent
+    wrote inside the submodule or moved its commit, else None. `reference`
+    is a commit whose gitlink the unit must keep (the merge base with the
+    target): a committed or staged gitlink change is then caught even when
+    the agent also moved the submodule checkout to match it."""
+    pinned = _gitlink(worktree, reference) if reference else None
+    if pinned is None:
+        try:
+            if submodule_entry(worktree) is None:
+                return None
+        except SharedSkillsError as exc:
+            return DIRTY, exc.detail
+    else:
+        for label, value in (("committed", _gitlink(worktree, "HEAD")), ("staged", _gitlink(worktree))):
+            if value != pinned:
+                return DIRTY, f"{label} gitlink of {SHARED_PATH} changed from {pinned[:12]} to {value}"
     sub = os.path.join(worktree, SHARED_PATH)
     if not os.path.lexists(os.path.join(sub, ".git")):
         # Not initialized: never run git there, it would report the parent.
@@ -190,4 +213,7 @@ def dirty_shared_skills(worktree):
         return DIRTY, exc.detail
     if not line.startswith(" "):
         return DIRTY, f"{SHARED_PATH} moved off its pinned commit: {line.strip()}"
+    head = _git(["rev-parse", "HEAD"], sub).stdout.strip()
+    if pinned and head != pinned:
+        return DIRTY, f"{SHARED_PATH} checkout is at {head[:12]}, pinned {pinned[:12]}"
     return None

@@ -1034,7 +1034,11 @@ class Conductor:
                                   failure=(reason, R.failure_evidence(reason, log_text=log_text)),
                                   outcome=(reason, cost))
         workspace = unit.get("workspace") or {}
-        dirty = dirty_shared_skills(workspace["path"]) if workspace.get("path") else None
+        dirty = None
+        if workspace.get("path"):
+            reference = run_git(["merge-base", "HEAD", f"refs/heads/{self.target}"], workspace["path"],
+                                check=False).stdout.strip() or workspace.get("base_commit")
+            dirty = dirty_shared_skills(workspace["path"], reference)
         if dirty:  # SUB-10: an edit inside the submodule is lost silently, so it fails the unit
             reason, detail = dirty
             data["shared_skills_dirty"] = detail

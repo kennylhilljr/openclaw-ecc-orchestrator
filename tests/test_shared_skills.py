@@ -224,6 +224,34 @@ class DirtyCheckTests(CatalogMixin, IntegrationBase):
         self.assertEqual(reason, "edit inside shared skills")
         self.assertIn("SKILL.md", detail)
 
+    def test_moved_and_committed_gitlink_is_dirty_against_the_reference(self):
+        """Committing inside the submodule and then the matching parent gitlink is still caught."""
+        pinned = self.consumer(self.repo)
+        wt = self.worktree(self.repo, "moved")
+        base = git(wt, "rev-parse", "HEAD")
+        SS.init_shared_skills(wt)
+        sub = os.path.join(wt, SS.SHARED_PATH)
+        ident = ["-c", "user.email=t@example.invalid", "-c", "user.name=T"]
+        git(sub, *ident, "commit", "-q", "--allow-empty", "-m", "moved")
+        git(wt, "add", SS.SHARED_PATH)
+        git(wt, *ident, "commit", "-q", "-m", "bump")
+        status = subprocess.run(["git", "submodule", "status"], cwd=wt, capture_output=True, text=True).stdout
+        self.assertTrue(status.startswith(" "), "the index matches the checkout")
+        reason, detail = SS.dirty_shared_skills(wt, base)
+        self.assertEqual(reason, "edit inside shared skills")
+        self.assertIn(pinned[:12], detail)
+
+    def test_broken_gitmodules_after_a_unit_is_dirty_not_an_exception(self):
+        self.consumer(self.repo)
+        wt = self.worktree(self.repo, "broke")
+        base = git(wt, "rev-parse", "HEAD")
+        with open(os.path.join(wt, ".gitmodules"), "w") as fh:
+            fh.write(f'[submodule "x"\n\tpath = {SS.SHARED_PATH}\n')
+        self.assertEqual(SS.dirty_shared_skills(wt)[0], "edit inside shared skills")
+        with open(os.path.join(wt, ".gitmodules"), "w") as fh:
+            fh.write("")
+        self.assertIsNone(SS.dirty_shared_skills(wt, base), "uninitialized and untouched is clean")
+
     def _unit_run(self, argv):
         self.consumer(self.repo)
         c, m, _ = self.conductor("c1")
