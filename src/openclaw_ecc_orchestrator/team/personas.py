@@ -152,7 +152,7 @@ def parse_verdict(text, mark, head):
         return None, f"verdict names head {doc.get('head')!r}, not the verified head"
     findings = [f for f in (doc.get("findings") or []) if isinstance(f, dict)]
     doc["findings"] = findings
-    doc["lessons"] = [{"practice": str(x.get("practice") or "")[:200], "lesson": str(x["lesson"])[:1000]}
+    doc["lessons"] = [{"practice": str(x.get("practice") or "")[:200], "lesson": str(x["lesson"])[:4000]}
                       for x in (doc.get("lessons") or []) if isinstance(x, dict) and x.get("lesson")][:10]
     if mark == REVIEW_MARK and doc["verdict"] == "approved" and any(f.get("severity") == "blocker"
                                                                      for f in findings):
@@ -178,8 +178,13 @@ def parse_verdict(text, mark, head):
 STEWARD_MARK = "ECC_STEWARD"
 
 
-def steward_prompt(lessons, ownership, ledger, spec_hint):
-    """The delivery lead as practices steward (TEAM-DELIVERY v7 4.6)."""
+CATALOG_SECTION = "Proposed for the catalog"
+
+
+def steward_prompt(lessons, ownership, ledger, spec_hint, catalog=None):
+    """The delivery lead as practices steward (TEAM-DELIVERY v7 4.6). `ownership`
+    already excludes the shared skills (skills-catalog SUB-11); `catalog` lists
+    the lessons the harness filed under "Proposed for the catalog"."""
     owned = "\n".join(f"- {role}: {', '.join(globs) or '(proposals only)'}" for role, globs in ownership.items())
     items = "\n".join(f"- {x['id']} [{x.get('role')}, {x.get('source')}, unit {x.get('unit') or '-'}]"
                       f"{' (' + x['practice'] + ')' if x.get('practice') else ''}: {x.get('what')}" for x in lessons)
@@ -199,9 +204,16 @@ def steward_prompt(lessons, ownership, ledger, spec_hint):
         "file you changed (or why not), and the rule in one sentence. Create the ledger if it is missing, with "
         "sections \"Applied\" and \"Proposed for the owner\".\n"
         "- Commit on the current branch with a message starting \"Practices:\" that lists the lesson ids. "
-        "Never push or switch branches.",
+        "Never push or switch branches.\n"
+        "- Never edit the shared skills: nothing under .agents/skills/shared (a pinned git submodule of the "
+        "skills catalog) and no .claude/skills/<name> link that points into it, whatever the ownership says. "
+        f"A lesson about a shared skill belongs under \"{CATALOG_SECTION}\" in the ledger; the pipeline "
+        "writes those entries and opens a catalog issue for them, so leave that section as it is.",
         "Who owns which practice files:\n" + owned,
         "Lessons:\n" + items,
+        *([f"Already under \"{CATALOG_SECTION}\" (for context, do not apply):\n" + "\n".join(
+            f"- {e['id']} [skill {e['skill']}, unit {e.get('unit') or '-'}]: {e['lesson']}" for e in catalog)]
+          if catalog else []),
         "End your reply with exactly one line of single-line JSON, nothing after it:\n"
         f'{STEWARD_MARK} {{"applied": ["L0001"], "proposed": ["L0002"], "skipped": ["L0003"]}}',
     ])
