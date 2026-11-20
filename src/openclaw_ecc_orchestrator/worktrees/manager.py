@@ -285,32 +285,55 @@ class WorktreeManager:
                                 if local else ""))
         except (GitError, OSError) as exc:
             checks.append(check("shared_skills_clean", False, str(exc)[-300:]))
-        # Any other initialized submodule, sibling or nested inside the shared one,
-        # is not inspected above, so --force could delete work in it.
-        proc = run_git(["submodule", "status", "--recursive"], worktree, check=False,
-                       config={"submodule.recurse": "false"})
-        others = []
-        for line in proc.stdout.splitlines():
-            if not line.strip():
-                continue
-            fields = line[1:].split()
-            path = fields[1] if len(fields) >= 2 else line.strip()
-            if path == SHARED_PATH:
-                continue
-            full = os.path.join(worktree, path)
-            if line[0] != "-" or (os.path.isdir(full) and os.listdir(full)):
-                others.append(path)
-        checks.append(check("only_shared_submodule_initialized", proc.returncode == 0 and not others,
-                            ",".join(others[:20]) or proc.stderr.strip()[-200:]))
+        # Any other submodule, sibling or nested inside the shared one, is not
+        # inspected above, so --force could delete work in it: an initialized one
+        # or a non-empty folder at its path blocks. Paths come from the index
+        # (NUL separated), so names with spaces or newlines are read whole.
+        others, errors = [], []
+        try:
+            for path in self._gitlinks(worktree):
+                if path != SHARED_PATH and self._occupied(os.path.join(worktree, path)):
+                    others.append(path)
+            for path in self._gitlinks(sub):
+                if self._occupied(os.path.join(sub, path)):
+                    others.append(f"{SHARED_PATH}/{path}")
+        except (GitError, OSError) as exc:
+            errors.append(str(exc)[-200:])
+        checks.append(check("only_shared_submodule_initialized", not others and not errors,
+                            ",".join(others[:20]) or "".join(errors)))
         return checks
+
+    @staticmethod
+    def _gitlinks(repo_dir):
+        """Paths of the gitlinks (submodules) in a checkout's index."""
+        out = run_git(["ls-files", "-s", "-z"], repo_dir).stdout
+        found = []
+        for entry in out.split("\0"):
+            meta, _, path = entry.partition("\t")
+            if meta.startswith("160000 ") and path and path not in found:
+                found.append(path)
+        return found
+
+    @staticmethod
+    def _occupied(path):
+        return os.path.lexists(os.path.join(path, ".git")) or (os.path.isdir(path) and bool(os.listdir(path))) \
+            or (os.path.lexists(path) and not os.path.isdir(path))
 
     @staticmethod
     def _local_commits(sub, pinned):
         objects = git_out(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectname)"], sub)
         commits = [line.split()[1] for line in objects.splitlines() if line.startswith("commit ")]
+        # Shallow boundary commits came from a depth-limited fetch (an earlier
+        # pinned commit, for one, after the target moved the gitlink), never from
+        # local work.
+        published = [pinned]
+        shallow = os.path.join(sub, git_out(["rev-parse", "--git-path", "shallow"], sub))
+        if os.path.isfile(shallow):
+            with open(shallow) as fh:
+                published += [line.strip() for line in fh if len(line.strip()) in (40, 64)]
         local = []
         for i in range(0, len(commits), 500):
-            out = git_out(["rev-list", *commits[i:i + 500], "--not", pinned, "--remotes"], sub)
+            out = git_out(["rev-list", *commits[i:i + 500], "--not", *published, "--remotes"], sub)
             local += [line for line in out.splitlines() if line and line not in local]
         return local
 

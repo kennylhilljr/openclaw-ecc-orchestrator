@@ -30,6 +30,7 @@ from openclaw_ecc_orchestrator.cli import preflight as PF
 from openclaw_ecc_orchestrator.gates.runner import GIT_REFUSED_SUBCOMMANDS, check_command_policy, run_gates
 from openclaw_ecc_orchestrator.merge_queue import queue as Q
 from openclaw_ecc_orchestrator.process.supervisor import Supervisor
+from openclaw_ecc_orchestrator.runs import conductor as C
 from openclaw_ecc_orchestrator.runners.cli_adapters import ClaudeAdapter
 from openclaw_ecc_orchestrator.worktrees import git as G
 from openclaw_ecc_orchestrator.worktrees import shared_skills as SS
@@ -449,6 +450,22 @@ class UnitWorktreeTests(UnitMixin, CatalogMixin, IntegrationBase):
         self.assertTrue(os.path.isdir(unit["workspace"]["path"]), "the workspace is recorded for cleanup")
         self.assertNotIn("shared_skills_commit", unit["workspace"])
 
+    def test_slow_initialization_keeps_the_run_lease(self):
+        """The fetch may outlast the lease; the unit still records and starts."""
+        pinned = self.consumer(self.repo)
+        c, m = self.new_run()
+        real = C.init_shared_skills
+
+        def slow(path):
+            self.clock.t += 600  # far past the 60 s test lease
+            return real(path)
+
+        marker = os.path.join(self.tmp, "seen.txt")
+        with mock.patch.object(C, "init_shared_skills", slow):
+            self.ok(self.drive_to_review(c, "r1", "u1", self.probe_argv(marker)))
+        self.assertEqual(self.read(marker), "True")
+        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], pinned)
+
     def test_repo_without_entry_records_no_commit(self):
         c, m = self.new_run()
         self.ok(self.drive_to_review(c, "r1", "u1", self.argv("write", "a.txt=done")))
@@ -484,6 +501,22 @@ class UnitRestartTests(UnitMixin, CatalogMixin, IntegrationBase):
         c, m = self.new_run()
         path = self.first_attempt_fails(c, m)
         self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], old)
+        new = self.bump_catalog()
+        self.assertNotEqual(new, old)
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.restart(c, marker)
+        self.assertEqual(self.read(marker), "True")
+        ws = self.unit(m)["workspace"]
+        self.assertEqual(ws["shared_skills_commit"], new)
+        self.assertEqual(git(os.path.join(path, SS.SHARED_PATH), "rev-parse", "HEAD"), new)
+        # The old pinned commit stays behind as a shallow fetch tip; it is not local work.
+        git(self.repo, "merge", "-q", "--ff-only", ws["branch"])
+        res = c.worktrees.cleanup("r1", "u1", "main")
+        self.ok(res)
+        self.assertFalse(os.path.exists(path))
+
+    def bump_catalog(self):
+        """Push a new catalog commit and move main's gitlink to it."""
         src = os.path.join(self.tmp, "catalog-src")
         with open(os.path.join(src, "v2.md"), "w") as fh:
             fh.write("v2\n")
@@ -495,13 +528,7 @@ class UnitRestartTests(UnitMixin, CatalogMixin, IntegrationBase):
         git(sub, "checkout", "-q", "origin/main")
         git(self.repo, "add", SS.SHARED_PATH)
         git(self.repo, "commit", "-q", "-m", "bump catalog")
-        new = git(self.repo, "rev-parse", f"HEAD:{SS.SHARED_PATH}")
-        self.assertNotEqual(new, old)
-        marker = os.path.join(self.tmp, "seen.txt")
-        self.restart(c, marker)
-        self.assertEqual(self.read(marker), "True")
-        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], new)
-        self.assertEqual(git(os.path.join(path, SS.SHARED_PATH), "rev-parse", "HEAD"), new)
+        return git(self.repo, "rev-parse", f"HEAD:{SS.SHARED_PATH}")
 
     def test_restart_check_failure_stops_before_the_runner(self):
         self.consumer(self.repo)
@@ -657,6 +684,20 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
         git(ws["path"], *FILE_OK, "submodule", "update", "--init", "-q", "--", "vendor/other")
         self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
                               "only_shared_submodule_initialized")
+
+    def test_cleanup_refuses_files_in_an_uninitialized_sibling_with_a_space(self):
+        def before():
+            other = self.make_catalog(name="other")
+            git(self.repo, *FILE_OK, "submodule", "add", "-q", other, "vendor/other space")
+            git(self.repo, "commit", "-q", "-m", "other")
+        c, ws = self.ready_for_cleanup(before=before)
+        folder = os.path.join(ws["path"], "vendor", "other space")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "notes.log"), "w") as fh:
+            fh.write("x\n")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "only_shared_submodule_initialized")
+        self.assertTrue(os.path.isfile(os.path.join(folder, "notes.log")))
 
     def test_cleanup_refuses_a_nested_submodule_with_ignored_content(self):
         inner = self.make_catalog(name="inner")
