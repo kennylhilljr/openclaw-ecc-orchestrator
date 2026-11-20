@@ -27,6 +27,7 @@ from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.store import iso, valid_identifier
 from .git import GitError, git_out, rev_exists, run_git, toplevel, unique_commits
+from .shared_skills import SHARED_PATH, SharedSkillsError, _gitlink, dirty_shared_skills, submodule_entry
 
 FORBIDDEN_COMPONENTS = {".openclaw", ".git"}
 
@@ -215,6 +216,7 @@ class WorktreeManager:
         info["branch_exists"] = branch_ok
         info["ignored_files"] = []
         info["detached_head"] = None
+        info["shared_skills_initialized"] = False
         if exists:
             untracked, changed, ignored = self._status(p["path"])
             checks.append(check("no_uncommitted_changes", not changed, ",".join(changed[:20])))
@@ -227,6 +229,13 @@ class WorktreeManager:
             # A detached HEAD is allowed; its commits are covered by the orphan check below.
             head_ok = head_ref == f"refs/heads/{p['branch']}" or not head_ref
             checks.append(check("head_on_unit_branch", head_ok, head_ref or "detached"))
+            entry = self._registered().get(os.path.realpath(p["path"])) or {}
+            locked = entry.get("locked")
+            checks.append(check("worktree_not_locked", not locked, "" if locked in (None, True) else str(locked)))
+            sub = os.path.join(p["path"], SHARED_PATH)
+            info["shared_skills_initialized"] = os.path.lexists(os.path.join(sub, ".git"))
+            if info["shared_skills_initialized"]:
+                checks += self._shared_skills_checks(p["path"], sub, target_branch)
         unique = []
         if branch_ok and target_ok:
             unique = unique_commits(self.repo, [f"refs/heads/{p['branch']}"], [f"refs/heads/{target_branch}"])
@@ -235,8 +244,140 @@ class WorktreeManager:
         info["orphaned_commits"] = self._orphaned_commits(p, exists, info["detached_head"]) if target_ok else []
         return checks, info
 
+    def _shared_skills_checks(self, worktree, sub, target_branch):
+        """Checks that let cleanup remove a worktree holding an initialized shared
+        skills submodule with `git worktree remove --force`, which deletes the
+        submodule checkout and its git directory without looking inside. Every
+        failure, including a git error, blocks; archive=True does not cover any
+        of it, because nothing inside the submodule is archived."""
+        checks = []
+        try:
+            top = os.path.realpath(git_out(["rev-parse", "--show-toplevel"], sub))
+            dirty = dirty_shared_skills(worktree)
+            # Explicit flags so submodule config (status.showUntrackedFiles=no and
+            # the like) cannot hide anything; run inside the submodule so the
+            # parent's submodule.<name>.ignore and diff.ignoreSubmodules do not apply.
+            out = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
+                           "--ignore-submodules=none"], sub).stdout
+            untracked, changed, ignored = self._parse_status(out)
+            sub_ignored = [f for f in ignored if not self._regenerable(f)]
+            # Compared directly so parent ignore settings cannot hide a moved HEAD.
+            head = git_out(["rev-parse", "HEAD"], sub)
+            staged, committed = _gitlink(worktree), _gitlink(worktree, "HEAD")
+            moved = not (head == staged == committed)
+            details = [
+                (top != os.path.realpath(sub), f"submodule work tree is {top}"),
+                (bool(dirty), dirty[1] if dirty else ""),
+                (bool(changed), "changed: " + ",".join(changed[:20])),
+                (bool(untracked), "untracked: " + ",".join(untracked[:20])),
+                (bool(sub_ignored), "ignored: " + ",".join(sub_ignored[:20])),
+                (moved, f"moved: HEAD {head[:12]}, staged {staged}, committed {committed}"),
+            ]
+            bad = [d for flag, d in details if flag]
+            checks.append(check("shared_skills_clean", not bad, bad[0] if bad else ""))
+            # Commits made inside the submodule live only in its git directory, which
+            # --force deletes. Every commit object stored there (whatever holds it: a
+            # branch, tag, stash, reflog, ORIG_HEAD, FETCH_HEAD or nothing at all) must
+            # be in the history of a commit the target branch or a parent remote ever
+            # pinned, or of a catalog remote-tracking ref. The unit's own gitlink is
+            # not trusted: the unit branch may pin a commit made right here.
+            local = self._local_commits(sub, self._pinned_history(target_branch))
+            checks.append(check("shared_skills_no_local_commits", not local,
+                                f"{len(local)} commit(s) in {SHARED_PATH} on no remote: {','.join(local[:5])}"
+                                if local else ""))
+        except (GitError, OSError) as exc:
+            checks.append(check("shared_skills_clean", False, str(exc)[-300:]))
+        # Any other submodule, sibling or nested inside the shared one, is not
+        # inspected above, so --force could delete work in it: an initialized one
+        # or a non-empty folder at its path blocks. Paths come from the index
+        # (NUL separated), so names with spaces or newlines are read whole.
+        others, errors = [], []
+        try:
+            for path in self._gitlinks(worktree):
+                if path != SHARED_PATH and self._occupied(os.path.join(worktree, path)):
+                    others.append(path)
+            for path in self._gitlinks(sub):
+                if self._occupied(os.path.join(sub, path)):
+                    others.append(f"{SHARED_PATH}/{path}")
+            others += self._other_module_gitdirs(worktree)
+        except (GitError, OSError, SharedSkillsError) as exc:
+            errors.append(str(exc)[-200:])
+        checks.append(check("only_shared_submodule_initialized", not others and not errors,
+                            ",".join(others[:20]) or "".join(errors)))
+        return checks
+
+    @staticmethod
+    def _gitlinks(repo_dir):
+        """Paths of the gitlinks (submodules) in a checkout's index."""
+        out = run_git(["ls-files", "-s", "-z"], repo_dir).stdout
+        found = []
+        for entry in out.split("\0"):
+            meta, _, path = entry.partition("\t")
+            if meta.startswith("160000 ") and path and path not in found:
+                found.append(path)
+        return found
+
+    @staticmethod
+    def _occupied(path):
+        return os.path.lexists(os.path.join(path, ".git")) or (os.path.isdir(path) and bool(os.listdir(path))) \
+            or (os.path.lexists(path) and not os.path.isdir(path))
+
+    @staticmethod
+    def _other_module_gitdirs(worktree):
+        """Submodule git directories kept in the worktree's administration area
+        other than the shared one, including those nested inside it. A
+        deinitialized submodule leaves an empty folder but keeps its git
+        directory there, and --force deletes it with any commits it holds."""
+        modules = os.path.join(worktree, git_out(["rev-parse", "--git-path", "modules"], worktree))
+        if not os.path.isdir(modules):
+            return []
+        entry = submodule_entry(worktree)
+        shared = entry[0] if entry else None
+        found = []
+        for root, dirs, files in os.walk(modules):
+            if "HEAD" in files and "objects" in dirs:  # a git directory
+                rel = os.path.relpath(root, modules)
+                if root == os.path.join(modules, shared or "\0"):
+                    dirs[:] = ["modules"] if "modules" in dirs else []  # only its nested submodules
+                    continue
+                found.append(f"modules/{rel}")
+                dirs[:] = []
+        return found
+
+    def _pinned_history(self, target_branch):
+        """Every commit the target branch, locally or on a parent remote, ever
+        pinned at SHARED_PATH. Other remote refs are not trusted: a pushed unit
+        branch carries the unit's own gitlink."""
+        out = run_git(["log", f"refs/heads/{target_branch}", f"--remotes=*/{target_branch}", "--format=",
+                       "--raw", "--no-abbrev", "--", SHARED_PATH], self.repo, check=False).stdout
+        pins = []
+        for line in out.splitlines():
+            fields = line.lstrip(":").split("\t", 1)[0].split()
+            for sha in fields[2:4]:
+                if len(sha) in (40, 64) and sha.strip("0") and sha not in pins:
+                    pins.append(sha)
+        return pins
+
+    @staticmethod
+    def _local_commits(sub, pins):
+        objects = git_out(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectname)"], sub)
+        commits = [line.split()[1] for line in objects.splitlines() if line.startswith("commit ")]
+        stored = set(commits)
+        # Only pins present here can be named to rev-list; the shallow file is not
+        # trusted, since a local fetch can write any commit into it.
+        published = [sha for sha in pins if sha in stored]
+        local = []
+        for i in range(0, len(commits), 500):
+            out = git_out(["rev-list", *commits[i:i + 500], "--not", *published, "--remotes"], sub)
+            local += [line for line in out.splitlines() if line and line not in local]
+        return local
+
     def _status(self, path):
         out = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"], path).stdout
+        return self._parse_status(out)
+
+    @staticmethod
+    def _parse_status(out):
         entries = out.split("\0")
         untracked, changed, ignored = [], [], []
         i = 0
@@ -348,7 +489,13 @@ class WorktreeManager:
                                 "detail": f"{len(ignored)} gitignored file(s) in {info['path']} would be deleted; "
                                           "move them or archive=True"})
         n_archive = len(commands)
-        if info["exists"]:
+        if info["exists"] and info.get("shared_skills_initialized"):
+            # git refuses to remove a worktree holding an initialized submodule. One
+            # --force skips only that refusal and git's clean check, which inspect has
+            # just done itself for the parent and the submodule. Never pass it twice:
+            # a second --force would also remove a locked worktree.
+            commands.append(["git", "worktree", "remove", "--force", info["path"]])
+        elif info["exists"]:
             commands.append(["git", "worktree", "remove", info["path"]])
         else:
             commands.append(["git", "worktree", "prune"])
