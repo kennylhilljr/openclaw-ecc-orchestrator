@@ -617,6 +617,27 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
                               "shared_skills_no_local_commits")
         git(sub, "cat-file", "-e", sha + "^{commit}")
 
+    def test_cleanup_refuses_a_submodule_commit_held_only_by_orig_head(self):
+        c, ws = self.ready_for_cleanup()
+        sub = self.sub(ws)
+        pinned = git(sub, "rev-parse", "HEAD")
+        git(sub, *IDENT, "commit", "-q", "--allow-empty", "-m", "local work")
+        sha = git(sub, "rev-parse", "HEAD")
+        git(sub, "reset", "-q", "--hard", pinned)
+        git(sub, "reflog", "expire", "--expire=now", "--all")
+        self.assertEqual(git(sub, "rev-parse", "ORIG_HEAD"), sha)
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+
+    def test_cleanup_refuses_a_dangling_submodule_commit(self):
+        c, ws = self.ready_for_cleanup()
+        sub, sha = self._unpublished_commit(ws)
+        git(sub, "reflog", "expire", "--expire=now", "--all")
+        self.assertEqual(git(sub, "log", "-g", "--format=%H", "HEAD", "--"), "")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+        git(sub, "cat-file", "-e", sha + "^{commit}")
+
     def test_cleanup_refuses_a_stash_inside_the_submodule(self):
         c, ws = self.ready_for_cleanup()
         sub = self.sub(ws)

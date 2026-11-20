@@ -276,10 +276,10 @@ class WorktreeManager:
             bad = [d for flag, d in details if flag]
             checks.append(check("shared_skills_clean", not bad, bad[0] if bad else ""))
             # Commits made inside the submodule live only in its git directory, which
-            # --force deletes: anything a local ref, the stash or a reflog still reaches
-            # that is neither the pinned commit's history nor on the catalog remote.
-            local = git_out(["rev-list", "--all", "--reflog", "--not", committed or head, "--remotes"], sub)
-            local = [line for line in local.splitlines() if line]
+            # --force deletes. Every commit object stored there (whatever holds it: a
+            # branch, tag, stash, reflog, ORIG_HEAD, FETCH_HEAD or nothing at all) must
+            # be in the pinned commit's history or on the catalog remote.
+            local = self._local_commits(sub, committed or head)
             checks.append(check("shared_skills_no_local_commits", not local,
                                 f"{len(local)} commit(s) in {SHARED_PATH} on no remote: {','.join(local[:5])}"
                                 if local else ""))
@@ -303,6 +303,16 @@ class WorktreeManager:
         checks.append(check("only_shared_submodule_initialized", proc.returncode == 0 and not others,
                             ",".join(others[:20]) or proc.stderr.strip()[-200:]))
         return checks
+
+    @staticmethod
+    def _local_commits(sub, pinned):
+        objects = git_out(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectname)"], sub)
+        commits = [line.split()[1] for line in objects.splitlines() if line.startswith("commit ")]
+        local = []
+        for i in range(0, len(commits), 500):
+            out = git_out(["rev-list", *commits[i:i + 500], "--not", pinned, "--remotes"], sub)
+            local += [line for line in out.splitlines() if line and line not in local]
+        return local
 
     def _status(self, path):
         out = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"], path).stdout
