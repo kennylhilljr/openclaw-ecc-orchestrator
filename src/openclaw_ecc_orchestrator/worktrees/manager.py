@@ -27,6 +27,7 @@ from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.store import iso, valid_identifier
 from .git import GitError, git_out, rev_exists, run_git, toplevel, unique_commits
+from .shared_skills import SHARED_PATH, _gitlink, dirty_shared_skills
 
 FORBIDDEN_COMPONENTS = {".openclaw", ".git"}
 
@@ -215,6 +216,7 @@ class WorktreeManager:
         info["branch_exists"] = branch_ok
         info["ignored_files"] = []
         info["detached_head"] = None
+        info["shared_skills_initialized"] = False
         if exists:
             untracked, changed, ignored = self._status(p["path"])
             checks.append(check("no_uncommitted_changes", not changed, ",".join(changed[:20])))
@@ -227,6 +229,13 @@ class WorktreeManager:
             # A detached HEAD is allowed; its commits are covered by the orphan check below.
             head_ok = head_ref == f"refs/heads/{p['branch']}" or not head_ref
             checks.append(check("head_on_unit_branch", head_ok, head_ref or "detached"))
+            entry = self._registered().get(os.path.realpath(p["path"])) or {}
+            locked = entry.get("locked")
+            checks.append(check("worktree_not_locked", not locked, "" if locked in (None, True) else str(locked)))
+            sub = os.path.join(p["path"], SHARED_PATH)
+            info["shared_skills_initialized"] = os.path.lexists(os.path.join(sub, ".git"))
+            if info["shared_skills_initialized"]:
+                checks += self._shared_skills_checks(p["path"], sub)
         unique = []
         if branch_ok and target_ok:
             unique = unique_commits(self.repo, [f"refs/heads/{p['branch']}"], [f"refs/heads/{target_branch}"])
@@ -235,8 +244,72 @@ class WorktreeManager:
         info["orphaned_commits"] = self._orphaned_commits(p, exists, info["detached_head"]) if target_ok else []
         return checks, info
 
+    def _shared_skills_checks(self, worktree, sub):
+        """Checks that let cleanup remove a worktree holding an initialized shared
+        skills submodule with `git worktree remove --force`, which deletes the
+        submodule checkout and its git directory without looking inside. Every
+        failure, including a git error, blocks; archive=True does not cover any
+        of it, because nothing inside the submodule is archived."""
+        checks = []
+        try:
+            top = os.path.realpath(git_out(["rev-parse", "--show-toplevel"], sub))
+            dirty = dirty_shared_skills(worktree)
+            # Explicit flags so submodule config (status.showUntrackedFiles=no and
+            # the like) cannot hide anything; run inside the submodule so the
+            # parent's submodule.<name>.ignore and diff.ignoreSubmodules do not apply.
+            out = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
+                           "--ignore-submodules=none"], sub).stdout
+            untracked, changed, ignored = self._parse_status(out)
+            sub_ignored = [f for f in ignored if not self._regenerable(f)]
+            # Compared directly so parent ignore settings cannot hide a moved HEAD.
+            head = git_out(["rev-parse", "HEAD"], sub)
+            staged, committed = _gitlink(worktree), _gitlink(worktree, "HEAD")
+            moved = not (head == staged == committed)
+            details = [
+                (top != os.path.realpath(sub), f"submodule work tree is {top}"),
+                (bool(dirty), dirty[1] if dirty else ""),
+                (bool(changed), "changed: " + ",".join(changed[:20])),
+                (bool(untracked), "untracked: " + ",".join(untracked[:20])),
+                (bool(sub_ignored), "ignored: " + ",".join(sub_ignored[:20])),
+                (moved, f"moved: HEAD {head[:12]}, staged {staged}, committed {committed}"),
+            ]
+            bad = [d for flag, d in details if flag]
+            checks.append(check("shared_skills_clean", not bad, bad[0] if bad else ""))
+            # Commits made inside the submodule live only in its git directory, which
+            # --force deletes: anything a local ref, the stash or a reflog still reaches
+            # that is neither the pinned commit's history nor on the catalog remote.
+            local = git_out(["rev-list", "--all", "--reflog", "--not", committed or head, "--remotes"], sub)
+            local = [line for line in local.splitlines() if line]
+            checks.append(check("shared_skills_no_local_commits", not local,
+                                f"{len(local)} commit(s) in {SHARED_PATH} on no remote: {','.join(local[:5])}"
+                                if local else ""))
+        except (GitError, OSError) as exc:
+            checks.append(check("shared_skills_clean", False, str(exc)[-300:]))
+        # Any other initialized submodule, sibling or nested inside the shared one,
+        # is not inspected above, so --force could delete work in it.
+        proc = run_git(["submodule", "status", "--recursive"], worktree, check=False,
+                       config={"submodule.recurse": "false"})
+        others = []
+        for line in proc.stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = line[1:].split()
+            path = fields[1] if len(fields) >= 2 else line.strip()
+            if path == SHARED_PATH:
+                continue
+            full = os.path.join(worktree, path)
+            if line[0] != "-" or (os.path.isdir(full) and os.listdir(full)):
+                others.append(path)
+        checks.append(check("only_shared_submodule_initialized", proc.returncode == 0 and not others,
+                            ",".join(others[:20]) or proc.stderr.strip()[-200:]))
+        return checks
+
     def _status(self, path):
         out = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored"], path).stdout
+        return self._parse_status(out)
+
+    @staticmethod
+    def _parse_status(out):
         entries = out.split("\0")
         untracked, changed, ignored = [], [], []
         i = 0
@@ -348,7 +421,13 @@ class WorktreeManager:
                                 "detail": f"{len(ignored)} gitignored file(s) in {info['path']} would be deleted; "
                                           "move them or archive=True"})
         n_archive = len(commands)
-        if info["exists"]:
+        if info["exists"] and info.get("shared_skills_initialized"):
+            # git refuses to remove a worktree holding an initialized submodule. One
+            # --force skips only that refusal and git's clean check, which inspect has
+            # just done itself for the parent and the submodule. Never pass it twice:
+            # a second --force would also remove a locked worktree.
+            commands.append(["git", "worktree", "remove", "--force", info["path"]])
+        elif info["exists"]:
             commands.append(["git", "worktree", "remove", info["path"]])
         else:
             commands.append(["git", "worktree", "prune"])

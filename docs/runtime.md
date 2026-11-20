@@ -218,8 +218,9 @@ Branches are named `ecc/<run_id>/<unit_id>`. Run and unit ids must match
 contain `..`; `create_run` rejects plans with other unit ids.
 
 Cleanup order: inspect (read only), optionally bundle the unique commits and
-verify the bundle, remove the worktree without force, delete the branch,
-delete the marker. The envelope's `rollback_checkpoint` names the bundle and
+verify the bundle, remove the worktree (without force, except as described
+under "Shared skills submodule" below), delete the branch, delete the marker.
+A locked worktree fails the `worktree_not_locked` check instead of raising. The envelope's `rollback_checkpoint` names the bundle and
 a restore command (a git fetch from the bundle into the branch). Every
 mutating call accepts `dry_run=True` and then only reports its plan.
 
@@ -232,8 +233,12 @@ A consumer repository may carry the skills catalog as a git submodule at
 
 - `init_shared_skills(worktree)` runs right after `worktree add` in the
   preflight worktree (`cli/preflight.py`), the merge check fallback and the
-  merge worktree (`merge_queue/queue.py`) and the verifier checkout
-  (`team/review.py`), before any runner or gate starts. It checks that the
+  merge worktree (`merge_queue/queue.py`), the verifier checkout
+  (`team/review.py`) and the unit worktree (`Conductor.start_unit` in
+  `runs/conductor.py`, also on a restart in an existing worktree, after the
+  target is merged in), before any runner or gate starts. A failed check in a
+  unit worktree sends the unit to `needs_user` with reason
+  `shared_skills_failed`; the workspace stays recorded so cleanup can find it. It checks that the
   `.gitmodules` URL is exactly `https://github.com/kennylhilljr/skills-catalog.git`,
   then runs `git submodule update --init --depth 1 -- .agents/skills/shared`
   with `protocol.allow=never`, `protocol.https.allow=always`,
@@ -246,13 +251,24 @@ A consumer repository may carry the skills catalog as a git submodule at
   fails with `submodule URL not allowed` or `shared skills missing` and
   returns the pinned catalog commit. The commit is recorded as
   `shared_skills_commit` in the preflight result, the merge queue history,
-  the unit's `merge` annotation and its `team` annotation.
+  the unit's workspace, the unit's `merge` annotation and its `team`
+  annotation.
 - After a unit's runner exits and before its handoff is accepted, the
   conductor runs `git -C <wt>/.agents/skills/shared status --porcelain`
   (`dirty_shared_skills`). Output, a moved submodule commit, or files in an
   uninitialized submodule folder fail the unit with
   `edit inside shared skills`: such an edit makes no diff in the parent and
   would be lost.
+- `WorktreeManager.cleanup` refuses a worktree whose shared submodule has
+  changed, untracked or non-regenerable ignored files (checked inside the
+  submodule with explicit flags, so `status.showUntrackedFiles` and the
+  parent's submodule ignore settings cannot hide them), whose submodule HEAD
+  differs from the staged or committed gitlink, whose submodule holds commits
+  on no remote that a local branch, tag, the stash or a reflog still reaches,
+  that holds any other initialized submodule (sibling or nested), or that is
+  locked. `archive=True` does not cover any of these. Otherwise it removes
+  the worktree with a single `git worktree remove --force`, since git
+  refuses to remove a worktree that holds an initialized submodule.
 - `submodule` stays in `GIT_REFUSED_SUBCOMMANDS` (`gates/runner.py`), so an
   agent's gate command cannot initialize or update it.
 

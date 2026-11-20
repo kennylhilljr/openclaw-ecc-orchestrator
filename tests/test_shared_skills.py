@@ -396,6 +396,283 @@ class ReviewPathTests(CatalogMixin, TeamBase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "verifier-saw.txt")), "no verifier ran")
 
 
+GITHUB_URL = "https://github.com/kennylhilljr/skills-catalog.git"
+IDENT = ["-c", "user.email=t@example.invalid", "-c", "user.name=T"]
+FILE_OK = ["-c", "protocol.file.allow=always"]
+
+
+class UnitMixin:
+    """Dispatches unit u1 of run r1 and probes what its runner saw."""
+
+    def new_run(self):
+        c, m, _ = self.conductor("c1")
+        u = work_unit("u1", files=["a.txt"], commands=[f"{PY} -c pass"], budget={"attempts": 3})
+        self.ok(c.create_run({"units": [u]}, run_id="r1"))
+        return c, m
+
+    def probe_argv(self, marker):
+        script = (f"import os, runpy, sys; open({marker!r}, 'w').write(str(os.path.isfile({CATALOG_JSON!r}))); "
+                  f"sys.argv = [{self.runner!r}, 'write', 'a.txt=done']; runpy.run_path({self.runner!r})")
+        return [PY, "-c", script]
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def unit(self, m):
+        return m.load("r1")["units"]["u1"]
+
+
+class UnitWorktreeTests(UnitMixin, CatalogMixin, IntegrationBase):
+    def test_dispatched_unit_runner_sees_the_catalog(self):
+        pinned = self.consumer(self.repo)
+        c, m = self.new_run()
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.ok(self.drive_to_review(c, "r1", "u1", self.probe_argv(marker)))
+        self.assertEqual(self.read(marker), "True")
+        unit = self.unit(m)
+        self.assertEqual(unit["workspace"]["shared_skills_commit"], pinned)
+        self.assertEqual(unit["state"], "reviewing")
+
+    def test_check_failure_stops_before_the_runner_and_keeps_the_workspace(self):
+        self.consumer(self.repo)
+        SS.ALLOWED_URL = GITHUB_URL  # restored by the patcher
+        c, m = self.new_run()
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.ok(c.assign_unit("r1", "u1"))
+        res = c.start_unit("r1", "u1", self.probe_argv(marker))
+        self.assertFalse(res["ok"])
+        self.assertIn("shared_skills_failed", self.failed_checks(res))
+        unit = self.unit(m)
+        self.assertEqual((unit["state"], unit["last_reason"]), ("needs_user", "shared_skills_failed"))
+        self.assertFalse(os.path.exists(marker), "the runner never started")
+        self.assertTrue(os.path.isdir(unit["workspace"]["path"]), "the workspace is recorded for cleanup")
+        self.assertNotIn("shared_skills_commit", unit["workspace"])
+
+    def test_repo_without_entry_records_no_commit(self):
+        c, m = self.new_run()
+        self.ok(self.drive_to_review(c, "r1", "u1", self.argv("write", "a.txt=done")))
+        self.assertNotIn("shared_skills_commit", self.unit(m)["workspace"])
+
+
+class UnitRestartTests(UnitMixin, CatalogMixin, IntegrationBase):
+    def first_attempt_fails(self, c, m):
+        self.ok(c.assign_unit("r1", "u1"))
+        self.ok(c.start_unit("r1", "u1", self.argv("fail")))
+        self.assertFalse(c.wait_unit("r1", "u1")["ok"])
+        if self.unit(m)["state"] != "ready":
+            self.ok(m.transition("r1", "c1", "u1", "ready", reason="retry"))
+        return self.unit(m)["workspace"]["path"]
+
+    def restart(self, c, marker):
+        self.ok(c.assign_unit("r1", "u1"))
+        self.ok(c.start_unit("r1", "u1", self.probe_argv(marker)))
+        self.ok(c.wait_unit("r1", "u1"))
+
+    def test_restart_initializes_an_existing_uninitialized_worktree(self):
+        c, m = self.new_run()
+        path = self.first_attempt_fails(c, m)
+        pinned = self.consumer(self.repo)  # lands on main after the worktree exists
+        self.assertFalse(os.path.isfile(os.path.join(path, CATALOG_JSON)))
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.restart(c, marker)
+        self.assertEqual(self.read(marker), "True")
+        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], pinned)
+
+    def test_restart_refreshes_the_commit_after_the_target_moves_the_gitlink(self):
+        old = self.consumer(self.repo)
+        c, m = self.new_run()
+        path = self.first_attempt_fails(c, m)
+        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], old)
+        src = os.path.join(self.tmp, "catalog-src")
+        with open(os.path.join(src, "v2.md"), "w") as fh:
+            fh.write("v2\n")
+        git(src, "add", "-A")
+        git(src, "commit", "-q", "-m", "v2")
+        git(src, "push", "-q", os.path.join(self.tmp, "catalog.git"), "main")
+        sub = os.path.join(self.repo, SS.SHARED_PATH)
+        git(sub, *FILE_OK, "fetch", "-q", "origin")
+        git(sub, "checkout", "-q", "origin/main")
+        git(self.repo, "add", SS.SHARED_PATH)
+        git(self.repo, "commit", "-q", "-m", "bump catalog")
+        new = git(self.repo, "rev-parse", f"HEAD:{SS.SHARED_PATH}")
+        self.assertNotEqual(new, old)
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.restart(c, marker)
+        self.assertEqual(self.read(marker), "True")
+        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], new)
+        self.assertEqual(git(os.path.join(path, SS.SHARED_PATH), "rev-parse", "HEAD"), new)
+
+    def test_restart_check_failure_stops_before_the_runner(self):
+        self.consumer(self.repo)
+        c, m = self.new_run()
+        self.first_attempt_fails(c, m)
+        SS.ALLOWED_URL = GITHUB_URL  # restored by the patcher
+        marker = os.path.join(self.tmp, "seen.txt")
+        self.ok(c.assign_unit("r1", "u1"))
+        res = c.start_unit("r1", "u1", self.probe_argv(marker))
+        self.assertFalse(res["ok"])
+        self.assertIn("shared_skills_failed", self.failed_checks(res))
+        unit = self.unit(m)
+        self.assertEqual((unit["state"], unit["last_reason"]), ("needs_user", "shared_skills_failed"))
+        self.assertFalse(os.path.exists(marker), "the runner never started")
+
+
+class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
+    def ready_for_cleanup(self, consumer=True, before=None):
+        if consumer:
+            self.consumer(self.repo)
+        if before:
+            before()
+        c, m = self.new_run()
+        self.ok(self.drive_to_review(c, "r1", "u1", self.argv("write", "a.txt=done")))
+        ws = self.unit(m)["workspace"]
+        if consumer:
+            # Idempotent; keeps these tests independent of the start_unit change.
+            SS.init_shared_skills(ws["path"])
+        git(self.repo, "merge", "-q", "--ff-only", ws["branch"])  # no unique commits left
+        return c, ws
+
+    def sub(self, ws):
+        return os.path.join(ws["path"], SS.SHARED_PATH)
+
+    def exclude(self, d, pattern):
+        path = os.path.join(d, git(d, "rev-parse", "--git-path", "info/exclude"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(pattern + "\n")
+
+    def assert_preserved(self, res, ws, name):
+        self.assertFalse(res["ok"], res)
+        self.assertIn(name, self.failed_checks(res))
+        self.assertTrue(os.path.isdir(ws["path"]))
+        self.assertNotEqual(git(self.repo, "branch", "--list", ws["branch"]), "")
+        self.assertIn(ws["path"], git(self.repo, "worktree", "list"))
+
+    def test_cleanup_removes_worktree_and_branch(self):
+        c, ws = self.ready_for_cleanup()
+        res = c.worktrees.cleanup("r1", "u1", "main")
+        self.ok(res)
+        self.assertFalse(os.path.exists(ws["path"]))
+        self.assertEqual(git(self.repo, "branch", "--list", ws["branch"]), "")
+        self.assertNotIn(ws["path"], git(self.repo, "worktree", "list"))
+        self.assertIn(["git", "worktree", "remove", "--force", ws["path"]], res["data"]["commands"])
+        self.assertEqual(sum(cmd.count("--force") for cmd in res["data"]["commands"]), 1)
+
+    def test_cleanup_refuses_an_edit_inside_the_submodule(self):
+        c, ws = self.ready_for_cleanup()
+        with open(os.path.join(self.sub(ws), "skills", "demo", "SKILL.md"), "a") as fh:
+            fh.write("edit\n")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws, "shared_skills_clean")
+
+    def test_cleanup_refuses_an_untracked_file_hidden_by_config(self):
+        c, ws = self.ready_for_cleanup()
+        sub = self.sub(ws)
+        git(sub, "config", "status.showUntrackedFiles", "no")
+        git(self.repo, "config", f"submodule.{SS.SHARED_PATH}.ignore", "all")
+        git(self.repo, "config", "diff.ignoreSubmodules", "all")
+        with open(os.path.join(sub, "lesson.md"), "w") as fh:
+            fh.write("x\n")
+        self.assertIsNone(SS.dirty_shared_skills(ws["path"]), "the post-unit check alone misses it")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws, "shared_skills_clean")
+
+    def test_cleanup_refuses_an_ignored_file_inside_the_submodule(self):
+        c, ws = self.ready_for_cleanup()
+        sub = self.sub(ws)
+        self.exclude(sub, "*.log")
+        with open(os.path.join(sub, "notes.log"), "w") as fh:
+            fh.write("x\n")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws, "shared_skills_clean")
+
+    def test_cleanup_refuses_a_moved_submodule_head_hidden_by_config(self):
+        c, ws = self.ready_for_cleanup()
+        git(self.repo, "config", f"submodule.{SS.SHARED_PATH}.ignore", "all")
+        git(self.sub(ws), *IDENT, "commit", "-q", "--allow-empty", "-m", "moved")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws, "shared_skills_clean")
+
+    def _unpublished_commit(self, ws, branch=None):
+        sub = self.sub(ws)
+        pinned = git(sub, "rev-parse", "HEAD")
+        if branch:
+            git(sub, "checkout", "-q", "-b", branch)
+        git(sub, *IDENT, "commit", "-q", "--allow-empty", "-m", "local work")
+        sha = git(sub, "rev-parse", "HEAD")
+        git(sub, "checkout", "-q", "--detach", pinned)  # back on the gitlink: status is clean
+        self.assertEqual(git(sub, "status", "--porcelain"), "")
+        self.assertIsNone(SS.dirty_shared_skills(ws["path"]))
+        return sub, sha
+
+    def test_cleanup_refuses_a_submodule_commit_on_a_local_branch(self):
+        c, ws = self.ready_for_cleanup()
+        sub, sha = self._unpublished_commit(ws, branch="mine")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+        git(sub, "cat-file", "-e", sha + "^{commit}")
+
+    def test_cleanup_refuses_a_submodule_commit_only_in_its_reflog(self):
+        c, ws = self.ready_for_cleanup()
+        sub, sha = self._unpublished_commit(ws)
+        self.assertNotIn(sha, git(sub, "for-each-ref", "--format=%(objectname)"))
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+        git(sub, "cat-file", "-e", sha + "^{commit}")
+
+    def test_cleanup_refuses_a_stash_inside_the_submodule(self):
+        c, ws = self.ready_for_cleanup()
+        sub = self.sub(ws)
+        with open(os.path.join(sub, "skills", "demo", "SKILL.md"), "a") as fh:
+            fh.write("edit\n")
+        git(sub, *IDENT, "stash", "-q")
+        self.assertEqual(git(sub, "status", "--porcelain"), "")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+
+    def test_cleanup_refuses_an_initialized_sibling_submodule(self):
+        def before():
+            other = self.make_catalog(name="other")
+            git(self.repo, *FILE_OK, "submodule", "add", "-q", other, "vendor/other")
+            git(self.repo, "commit", "-q", "-m", "other")
+        c, ws = self.ready_for_cleanup(before=before)
+        git(ws["path"], *FILE_OK, "submodule", "update", "--init", "-q", "--", "vendor/other")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "only_shared_submodule_initialized")
+
+    def test_cleanup_refuses_a_nested_submodule_with_ignored_content(self):
+        inner = self.make_catalog(name="inner")
+        url = self.make_catalog(name="outer")
+        src = os.path.join(self.tmp, "outer-src")
+        git(src, *FILE_OK, "submodule", "add", "-q", inner, "nested")
+        git(src, "commit", "-q", "-m", "nested")
+        git(src, "push", "-q", url[len("file://"):], "main")
+        self.allow(url)
+        self.add_submodule(self.repo, url)
+        c, ws = self.ready_for_cleanup(consumer=False)
+        SS.init_shared_skills(ws["path"])
+        sub = self.sub(ws)
+        git(sub, *FILE_OK, "submodule", "update", "--init", "-q", "--", "nested")
+        nested = os.path.join(sub, "nested")
+        self.exclude(nested, "*.log")
+        with open(os.path.join(nested, "notes.log"), "w") as fh:
+            fh.write("x\n")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "only_shared_submodule_initialized")
+        self.assertTrue(os.path.isfile(os.path.join(nested, "notes.log")))
+
+    def test_cleanup_refuses_a_locked_worktree(self):
+        c, ws = self.ready_for_cleanup()
+        git(self.repo, "worktree", "lock", "--reason", "test", ws["path"])
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main"), ws, "worktree_not_locked")
+
+    def test_plain_worktree_keeps_remove_without_force(self):
+        c, ws = self.ready_for_cleanup(consumer=False)
+        res = c.worktrees.cleanup("r1", "u1", "main", dry_run=True)
+        self.ok(res)
+        self.assertIn(["git", "worktree", "remove", ws["path"]], res["data"]["commands"])
+        self.assertFalse(any("--force" in cmd for cmd in res["data"]["commands"]))
+        self.ok(c.worktrees.cleanup("r1", "u1", "main"))
+        self.assertFalse(os.path.exists(ws["path"]))
+
+
 class RefusedSubcommandTests(unittest.TestCase):
     """SUB-15: only the harness initializes submodules."""
 

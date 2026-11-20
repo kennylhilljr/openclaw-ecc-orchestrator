@@ -55,7 +55,7 @@ from ..routing.selection import review_satisfies, select_reviewer, select_runner
 from ..runners.cli_adapters import git_write_dir
 from ..runners.registry import model_family
 from ..worktrees.git import git_out, rev_exists, run_git
-from ..worktrees.shared_skills import dirty_shared_skills
+from ..worktrees.shared_skills import SharedSkillsError, dirty_shared_skills, init_shared_skills
 from . import repair as R
 from . import state as S
 from .envelope import SCHEMA_VERSION, check, envelope
@@ -648,6 +648,15 @@ class Conductor:
                 f"{', '.join(files)}. Resolve these conflicts first, keeping both sides' intent, commit the merge, "
                 "then continue the unit.")
 
+    @staticmethod
+    def _init_shared_skills(path):
+        """Initialize and check the shared skills submodule in a unit worktree
+        before its runner starts. Returns (commit or None, failure detail or None)."""
+        try:
+            return init_shared_skills(path), None
+        except SharedSkillsError as exc:
+            return None, f"{exc.reason}: {exc.detail}" if exc.detail else exc.reason
+
     def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None, repair_argv=None):
         op = "unit.start"
         run = self.manager.load(run_id)
@@ -666,14 +675,30 @@ class Conductor:
                 return created
             workspace = {"path": created["data"]["path"], "branch": created["data"]["branch"],
                          "base_commit": created["data"]["base_commit"]}
+            commit, failure = self._init_shared_skills(created["data"]["path"])
+            if commit:
+                workspace["shared_skills_commit"] = commit
+            # Recorded even when the check failed, so cleanup can still find the worktree.
             res = self.manager.record_workspace(run_id, self.id, unit_id, workspace)
             if not res["ok"]:
                 return res
+            if failure is not None:
+                return self._needs_user(run_id, unit_id, "shared_skills_failed", failure, op)
         else:
             note = self._sync_with_target(paths["path"])
             if note and "--" in runner_argv:
                 runner_argv = list(runner_argv)
                 runner_argv[-1] = f"{runner_argv[-1]}\n\n{note}"
+            # After the sync: merging the target can move the gitlink.
+            commit, failure = self._init_shared_skills(paths["path"])
+            if failure is not None:
+                return self._needs_user(run_id, unit_id, "shared_skills_failed", failure, op)
+            ws = dict(unit.get("workspace") or {})
+            if commit and ws.get("path") and ws.get("shared_skills_commit") != commit:
+                ws["shared_skills_commit"] = commit
+                res = self.manager.record_workspace(run_id, self.id, unit_id, ws)
+                if not res["ok"]:
+                    return res
         before = None
         if self.git_state_guard is not None:
             try:
