@@ -278,10 +278,10 @@ class WorktreeManager:
             # Commits made inside the submodule live only in its git directory, which
             # --force deletes. Every commit object stored there (whatever holds it: a
             # branch, tag, stash, reflog, ORIG_HEAD, FETCH_HEAD or nothing at all) must
-            # be in the history of the pinned commit, of a commit the target branch or
-            # a parent remote ever pinned, or of a catalog remote-tracking ref.
-            pins = [committed or head] + self._pinned_history(target_branch)
-            local = self._local_commits(sub, pins)
+            # be in the history of a commit the target branch or a parent remote ever
+            # pinned, or of a catalog remote-tracking ref. The unit's own gitlink is
+            # not trusted: the unit branch may pin a commit made right here.
+            local = self._local_commits(sub, self._pinned_history(target_branch))
             checks.append(check("shared_skills_no_local_commits", not local,
                                 f"{len(local)} commit(s) in {SHARED_PATH} on no remote: {','.join(local[:5])}"
                                 if local else ""))

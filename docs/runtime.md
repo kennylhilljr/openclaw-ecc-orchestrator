@@ -265,9 +265,9 @@ A consumer repository may carry the skills catalog as a git submodule at
   parent's submodule ignore settings cannot hide them), whose submodule HEAD
   differs from the staged or committed gitlink, whose submodule stores any
   commit object (held by a branch, tag, the stash, a reflog, `ORIG_HEAD`,
-  `FETCH_HEAD` or nothing at all) outside the history of the pinned commit,
-  of any commit the target branch or a parent remote ever pinned there, and
-  of the catalog remote-tracking refs,
+  `FETCH_HEAD` or nothing at all) outside the history of any commit the
+  target branch or a parent remote ever pinned there and of the catalog
+  remote-tracking refs (the unit branch's own gitlink is not trusted),
   that holds any other initialized submodule, a non-empty folder at another
   submodule's path or another submodule's git directory (sibling or nested,
   including a deinitialized one), or that is locked. `archive=True` does not cover any of these. Otherwise it removes
