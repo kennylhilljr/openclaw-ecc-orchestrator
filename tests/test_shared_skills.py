@@ -711,6 +711,23 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
                               "shared_skills_no_local_commits")
         git(sub, "cat-file", "-e", sha + "^{commit}")
 
+    def test_cleanup_refuses_a_local_commit_pinned_by_the_pushed_unit_branch(self):
+        c, ws = self.ready_for_cleanup()
+        sub = self.sub(ws)
+        git(sub, *IDENT, "commit", "-q", "--allow-empty", "-m", "local catalog work")
+        sha = git(sub, "rev-parse", "HEAD")
+        git(ws["path"], "add", SS.SHARED_PATH)
+        git(ws["path"], *IDENT, "commit", "-q", "-m", "local gitlink")
+        remote = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", remote])
+        git(remote, "init", "-q", "--bare")
+        git(self.repo, "remote", "add", "parent", remote)
+        git(ws["path"], "push", "-q", "parent", ws["branch"])
+        self.assertNotEqual(git(self.repo, "branch", "-r", "--list", "parent/" + ws["branch"]), "")
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+        git(sub, "cat-file", "-e", sha + "^{commit}")
+
     def test_cleanup_refuses_a_stash_inside_the_submodule(self):
         c, ws = self.ready_for_cleanup()
         sub = self.sub(ws)

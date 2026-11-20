@@ -345,10 +345,11 @@ class WorktreeManager:
         return found
 
     def _pinned_history(self, target_branch):
-        """Every commit the target branch or a parent remote ever pinned at
-        SHARED_PATH."""
-        out = run_git(["log", f"refs/heads/{target_branch}", "--remotes", "--format=", "--raw", "--no-abbrev",
-                       "--", SHARED_PATH], self.repo, check=False).stdout
+        """Every commit the target branch, locally or on a parent remote, ever
+        pinned at SHARED_PATH. Other remote refs are not trusted: a pushed unit
+        branch carries the unit's own gitlink."""
+        out = run_git(["log", f"refs/heads/{target_branch}", f"--remotes=*/{target_branch}", "--format=",
+                       "--raw", "--no-abbrev", "--", SHARED_PATH], self.repo, check=False).stdout
         pins = []
         for line in out.splitlines():
             fields = line.lstrip(":").split("\t", 1)[0].split()
