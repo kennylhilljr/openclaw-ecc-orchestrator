@@ -466,6 +466,29 @@ class UnitWorktreeTests(UnitMixin, CatalogMixin, IntegrationBase):
         self.assertEqual(self.read(marker), "True")
         self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], pinned)
 
+    def test_lease_is_renewed_before_initialization(self):
+        """A lease about to expire is renewed before the fetch, so another
+        conductor cannot take the run while it runs."""
+        pinned = self.consumer(self.repo)
+        c, m = self.new_run()
+        _, other, _ = self.conductor("c2")
+        real = C.init_shared_skills
+        taken = []
+
+        def slow(path):
+            self.clock.t += 30
+            taken.append(other.acquire_lease("r1", "c2")["ok"])
+            return real(path)
+
+        self.ok(c.assign_unit("r1", "u1"))
+        self.clock.t += 59  # one second left on the 60 s test lease
+        marker = os.path.join(self.tmp, "seen.txt")
+        with mock.patch.object(C, "init_shared_skills", slow):
+            self.ok(c.start_unit("r1", "u1", self.probe_argv(marker)))
+        self.ok(c.wait_unit("r1", "u1"))
+        self.assertEqual(taken, [False])
+        self.assertEqual(self.unit(m)["workspace"]["shared_skills_commit"], pinned)
+
     def test_repo_without_entry_records_no_commit(self):
         c, m = self.new_run()
         self.ok(self.drive_to_review(c, "r1", "u1", self.argv("write", "a.txt=done")))
@@ -665,6 +688,18 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
                               "shared_skills_no_local_commits")
         git(sub, "cat-file", "-e", sha + "^{commit}")
 
+    def test_cleanup_refuses_a_local_commit_forged_into_the_shallow_file(self):
+        c, ws = self.ready_for_cleanup()
+        sub, sha = self._unpublished_commit(ws, branch="mine")
+        git(sub, "branch", "-q", "-D", "mine")
+        git(sub, *FILE_OK, "fetch", "-q", "--depth=1", ".", sha)
+        git(sub, "reflog", "expire", "--expire=now", "--all")
+        shallow = os.path.join(sub, git(sub, "rev-parse", "--git-path", "shallow"))
+        self.assertIn(sha, self.read(shallow))
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "shared_skills_no_local_commits")
+        git(sub, "cat-file", "-e", sha + "^{commit}")
+
     def test_cleanup_refuses_a_stash_inside_the_submodule(self):
         c, ws = self.ready_for_cleanup()
         sub = self.sub(ws)
@@ -699,7 +734,8 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
                               "only_shared_submodule_initialized")
         self.assertTrue(os.path.isfile(os.path.join(folder, "notes.log")))
 
-    def test_cleanup_refuses_a_nested_submodule_with_ignored_content(self):
+    def nested_catalog(self):
+        """A catalog whose own repository carries a submodule at `nested`."""
         inner = self.make_catalog(name="inner")
         url = self.make_catalog(name="outer")
         src = os.path.join(self.tmp, "outer-src")
@@ -708,6 +744,40 @@ class UnitCleanupTests(UnitMixin, CatalogMixin, IntegrationBase):
         git(src, "push", "-q", url[len("file://"):], "main")
         self.allow(url)
         self.add_submodule(self.repo, url)
+
+    def test_cleanup_refuses_a_deinitialized_sibling_submodule_with_a_local_commit(self):
+        def before():
+            other = self.make_catalog(name="other")
+            git(self.repo, *FILE_OK, "submodule", "add", "-q", other, "vendor/other")
+            git(self.repo, "commit", "-q", "-m", "other")
+        c, ws = self.ready_for_cleanup(before=before)
+        git(ws["path"], *FILE_OK, "submodule", "update", "--init", "-q", "--", "vendor/other")
+        sib = os.path.join(ws["path"], "vendor", "other")
+        git(sib, *IDENT, "commit", "-q", "--allow-empty", "-m", "local work")
+        gitdir = git(sib, "rev-parse", "--absolute-git-dir")
+        git(ws["path"], "submodule", "deinit", "-q", "--force", "--", "vendor/other")
+        self.assertEqual(os.listdir(sib), [])
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "only_shared_submodule_initialized")
+        self.assertTrue(os.path.isdir(gitdir))
+
+    def test_cleanup_refuses_a_deinitialized_nested_submodule(self):
+        self.nested_catalog()
+        c, ws = self.ready_for_cleanup(consumer=False)
+        SS.init_shared_skills(ws["path"])
+        sub = self.sub(ws)
+        git(sub, *FILE_OK, "submodule", "update", "--init", "-q", "--", "nested")
+        nested = os.path.join(sub, "nested")
+        git(nested, *IDENT, "commit", "-q", "--allow-empty", "-m", "local work")
+        gitdir = git(nested, "rev-parse", "--absolute-git-dir")
+        git(sub, "submodule", "deinit", "-q", "--force", "--", "nested")
+        self.assertEqual(os.listdir(nested), [])
+        self.assert_preserved(c.worktrees.cleanup("r1", "u1", "main", archive=True), ws,
+                              "only_shared_submodule_initialized")
+        self.assertTrue(os.path.isdir(gitdir))
+
+    def test_cleanup_refuses_a_nested_submodule_with_ignored_content(self):
+        self.nested_catalog()
         c, ws = self.ready_for_cleanup(consumer=False)
         SS.init_shared_skills(ws["path"])
         sub = self.sub(ws)

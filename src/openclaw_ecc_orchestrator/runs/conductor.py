@@ -648,18 +648,23 @@ class Conductor:
                 f"{', '.join(files)}. Resolve these conflicts first, keeping both sides' intent, commit the merge, "
                 "then continue the unit.")
 
-    def _init_shared_skills(self, run_id, path):
+    def _init_shared_skills(self, run_id, unit_id, path, op):
         """Initialize and check the shared skills submodule in a unit worktree
-        before its runner starts. Returns (commit or None, failure detail or None).
+        before its runner starts. Returns (commit or None, stop envelope or None).
         The fetch may take several minutes (two tries of UPDATE_TIMEOUT), so the
-        run lease is kept alive meanwhile."""
+        lease is renewed first, and kept alive meanwhile; a failed renewal stops
+        before anything is fetched."""
         if not os.path.isfile(os.path.join(path, ".gitmodules")):
             return None, None  # what init_shared_skills returns too, without a heartbeat
+        held, detail = self._keep_lease(run_id, force=True)
+        if not held:
+            return None, envelope(op, ok=False, checks=[check("lease_held", False, detail)])
         with self.lease_heartbeat(run_id):
             try:
                 return init_shared_skills(path), None
             except SharedSkillsError as exc:
-                return None, f"{exc.reason}: {exc.detail}" if exc.detail else exc.reason
+                failure = f"{exc.reason}: {exc.detail}" if exc.detail else exc.reason
+        return None, self._needs_user(run_id, unit_id, "shared_skills_failed", failure, op)
 
     def start_unit(self, run_id, unit_id, runner_argv, extra_env=None, on_line=None, repair_argv=None):
         op = "unit.start"
@@ -684,9 +689,9 @@ class Conductor:
             res = self.manager.record_workspace(run_id, self.id, unit_id, workspace)
             if not res["ok"]:
                 return res
-            commit, failure = self._init_shared_skills(run_id, created["data"]["path"])
-            if failure is not None:
-                return self._needs_user(run_id, unit_id, "shared_skills_failed", failure, op)
+            commit, stop = self._init_shared_skills(run_id, unit_id, created["data"]["path"], op)
+            if stop is not None:
+                return stop
             if commit:
                 workspace["shared_skills_commit"] = commit
                 res = self.manager.record_workspace(run_id, self.id, unit_id, workspace)
@@ -698,9 +703,9 @@ class Conductor:
                 runner_argv = list(runner_argv)
                 runner_argv[-1] = f"{runner_argv[-1]}\n\n{note}"
             # After the sync: merging the target can move the gitlink.
-            commit, failure = self._init_shared_skills(run_id, paths["path"])
-            if failure is not None:
-                return self._needs_user(run_id, unit_id, "shared_skills_failed", failure, op)
+            commit, stop = self._init_shared_skills(run_id, unit_id, paths["path"], op)
+            if stop is not None:
+                return stop
             ws = dict(unit.get("workspace") or {})
             if commit and ws.get("path") and ws.get("shared_skills_commit") != commit:
                 ws["shared_skills_commit"] = commit

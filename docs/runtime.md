@@ -265,10 +265,12 @@ A consumer repository may carry the skills catalog as a git submodule at
   parent's submodule ignore settings cannot hide them), whose submodule HEAD
   differs from the staged or committed gitlink, whose submodule stores any
   commit object (held by a branch, tag, the stash, a reflog, `ORIG_HEAD`,
-  `FETCH_HEAD` or nothing at all) outside the pinned commit's history, the
-  remote refs and the shallow boundary,
-  that holds any other initialized submodule or a non-empty folder at another
-  submodule's path (sibling or nested), or that is locked. `archive=True` does not cover any of these. Otherwise it removes
+  `FETCH_HEAD` or nothing at all) outside the history of the pinned commit,
+  of any commit the target branch or a parent remote ever pinned there, and
+  of the catalog remote-tracking refs,
+  that holds any other initialized submodule, a non-empty folder at another
+  submodule's path or another submodule's git directory (sibling or nested,
+  including a deinitialized one), or that is locked. `archive=True` does not cover any of these. Otherwise it removes
   the worktree with a single `git worktree remove --force`, since git
   refuses to remove a worktree that holds an initialized submodule.
 - `submodule` stays in `GIT_REFUSED_SUBCOMMANDS` (`gates/runner.py`), so an

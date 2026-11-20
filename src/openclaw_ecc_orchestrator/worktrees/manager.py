@@ -27,7 +27,7 @@ from ..runs.envelope import SCHEMA_VERSION, check, envelope
 from ..runs.fsutil import atomic_write_json
 from ..runs.store import iso, valid_identifier
 from .git import GitError, git_out, rev_exists, run_git, toplevel, unique_commits
-from .shared_skills import SHARED_PATH, _gitlink, dirty_shared_skills
+from .shared_skills import SHARED_PATH, SharedSkillsError, _gitlink, dirty_shared_skills, submodule_entry
 
 FORBIDDEN_COMPONENTS = {".openclaw", ".git"}
 
@@ -235,7 +235,7 @@ class WorktreeManager:
             sub = os.path.join(p["path"], SHARED_PATH)
             info["shared_skills_initialized"] = os.path.lexists(os.path.join(sub, ".git"))
             if info["shared_skills_initialized"]:
-                checks += self._shared_skills_checks(p["path"], sub)
+                checks += self._shared_skills_checks(p["path"], sub, target_branch)
         unique = []
         if branch_ok and target_ok:
             unique = unique_commits(self.repo, [f"refs/heads/{p['branch']}"], [f"refs/heads/{target_branch}"])
@@ -244,7 +244,7 @@ class WorktreeManager:
         info["orphaned_commits"] = self._orphaned_commits(p, exists, info["detached_head"]) if target_ok else []
         return checks, info
 
-    def _shared_skills_checks(self, worktree, sub):
+    def _shared_skills_checks(self, worktree, sub, target_branch):
         """Checks that let cleanup remove a worktree holding an initialized shared
         skills submodule with `git worktree remove --force`, which deletes the
         submodule checkout and its git directory without looking inside. Every
@@ -278,8 +278,10 @@ class WorktreeManager:
             # Commits made inside the submodule live only in its git directory, which
             # --force deletes. Every commit object stored there (whatever holds it: a
             # branch, tag, stash, reflog, ORIG_HEAD, FETCH_HEAD or nothing at all) must
-            # be in the pinned commit's history or on the catalog remote.
-            local = self._local_commits(sub, committed or head)
+            # be in the history of the pinned commit, of a commit the target branch or
+            # a parent remote ever pinned, or of a catalog remote-tracking ref.
+            pins = [committed or head] + self._pinned_history(target_branch)
+            local = self._local_commits(sub, pins)
             checks.append(check("shared_skills_no_local_commits", not local,
                                 f"{len(local)} commit(s) in {SHARED_PATH} on no remote: {','.join(local[:5])}"
                                 if local else ""))
@@ -297,7 +299,8 @@ class WorktreeManager:
             for path in self._gitlinks(sub):
                 if self._occupied(os.path.join(sub, path)):
                     others.append(f"{SHARED_PATH}/{path}")
-        except (GitError, OSError) as exc:
+            others += self._other_module_gitdirs(worktree)
+        except (GitError, OSError, SharedSkillsError) as exc:
             errors.append(str(exc)[-200:])
         checks.append(check("only_shared_submodule_initialized", not others and not errors,
                             ",".join(others[:20]) or "".join(errors)))
@@ -320,17 +323,48 @@ class WorktreeManager:
             or (os.path.lexists(path) and not os.path.isdir(path))
 
     @staticmethod
-    def _local_commits(sub, pinned):
+    def _other_module_gitdirs(worktree):
+        """Submodule git directories kept in the worktree's administration area
+        other than the shared one, including those nested inside it. A
+        deinitialized submodule leaves an empty folder but keeps its git
+        directory there, and --force deletes it with any commits it holds."""
+        modules = os.path.join(worktree, git_out(["rev-parse", "--git-path", "modules"], worktree))
+        if not os.path.isdir(modules):
+            return []
+        entry = submodule_entry(worktree)
+        shared = entry[0] if entry else None
+        found = []
+        for root, dirs, files in os.walk(modules):
+            if "HEAD" in files and "objects" in dirs:  # a git directory
+                rel = os.path.relpath(root, modules)
+                if root == os.path.join(modules, shared or "\0"):
+                    dirs[:] = ["modules"] if "modules" in dirs else []  # only its nested submodules
+                    continue
+                found.append(f"modules/{rel}")
+                dirs[:] = []
+        return found
+
+    def _pinned_history(self, target_branch):
+        """Every commit the target branch or a parent remote ever pinned at
+        SHARED_PATH."""
+        out = run_git(["log", f"refs/heads/{target_branch}", "--remotes", "--format=", "--raw", "--no-abbrev",
+                       "--", SHARED_PATH], self.repo, check=False).stdout
+        pins = []
+        for line in out.splitlines():
+            fields = line.lstrip(":").split("\t", 1)[0].split()
+            for sha in fields[2:4]:
+                if len(sha) in (40, 64) and sha.strip("0") and sha not in pins:
+                    pins.append(sha)
+        return pins
+
+    @staticmethod
+    def _local_commits(sub, pins):
         objects = git_out(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectname)"], sub)
         commits = [line.split()[1] for line in objects.splitlines() if line.startswith("commit ")]
-        # Shallow boundary commits came from a depth-limited fetch (an earlier
-        # pinned commit, for one, after the target moved the gitlink), never from
-        # local work.
-        published = [pinned]
-        shallow = os.path.join(sub, git_out(["rev-parse", "--git-path", "shallow"], sub))
-        if os.path.isfile(shallow):
-            with open(shallow) as fh:
-                published += [line.strip() for line in fh if len(line.strip()) in (40, 64)]
+        stored = set(commits)
+        # Only pins present here can be named to rev-list; the shallow file is not
+        # trusted, since a local fetch can write any commit into it.
+        published = [sha for sha in pins if sha in stored]
         local = []
         for i in range(0, len(commits), 500):
             out = git_out(["rev-list", *commits[i:i + 500], "--not", *published, "--remotes"], sub)
