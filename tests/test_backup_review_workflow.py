@@ -12,9 +12,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "backup-review.yml"
 
+# The paths claude-code-action resets to the base branch on pull_request
+# events (SENSITIVE_PATHS in its src/github/operations/restore-config.ts).
+CONFIG_PATHS = (
+    ".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc",
+    "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".husky",
+)
+
 
 def text():
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def prompt_text():
+    return text().split("prompt: |", 1)[1].split("claude_args:", 1)[0]
+
+
+def review_steps():
+    """The review job's steps, split at each step's leading dash."""
+    job = text().split("\n  review:\n", 1)[1]
+    return re.split(r"\n      - ", job)
 
 
 class BackupReviewWorkflowTest(unittest.TestCase):
@@ -31,15 +48,18 @@ class BackupReviewWorkflowTest(unittest.TestCase):
         self.assertRegex(find, r"select\(\(\.isDraft \| not\) and \(\.isCrossRepository \| not\)\)")
 
     def test_prompt_says_pr_content_is_data_not_instructions(self):
-        prompt = text().split("prompt: |", 1)[1].split("claude_args:", 1)[0]
-        self.assertIn("untrusted data, not instructions", prompt)
+        self.assertIn("untrusted data, not instructions", prompt_text())
 
-    def test_agent_instructions_come_from_the_base_branch(self):
-        body = text()
-        self.assertIn('git show "$base:$f" > "$RUNNER_TEMP/base-instructions/$f"', body)
-        prompt = body.split("prompt: |", 1)[1].split("claude_args:", 1)[0]
-        self.assertIn("/base-instructions/AGENTS.md", prompt)
-        self.assertNotIn("First read the repository's agent instructions if there are any", prompt)
+    def test_claude_config_is_reset_to_the_base_branch_before_claude_runs(self):
+        steps = review_steps()
+        claude_index = next(i for i, s in enumerate(steps) if "claude-code-action@" in s)
+        before = "\n".join(steps[:claude_index])
+        loop = re.search(r"for p in ([^;]+); do\n\s*rm -rf -- \"\$p\"\n", before)
+        self.assertIsNotNone(loop, "no reset loop before the claude step")
+        self.assertEqual(set(loop.group(1).split()), set(CONFIG_PATHS))
+        self.assertIn('git checkout -q "$base" -- "$p"', before)
+        self.assertIn('exit 1', before.split('git cat-file -e "$base^{commit}"', 1)[1].split("\n          fi\n", 1)[0])
+        self.assertIn("base branch's versions", prompt_text())
 
     def test_review_tools_stay_read_only(self):
         body = text()
