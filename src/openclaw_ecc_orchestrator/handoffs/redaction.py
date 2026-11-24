@@ -206,10 +206,40 @@ def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     return spans
 
 
+# A JSON object key made of camelCase words whose value is a number, such as
+# Claude Code's "cacheCreationEphemeral1hInputTokens": 60157 in modelUsage.
+# Long counter names like that score above the entropy threshold. The
+# exemption is narrow: a lowercase first word, then at least three
+# capitalized words, at most two digits in all (each digit group one digit and
+# at most one lowercase letter, like "1h"), no runs of capitals, and a numeric
+# value. Random tokens have runs of capitals or many digits, so they still go
+# through the entropy check.
+_CAMEL_WORDS_RE = re.compile(r"[a-z]+(?:[A-Z][a-z]+|[0-9][a-z]?)*")
+_NUMERIC_KEY_END_RE = re.compile(r'\\*"\s*:\s*-?\d')
+_MIN_CAMEL_WORDS = 3
+_MAX_KEY_DIGITS = 2
+
+
+def _numeric_counter_key(m: "re.Match[str]") -> bool:
+    text, start, end = m.string, m.start(), m.end()
+    token = m.group(0)
+    if start == 0 or text[start - 1] != '"':
+        return False
+    if not _CAMEL_WORDS_RE.fullmatch(token):
+        return False
+    if sum(c.isupper() for c in token) < _MIN_CAMEL_WORDS:
+        return False
+    if sum(c.isdigit() for c in token) > _MAX_KEY_DIGITS:
+        return False
+    return _NUMERIC_KEY_END_RE.match(text, end) is not None
+
+
 def _detect_spans(text: str) -> list[tuple[int, int]]:
     spans = [m.span() for m in _PREFIX_RE.finditer(text)]
     spans += [m.span() for m in _PEM_BLOCK_RE.finditer(text)]
     for m in _TOKEN_RE.finditer(text):
+        if _numeric_counter_key(m):
+            continue
         spans.extend(_entropy_spans(m))
     return spans
 
@@ -317,6 +347,8 @@ def inspection_findings(texts: Iterable[object], secrets: Iterable[str] = ()) ->
             findings.append({"text": index, "kind": "credential_pattern"})
         opaque = [m.span(1) for m in _OPAQUE_VALUE_RE.finditer(text)]
         for m in _TOKEN_RE.finditer(text):
+            if _numeric_counter_key(m):
+                continue
             hits = [span for span in _entropy_spans(m)
                     if not any(start <= span[0] and span[1] <= end for start, end in opaque)]
             if hits:
