@@ -294,5 +294,55 @@ class BranchNameTests(unittest.TestCase):
         self.assertEqual(scan_strings(doc), [])
 
 
+class CounterKeyTests(unittest.TestCase):
+    """Long camelCase usage counter keys with numeric values are not secrets."""
+
+    # Built at runtime so the source holds no literal random token.
+    FAKE = "".join("aZ9kQ7mX2pL4vR8tW1yB6nC3dF5gH0jK"[i % 32] for i in range(40))
+
+    def result_line(self, extra=""):
+        usage = {"inputTokens": 2, "cacheCreationEphemeral5mInputTokens": 0,
+                 "cacheCreationEphemeral1hInputTokens": 60157}
+        line = json.dumps({"type": "result", "modelUsage": {"claude-haiku-5-5": usage}})
+        return line[:-1] + extra + "}"
+
+    def test_counter_keys_are_not_findings(self):
+        self.assertEqual(redaction.inspection_findings([self.result_line()]), [])
+
+    def test_counter_keys_stay_visible_when_redacting(self):
+        text = self.result_line()
+        self.assertEqual(redaction.redact_text(text), text)
+
+    def test_escaped_json_counter_key(self):
+        text = json.dumps(self.result_line())  # the line inside a JSON string
+        self.assertEqual(redaction.inspection_findings([text]), [])
+
+    def test_random_string_value_still_caught(self):
+        text = self.result_line(', "blob": "%s"' % self.FAKE)
+        kinds = [f["kind"] for f in redaction.inspection_findings([text])]
+        self.assertIn("high_entropy", kinds)
+
+    def test_random_key_with_number_still_caught(self):
+        text = '{"%s": 1}' % self.FAKE
+        kinds = [f["kind"] for f in redaction.inspection_findings([text])]
+        self.assertIn("high_entropy", kinds)
+
+    def test_digit_separated_key_still_caught(self):
+        # Splits into camelCase-like pieces, but its many digits mark it random.
+        key = "".join("%s%d%s" % (c, i % 10, c.upper()) for i, c in enumerate("bcdfghjkmnpqr"))
+        text = '{"%s": 1}' % key
+        kinds = [f["kind"] for f in redaction.inspection_findings([text])]
+        self.assertIn("high_entropy", kinds)
+
+    def test_double_escaped_counter_key(self):
+        text = json.dumps(json.dumps(self.result_line()))
+        self.assertEqual(redaction.inspection_findings([text]), [])
+
+    def test_camel_key_with_string_value_still_caught(self):
+        text = '{"cacheCreationEphemeral1hInputTokens": "x"}'
+        kinds = [f["kind"] for f in redaction.inspection_findings([text])]
+        self.assertIn("high_entropy", kinds)
+
+
 if __name__ == "__main__":
     unittest.main()
