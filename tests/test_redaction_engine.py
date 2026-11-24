@@ -344,5 +344,79 @@ class CounterKeyTests(unittest.TestCase):
         self.assertIn("high_entropy", kinds)
 
 
+class DottedTempPathTests(unittest.TestCase):
+    """mktemp names such as /tmp/ecc-check.Ab3Xy9 split at the dot (issue 57)."""
+
+    FAKE = "Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5Ws0Ye"
+    ROOTS = ("/tmp/ecc-check.Ab3Xy9", "/private/tmp/ecc-check.Ab3Xy9")
+    TAILS = ("/xdg-state/openclaw-ecc-orchestrator",
+             "/xdg-state/openclaw-ecc-orchestrator/backups/backup-20261117T120000Z",
+             "/xdg-state/openclaw-ecc-orchestrator/archive/run-20261117T120000Z.tar.gz",
+             "/gates/unit-implementation-01/output.log")
+
+    def benign_forms(self):
+        for root in self.ROOTS:
+            for tail in self.TAILS:
+                path = root + tail
+                yield path
+                yield "state_dir=" + path
+                yield json.dumps({"state_dir": path})
+                yield json.dumps(json.dumps({"output_tail": "wrote " + path + "\n"}))
+
+    def test_dotted_temp_paths_are_not_secrets(self):
+        r = Redactor()
+        for text in self.benign_forms():
+            with self.subTest(text=text):
+                self.assertFalse(contains_secret(text))
+                self.assertEqual(r.redact(text), text)
+
+    def test_repeated_dotted_directories(self):
+        text = "/tmp/ecc-check.Ab3Xy9/sub.Qm4Zt8/more.Wv7Kp2/xdg-state/openclaw-ecc-orchestrator"
+        self.assertFalse(contains_secret(text))
+        self.assertEqual(Redactor().redact(text), text)
+
+    def test_random_segment_after_dot_still_caught(self):
+        for text in ("/tmp/ecc-check.%s" % self.FAKE,
+                     "/tmp/ecc-check.Ab3Xy9/%s/x" % self.FAKE,
+                     "/tmp/ecc-check.Ab3Xy9/sub.%s/x" % self.FAKE):
+            with self.subTest(text=text):
+                self.assertTrue(contains_secret(text))
+                self.assertNotIn(self.FAKE, Redactor().redact(text))
+
+    def test_known_credentials_inside_dotted_paths_still_caught(self):
+        for label, secret in SAMPLES.items():
+            text = "/tmp/ecc-check.Ab3Xy9/%s/file" % secret
+            with self.subTest(label=label):
+                self.assertTrue(contains_secret(text))
+                self.assertNotIn(secret, Redactor().redact(text))
+
+    def test_registered_literal_inside_dotted_path_still_masked(self):
+        r = Redactor()
+        r.add_secret("hunter2-literal")
+        out = r.redact("/tmp/ecc-check.Ab3Xy9/hunter2-literal/x")
+        self.assertNotIn("hunter2-literal", out)
+
+    def test_unrelated_dotted_text_is_not_exempt(self):
+        secret = "Xq7Lp2Zr9Vt4/Mb8Nc1Kd6Hf3Jg5Ws0Ye/Ab3Xy9"  # gitleaks:allow (fake)
+        for text in ("config.%s" % secret,
+                     "relative/dir.%s" % secret,
+                     "foo/tmp/x.%s" % secret):
+            with self.subTest(text=text):
+                self.assertTrue(contains_secret(text))
+                self.assertNotIn(secret, Redactor().redact(text))
+
+    def test_whitespace_and_quotes_break_path_context(self):
+        secret = "Xq7Lp2Zr9Vt4/Mb8Nc1Kd6Hf3Jg5Ws0Ye/Ab3Xy9"  # gitleaks:allow (fake)
+        for text in ("/tmp/ecc-check.Ab3Xy9 other.%s" % secret,
+                     "/tmp/ecc-check.Ab3Xy9\tother.%s" % secret,
+                     '"/tmp/ecc-check.Ab3Xy9" "x.%s"' % secret,
+                     "'/tmp/a' b.%s" % secret,
+                     "/tmp/a=b.%s" % secret,
+                     "/tmp/a:b.%s" % secret):
+            with self.subTest(text=text):
+                self.assertTrue(contains_secret(text))
+                self.assertNotIn(secret, Redactor().redact(text))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -167,12 +167,33 @@ def _branch_spans(m: "re.Match[str]") -> list[tuple[int, int]] | None:
     return None
 
 
+_PATH_RUN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-/")
+_PATH_LOOKBACK = 4096
+
+
 def _continues_path(m: "re.Match[str]") -> bool:
-    """True when the token resumes an absolute path right after a hidden
-    directory's dot ("/.local/share/..." splits at the dot, so the rest no
-    longer starts at a path root). A credential is never preceded by "/."."""
-    i = m.start()
-    return i >= 2 and m.string[i - 1] == "." and m.string[i - 2] == "/"
+    """True when the token resumes an absolute path right after a dot.
+
+    The token pattern has no ".", so a path splits there and the rest no longer
+    starts at a path root: a hidden directory ("/.local/share/...") or a dotted
+    name such as mktemp's "/tmp/ecc-check.Ab3Xy9/xdg-state/...". A credential is
+    never preceded by "/.". For any other dot, the text before it must be an
+    unbroken run of path characters (no whitespace, quotes, "=" or ":") that
+    starts at a known path root, so a separate value after a path is not exempt.
+    """
+    text, i = m.string, m.start()
+    if i < 2 or text[i - 1] != ".":
+        return False
+    if text[i - 2] == "/":
+        return True
+    j = i - 1
+    floor = max(0, j - _PATH_LOOKBACK)
+    while j > floor and text[j - 1] in _PATH_RUN_CHARS:
+        j -= 1
+    if j > floor or j == 0:
+        return any(text.startswith(root, j) and j + len(root) <= i - 1 for root in _PATH_ROOTS)
+    return False
 
 
 # Repository-relative file paths (for example docs/prd/components/PRD-platform-v3.md)
