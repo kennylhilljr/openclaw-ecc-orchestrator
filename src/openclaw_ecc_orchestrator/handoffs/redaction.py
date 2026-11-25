@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 REDACTED = "[REDACTED]"
 MASK = REDACTED
@@ -118,8 +118,123 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 # /private/var/folders/6j/8_5x46rs.../T/tmpabc (mixed case, digits, slashes)
 # reads as one random token and gets masked. A segment that is itself long
 # and random is still masked, and the credential prefix rules apply anywhere.
+# A standard base64 credential can contain "/", so its pieces may each be
+# shorter than 32 characters. Adjacent pieces made of base64 characters form
+# a chain: strong pieces (upper and lower case, not word like) joined by
+# filler pieces (1 to 3 characters, or other non word like base64 runs), never
+# two fillers in a row. A chain must start and end on a strong piece or on a
+# short piece that is not plain lowercase, so root names such as "tmp" never
+# join one. Every window of up to 8 pieces of a chain that reaches 32
+# characters is also judged, and when one is random and changes character
+# class as often as base64 does, the whole chain is masked. Word like
+# segments, segments with "-", "_" or ".", and two fillers in a row end a
+# chain, so temp, venv, repository, CamelCase and acronym heavy paths such as
+# /var/folders/6j/<id>/T/tmpabc or /opt/JSON2XML/CLI3 stay visible.
 _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
+
+_PIECE_CHARS_RE = re.compile(r"[A-Za-z0-9+=]+")
+_WORD_RUN_RE = re.compile(r"[a-z]{3,}")
+_CHAIN_MIN_LEN = 32
+_CHAIN_MAX_PIECES = 8
+# Random base64 changes between upper case, lower case and digits about every
+# 1.5 characters. CamelCase directory names such as GitHub/MyHTTP2Client/JSONParser4
+# keep one class for longer, so a window whose class runs average more than
+# this is not judged random.
+_CHAIN_MAX_MEAN_RUN = 2.0
+
+
+def _char_class(ch: str) -> str:
+    return "u" if ch.isupper() else "l" if ch.islower() else "d" if ch.isdigit() else "o"
+
+
+def _choppy(window: str) -> bool:
+    """True when character classes change as often as in random base64."""
+    text = window.replace("/", "")
+    if not text:
+        return False
+    runs = 1 + sum(_char_class(a) != _char_class(b) for a, b in zip(text, text[1:]))
+    return len(text) <= _CHAIN_MAX_MEAN_RUN * runs
+
+
+def _word_like(segment: str) -> bool:
+    return 2 * sum(len(w) for w in _WORD_RUN_RE.findall(segment)) >= len(segment)
+
+
+def _strong_piece(segment: str) -> bool:
+    """A path segment that looks like a piece of a slash split random token."""
+    return (len(segment) >= 4 and _PIECE_CHARS_RE.fullmatch(segment) is not None
+            and re.search(r"[A-Z]", segment) is not None
+            and re.search(r"[a-z]", segment) is not None
+            and not _word_like(segment))
+
+
+def _short_piece(segment: str) -> bool:
+    return 1 <= len(segment) <= 3 and _PIECE_CHARS_RE.fullmatch(segment) is not None
+
+
+def _filler_piece(segment: str) -> bool:
+    """A piece that may sit between strong pieces: empty (from "//"), short,
+    or a base64 run without the mixed case of a strong piece ("mb8n", "MB8N")."""
+    if segment == "" or _short_piece(segment):
+        return True
+    return (len(segment) >= 4 and _PIECE_CHARS_RE.fullmatch(segment) is not None
+            and not _word_like(segment) and not _strong_piece(segment))
+
+
+def _chain_end(segment: str) -> bool:
+    return segment != "" and (_strong_piece(segment)
+                              or (_short_piece(segment) and not segment.islower()))
+
+
+class _Piece(NamedTuple):
+    start: int
+    end: int
+    text: str
+
+
+def _chains(pieces: list[_Piece]) -> list[list[_Piece]]:
+    """Runs of strong pieces and single fillers, trimmed to start and end on
+    a chain end, holding at least two pieces and at least one strong piece."""
+    runs: list[list[_Piece]] = [[]]
+    for piece in pieces:
+        if _strong_piece(piece.text):
+            runs[-1].append(piece)
+        elif _filler_piece(piece.text):
+            if runs[-1] and not _strong_piece(runs[-1][-1].text):
+                runs.append([])
+            runs[-1].append(piece)
+        else:
+            runs.append([])
+    chains = []
+    for run in runs:
+        while run and not _chain_end(run[0].text):
+            run.pop(0)
+        while run and not _chain_end(run[-1].text):
+            run.pop()
+        if len(run) >= 2 and any(_strong_piece(p.text) for p in run):
+            chains.append(run)
+    return chains
+
+
+def _chain_spans(m: "re.Match[str]", pieces: list[_Piece]) -> list[tuple[int, int]]:
+    """Spans of chains holding a random window of at least 32 characters.
+
+    Every window of 2 to _CHAIN_MAX_PIECES adjacent pieces that reaches the
+    minimum length is judged, so padding before or after a credential cannot
+    dilute it. A window must also be choppy (see _CHAIN_MAX_MEAN_RUN). A
+    random window masks its whole chain, so no piece of the credential is
+    left visible.
+    """
+    spans = []
+    for chain in _chains(pieces):
+        windows = (m.string[chain[i].start:chain[j].end]
+                   for i in range(len(chain))
+                   for j in range(i + 1, min(len(chain), i + _CHAIN_MAX_PIECES))
+                   if chain[j].end - chain[i].start >= _CHAIN_MIN_LEN)
+        if any(_is_high_entropy(w) and _choppy(w) for w in windows):
+            spans.append((chain[0].start, chain[-1].end))
+    return spans
 
 
 def _path_start(token: str) -> int:
@@ -220,10 +335,13 @@ def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     if len(head) >= 32 and _is_high_entropy(head):
         spans.append((m.start(), m.start() + start))
     offset = m.start() + start
+    pieces = []
     for segment in token[start:].split("/"):
         if len(segment) >= 32 and _is_high_entropy(segment):
             spans.append((offset, offset + len(segment)))
+        pieces.append(_Piece(offset, offset + len(segment), segment))
         offset += len(segment) + 1
+    spans.extend(_chain_spans(m, pieces))
     return spans
 
 

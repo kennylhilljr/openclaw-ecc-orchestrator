@@ -418,5 +418,99 @@ class DottedTempPathTests(unittest.TestCase):
                 self.assertNotIn(secret, Redactor().redact(text))
 
 
+class PathSegmentWindowTests(unittest.TestCase):
+    """Slash split credentials under a path root (issue 64, follow-up to issue 57)."""
+
+    P1 = "Xq7Lp2Zr9Vt4"  # gitleaks:allow (fake)
+    P2 = "Mb8Nc1Kd6Hf3Jg5"  # gitleaks:allow (fake)
+    P3 = "Ws0YeR2uT8iO"  # gitleaks:allow (fake)
+    CRED = P1 + "/" + P2 + "/" + P3
+    # First two pieces reach 32 characters; the suffix cannot form its own window.
+    SPLIT = "Xq7Lp2Zr9Vt4/Mb8Nc1Kd6Hf3Jg5Ws0Ye/Ab3Xy9"  # gitleaks:allow (fake)
+    SPLIT_PIECES = ["Xq7Lp2Zr9Vt4", "Mb8Nc1Kd6Hf3Jg5Ws0Ye", "Ab3Xy9"]
+
+    def cases(self):
+        p1, p2, p3, cred = self.P1, self.P2, self.P3, self.CRED
+        return [
+            ("/tmp/" + cred, [p1, p2, p3]),
+            ("/tmp/." + cred, [p1, p2, p3]),
+            ("/tmp/Xq7Lp2Zr9Vt4/Mb8/Nc1Kd6Hf3Jg5/Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "Mb8", "Nc1Kd6Hf3Jg5", "Ws0YeR2uT8iO"]),
+            ("/tmp/" + cred + "/" + "A" * 100, [p1, p2, p3]),
+            ("/tmp/" + cred + "/" + "Ab" * 50, [p1, p2, p3]),
+            ("/tmp/" + "A" * 100 + "/" + cred, [p1, p2, p3]),
+            ("/tmp/ecc-check.Ab3Xy9/" + cred + "/file", [p1, p2, p3]),
+            ("/Users/dev/Xq7Lp2Zr9Vt4Mb8Nc1/Kd6Hf3Jg5Ws0YeR2u/x",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4Mb8Nc1", "Kd6Hf3Jg5Ws0YeR2u"]),
+            ("cwd=/private/var/" + cred, [p1, p2, p3]),
+            ("/tmp/" + self.SPLIT, self.SPLIT_PIECES),
+            ("/tmp/." + self.SPLIT, self.SPLIT_PIECES),
+            ("/tmp/ecc-check." + self.SPLIT, self.SPLIT_PIECES),
+            ("/tmp/ecc-check.Ab3Xy9/" + self.SPLIT + "/file", self.SPLIT_PIECES),
+            # A short piece at either end of the credential.
+            ("/tmp/Mb8/Xq7Lp2Zr9Vt4Ab/Nc1Kd6Hf3Jg5Ws",  # gitleaks:allow (fake)
+             ["Mb8", "Xq7Lp2Zr9Vt4Ab", "Nc1Kd6Hf3Jg5Ws"]),
+            ("/tmp/Xq7Lp2Zr9Vt4Ab/Nc1Kd6Hf3Jg5Ws/Mb8",  # gitleaks:allow (fake)
+             ["Mb8", "Xq7Lp2Zr9Vt4Ab", "Nc1Kd6Hf3Jg5Ws"]),
+            # Only the full three piece window is random enough.
+            ("/tmp/Ab1Ab1Ab1Ab1Ab1A/Cd2Cd2Cd2Cd2Cd2C/Ef3Gh4Ij5Kl6Mn7Op",  # gitleaks:allow (fake)
+             ["Ab1Ab1Ab1Ab1Ab1A", "Cd2Cd2Cd2Cd2Cd2C", "Ef3Gh4Ij5Kl6Mn7Op"]),
+            # A longer piece without mixed case between two strong pieces.
+            ("/tmp/Xq7Lp2Zr9Vt4/mb8n/Nc1Kd6Hf3Jg5Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "mb8n", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
+            ("/tmp/Xq7Lp2Zr9Vt4/MB8N/Nc1Kd6Hf3Jg5Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "MB8N", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
+            # A short random piece with a three letter run, and an empty piece.
+            ("/tmp/Xq7Lp2Zr9Vt4/aBcd/Nc1Kd6Hf3Jg5Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "aBcd", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
+            ("/tmp/Xq7Lp2Zr9Vt4Mb8Nc1//Kd6Hf3Jg5Ws0YeR2u",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4Mb8Nc1", "Kd6Hf3Jg5Ws0YeR2u"]),
+            # Base64 of 32 random bytes, split by its own "/".
+            ("/tmp/2hO0arregJtSPqotEn44Id/AWOsuvpVuIHBZJV3SO50=",  # gitleaks:allow (fake)
+             ["2hO0arregJtSPqotEn44Id", "AWOsuvpVuIHBZJV3SO50"]),
+        ]
+
+    def test_slash_split_credentials_are_caught(self):
+        for text, pieces in self.cases():
+            with self.subTest(text=text):
+                self.assertTrue(contains_secret(text))
+                for out in (Redactor().redact(text), redaction.redact_text(text)):
+                    for piece in pieces:
+                        self.assertNotIn(piece, out)
+                    self.assertIn(REDACTED, out)
+                kinds = [f["kind"] for f in redaction.inspection_findings([text])]
+                self.assertIn("high_entropy", kinds)
+
+    def test_benign_paths_stay_visible(self):
+        for text in ("/private/var/folders/6j/8_5x46rs3db2852wd7wb16v40000gn/T/tmpabc",
+                     "/private/var/folders/6j/8x5x46rs3db2852wd7wb16v40000gn/T/tmpAb3xY9z",
+                     "/var/folders/6j/8_5x46rs3db2852wd7wb16v40000gn/T/venv-oc/bin/python",
+                     "/Users/Dev1/Documents/GitHub/openclaw-ecc-orchestrator/.venv/bin/python3.11",
+                     "/Users/Dev1/Projects/Orchestrator2/build/tmpAb3xY9z/worktrees/unit-a",
+                     "/Users/JaneDoe/Documents/GitHub/MyProject2/src/main",
+                     "/tmp/ecc-check.Ab3Xy9/sub.Qm4Zt8/more.Wv7Kp2/xdg-state/openclaw-ecc-orchestrator",
+                     "/tmp/x/20261117T120000Z/20261117T130000Z/20261117T140000Z",
+                     "/home/user/.cache/pip/http/d/4/e/a/"
+                     "0123456789abcdef0123456789abcdef0123456789abcdef",
+                     # Root names are not credential pieces.
+                     "/tmp/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W",  # gitleaks:allow (fake)
+                     "/private/var/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W",  # gitleaks:allow (fake)
+                     "/usr/lib/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W/bin",  # gitleaks:allow (fake)
+                     # Acronym heavy directory names.
+                     "/Users/Dev1/GitHub/JSON2XML/CLI3/ARM64/SDK",
+                     "/opt/LLVM17/AArch64/X86/MCJIT/IR/SDKs/iOS17",
+                     "/tmp/x/20261117T120000Z/ab/20261117T130000Z/Ab3Xy9",
+                     "/Users/Dev1/GitHub/MyHTTP2Client/JSONParser4/XMLHttpRequest2/src"):
+            with self.subTest(text=text):
+                self.assertFalse(contains_secret(text))
+                self.assertEqual(Redactor().redact(text), text)
+                self.assertEqual(redaction.redact_text("cwd=" + text + " ok"), "cwd=" + text + " ok")
+                self.assertEqual(redaction.inspection_findings([text]), [])
+
+    def test_camel_case_repo_relative_path_stays_visible(self):
+        text = "see src/GitHub/MyHTTP2Client/JSONParser4/test.py now"
+        self.assertFalse(contains_secret(text))
+        self.assertEqual(redaction.redact_text(text), text)
+
 if __name__ == "__main__":
     unittest.main()
