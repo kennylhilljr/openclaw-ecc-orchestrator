@@ -125,21 +125,36 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 # two fillers in a row. A chain must start and end on a strong piece or on a
 # short piece that is not plain lowercase, so root names such as "tmp" never
 # join one. Every window of up to 8 pieces of a chain that reaches 32
-# characters is also judged, and when one is random the whole chain is
-# masked. Word like segments, segments with "-", "_" or ".", and two fillers
-# in a row end a chain, so temp, venv, repository and acronym heavy paths
-# such as /var/folders/6j/<id>/T/tmpabc or /opt/JSON2XML/CLI3 stay visible.
+# characters is also judged, and when one is random and changes character
+# class as often as base64 does, the whole chain is masked. Word like
+# segments, segments with "-", "_" or ".", and two fillers in a row end a
+# chain, so temp, venv, repository, CamelCase and acronym heavy paths such as
+# /var/folders/6j/<id>/T/tmpabc or /opt/JSON2XML/CLI3 stay visible.
 _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
 
 _PIECE_CHARS_RE = re.compile(r"[A-Za-z0-9+=]+")
-# Words inside a segment: runs of four or more letters in lowercase or
-# Capitalized form, and acronyms of three or more capitals, as in
-# "Documents", "MyHTTP2Client" or "JSONParser4". Shorter runs are common in
-# random base64 and do not count.
-_WORD_RUN_RE = re.compile(r"[A-Z][a-z]{3,}|[a-z]{4,}|[A-Z]{3,}(?![a-z])")
+_WORD_RUN_RE = re.compile(r"[a-z]{3,}")
 _CHAIN_MIN_LEN = 32
 _CHAIN_MAX_PIECES = 8
+# Random base64 changes between upper case, lower case and digits about every
+# 1.5 characters. CamelCase directory names such as GitHub/MyHTTP2Client/JSONParser4
+# keep one class for longer, so a window whose class runs average more than
+# this is not judged random.
+_CHAIN_MAX_MEAN_RUN = 2.0
+
+
+def _char_class(ch: str) -> str:
+    return "u" if ch.isupper() else "l" if ch.islower() else "d" if ch.isdigit() else "o"
+
+
+def _choppy(window: str) -> bool:
+    """True when character classes change as often as in random base64."""
+    text = window.replace("/", "")
+    if not text:
+        return False
+    runs = 1 + sum(_char_class(a) != _char_class(b) for a, b in zip(text, text[1:]))
+    return len(text) <= _CHAIN_MAX_MEAN_RUN * runs
 
 
 def _word_like(segment: str) -> bool:
@@ -207,15 +222,17 @@ def _chain_spans(m: "re.Match[str]", pieces: list[_Piece]) -> list[tuple[int, in
 
     Every window of 2 to _CHAIN_MAX_PIECES adjacent pieces that reaches the
     minimum length is judged, so padding before or after a credential cannot
-    dilute it. A random window masks its whole chain, so no piece of the
-    credential is left visible.
+    dilute it. A window must also be choppy (see _CHAIN_MAX_MEAN_RUN). A
+    random window masks its whole chain, so no piece of the credential is
+    left visible.
     """
     spans = []
     for chain in _chains(pieces):
-        if any(_is_high_entropy(m.string[chain[i].start:chain[j].end])
-               for i in range(len(chain))
-               for j in range(i + 1, min(len(chain), i + _CHAIN_MAX_PIECES))
-               if chain[j].end - chain[i].start >= _CHAIN_MIN_LEN):
+        windows = (m.string[chain[i].start:chain[j].end]
+                   for i in range(len(chain))
+                   for j in range(i + 1, min(len(chain), i + _CHAIN_MAX_PIECES))
+                   if chain[j].end - chain[i].start >= _CHAIN_MIN_LEN)
+        if any(_is_high_entropy(w) and _choppy(w) for w in windows):
             spans.append((chain[0].start, chain[-1].end))
     return spans
 

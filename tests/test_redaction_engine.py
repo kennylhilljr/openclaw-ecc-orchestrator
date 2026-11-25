@@ -465,6 +465,9 @@ class PathSegmentWindowTests(unittest.TestCase):
              ["Xq7Lp2Zr9Vt4", "aBcd", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
             ("/tmp/Xq7Lp2Zr9Vt4Mb8Nc1//Kd6Hf3Jg5Ws0YeR2u",  # gitleaks:allow (fake)
              ["Xq7Lp2Zr9Vt4Mb8Nc1", "Kd6Hf3Jg5Ws0YeR2u"]),
+            # Base64 of 32 random bytes, split by its own "/".
+            ("/tmp/2hO0arregJtSPqotEn44Id/AWOsuvpVuIHBZJV3SO50=",  # gitleaks:allow (fake)
+             ["2hO0arregJtSPqotEn44Id", "AWOsuvpVuIHBZJV3SO50"]),
         ]
 
     def test_slash_split_credentials_are_caught(self):
