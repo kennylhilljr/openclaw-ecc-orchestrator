@@ -455,6 +455,11 @@ class PathSegmentWindowTests(unittest.TestCase):
             # Only the full three piece window is random enough.
             ("/tmp/Ab1Ab1Ab1Ab1Ab1A/Cd2Cd2Cd2Cd2Cd2C/Ef3Gh4Ij5Kl6Mn7Op",  # gitleaks:allow (fake)
              ["Ab1Ab1Ab1Ab1Ab1A", "Cd2Cd2Cd2Cd2Cd2C", "Ef3Gh4Ij5Kl6Mn7Op"]),
+            # A longer piece without mixed case between two strong pieces.
+            ("/tmp/Xq7Lp2Zr9Vt4/mb8n/Nc1Kd6Hf3Jg5Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "mb8n", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
+            ("/tmp/Xq7Lp2Zr9Vt4/MB8N/Nc1Kd6Hf3Jg5Ws0YeR2uT8iO",  # gitleaks:allow (fake)
+             ["Xq7Lp2Zr9Vt4", "MB8N", "Nc1Kd6Hf3Jg5Ws0YeR2uT8iO"]),
         ]
 
     def test_slash_split_credentials_are_caught(self):
@@ -478,7 +483,15 @@ class PathSegmentWindowTests(unittest.TestCase):
                      "/tmp/ecc-check.Ab3Xy9/sub.Qm4Zt8/more.Wv7Kp2/xdg-state/openclaw-ecc-orchestrator",
                      "/tmp/x/20261117T120000Z/20261117T130000Z/20261117T140000Z",
                      "/home/user/.cache/pip/http/d/4/e/a/"
-                     "0123456789abcdef0123456789abcdef0123456789abcdef"):
+                     "0123456789abcdef0123456789abcdef0123456789abcdef",
+                     # Root names are not credential pieces.
+                     "/tmp/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W",  # gitleaks:allow (fake)
+                     "/private/var/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W",  # gitleaks:allow (fake)
+                     "/usr/lib/Xq7Lp2Zr9Vt4Mb8Nc1Kd6Hf3Jg5W/bin",  # gitleaks:allow (fake)
+                     # Acronym heavy directory names.
+                     "/Users/Dev1/GitHub/JSON2XML/CLI3/ARM64/SDK",
+                     "/opt/LLVM17/AArch64/X86/MCJIT/IR/SDKs/iOS17",
+                     "/tmp/x/20261117T120000Z/ab/20261117T130000Z/Ab3Xy9"):
             with self.subTest(text=text):
                 self.assertFalse(contains_secret(text))
                 self.assertEqual(Redactor().redact(text), text)

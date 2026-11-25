@@ -507,7 +507,7 @@ There is one engine, `handoffs.redaction`; `process.redact` re-exports it.
 | Covered | How |
 | :- | :- |
 | `sk-`, `sk-ant-`, `sk-or-`, `sk-proj-`, `gsk_`, `AIza`, `ghp_`, `gho_`, `github_pat_`, `glpat-`, `xox*`, `AKIA`, `ASIA`, `hf_`, JWTs, bearer credentials | prefix patterns |
-| long mixed case tokens | entropy rule (hex digests up to 64 characters are kept). Inside an absolute path under a common root (`/private/`, `/var/`, `/tmp/`, `/Users/`, `/home/` and similar), each path segment is judged on its own, so macOS temp paths such as `/private/var/folders/<x>/<id>/T/tmpXXXX` stay readable while a long random segment is still masked |
+| long mixed case tokens | entropy rule (hex digests up to 64 characters are kept). Inside an absolute path under a common root (`/private/`, `/var/`, `/tmp/`, `/Users/`, `/home/` and similar), each path segment is judged on its own, so macOS temp paths such as `/private/var/folders/<x>/<id>/T/tmpXXXX` stay readable while a long random segment is still masked. A credential with "/" in it is caught by also judging windows of adjacent random looking segments (mixed case base64 pieces joined by single short or non word pieces); a random window masks every piece of it, while word like, dotted, dashed and acronym heavy segments break a window |
 | provider account and key ids in error bodies (`org-<hex>`, `ak-<id>`) | prefix patterns |
 | `NAME=value`, `name: value`, JSON pairs with a secret looking name; `Authorization` headers; URL passwords | value rules that keep the name and mask the value |
 | private key blocks | masked whole inside one text; `StreamRedactor` masks every line from BEGIN through END when a key arrives line by line |

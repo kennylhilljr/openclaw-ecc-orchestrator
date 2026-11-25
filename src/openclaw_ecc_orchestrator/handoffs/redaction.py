@@ -119,12 +119,16 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 # reads as one random token and gets masked. A segment that is itself long
 # and random is still masked, and the credential prefix rules apply anywhere.
 # A standard base64 credential can contain "/", so its pieces may each be
-# shorter than 32 characters. Adjacent random looking segments (mixed case,
-# only base64 characters, not word like) and 1 to 3 character pieces, never
-# two short pieces in a row, form a chain. Every window of up to 8 pieces of
-# a chain that reaches 32 characters is also judged, and when one is random
-# the whole chain is masked. Word like segments and segments with "-", "_" or "." end a
-# chain, so temp, venv and repository paths stay visible.
+# shorter than 32 characters. Adjacent pieces made of base64 characters form
+# a chain: strong pieces (upper and lower case, not word like) joined by
+# filler pieces (1 to 3 characters, or other non word like base64 runs), never
+# two fillers in a row. A chain must start and end on a strong piece or on a
+# short piece that is not plain lowercase, so root names such as "tmp" never
+# join one. Every window of up to 8 pieces of a chain that reaches 32
+# characters is also judged, and when one is random the whole chain is
+# masked. Word like segments, segments with "-", "_" or ".", and two fillers
+# in a row end a chain, so temp, venv, repository and acronym heavy paths
+# such as /var/folders/6j/<id>/T/tmpabc or /opt/JSON2XML/CLI3 stay visible.
 _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
 
@@ -139,15 +143,28 @@ def _word_like(segment: str) -> bool:
 
 
 def _strong_piece(segment: str) -> bool:
-    """A path segment that may be part of a slash split random token."""
+    """A path segment that looks like a piece of a slash split random token."""
     return (len(segment) >= 4 and _PIECE_CHARS_RE.fullmatch(segment) is not None
             and re.search(r"[A-Z]", segment) is not None
-            and re.search(r"[a-z0-9]", segment) is not None
+            and re.search(r"[a-z]", segment) is not None
             and not _word_like(segment))
 
 
 def _short_piece(segment: str) -> bool:
     return 1 <= len(segment) <= 3 and _PIECE_CHARS_RE.fullmatch(segment) is not None
+
+
+def _filler_piece(segment: str) -> bool:
+    """A piece that may sit between strong pieces: short, or a base64 run
+    without the mixed case of a strong piece (such as "mb8n" or "MB8N")."""
+    if _short_piece(segment):
+        return True
+    return (len(segment) >= 4 and _PIECE_CHARS_RE.fullmatch(segment) is not None
+            and not _word_like(segment) and not _strong_piece(segment))
+
+
+def _chain_end(segment: str) -> bool:
+    return _strong_piece(segment) or (_short_piece(segment) and not segment.islower())
 
 
 class _Piece(NamedTuple):
@@ -157,26 +174,26 @@ class _Piece(NamedTuple):
 
 
 def _chains(pieces: list[_Piece]) -> list[list[_Piece]]:
-    """Maximal runs of strong and short pieces with no two short pieces in a
-    row, holding at least two pieces and at least one strong piece."""
-    chains: list[list[_Piece]] = []
-    current: list[_Piece] = []
-
-    def flush() -> None:
-        if len(current) >= 2 and any(_strong_piece(p.text) for p in current):
-            chains.append(list(current))
-        current.clear()
-
+    """Runs of strong pieces and single fillers, trimmed to start and end on
+    a chain end, holding at least two pieces and at least one strong piece."""
+    runs: list[list[_Piece]] = [[]]
     for piece in pieces:
         if _strong_piece(piece.text):
-            current.append(piece)
-        elif _short_piece(piece.text):
-            if current and _short_piece(current[-1].text):
-                flush()
-            current.append(piece)
+            runs[-1].append(piece)
+        elif _filler_piece(piece.text):
+            if runs[-1] and not _strong_piece(runs[-1][-1].text):
+                runs.append([])
+            runs[-1].append(piece)
         else:
-            flush()
-    flush()
+            runs.append([])
+    chains = []
+    for run in runs:
+        while run and not _chain_end(run[0].text):
+            run.pop(0)
+        while run and not _chain_end(run[-1].text):
+            run.pop()
+        if len(run) >= 2 and any(_strong_piece(p.text) for p in run):
+            chains.append(run)
     return chains
 
 
