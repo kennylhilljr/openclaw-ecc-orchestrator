@@ -148,6 +148,36 @@ class CheckScriptTest(unittest.TestCase):
         self.assertIn("PASS: secrets", result.stdout.splitlines())
         self.assertEqual(self.entries_for("gitleaks"), [])
 
+    def test_missing_gitleaks_fails_when_required(self):
+        self.write_stubs(["python3.11", "npm"])
+        result = self.run_check({"ECC_CHECK_REQUIRE_GITLEAKS": "1"})
+        out = result.stdout.splitlines()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL: secrets", out)
+        self.assertNotIn(SKIP_LINE, out)
+        self.assertNotIn("PASS: secrets", out)
+        self.assertIn("PASS: python", out)
+        self.assertIn("PASS: node", out)
+
+    def test_present_gitleaks_runs_when_required(self):
+        self.write_stubs(STUBS)
+        result = self.run_check({"ECC_CHECK_REQUIRE_GITLEAKS": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: secrets", result.stdout.splitlines())
+        self.assertEqual(len(self.entries_for("gitleaks")), 1)
+
+    def test_python_interpreter_override(self):
+        self.write_stubs(["npm", "gitleaks"])
+        alt = self.stub_dir / "python3.12"
+        alt.write_text(STUB_TEMPLATE.format(name="python3.12", env="STUB_PYTHON_EXIT"))
+        alt.chmod(0o755)
+        result = self.run_check({"ECC_CHECK_PYTHON": "python3.12"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (py,) = self.entries_for("python3.12")
+        self.assertEqual(py["args"], "-m unittest discover -s tests -t .")
+        self.assertEqual(py["pythonpath"], "src")
+        self.assertEqual(self.entries_for("python3.11"), [])
+
     def test_private_temp_folder(self):
         self.write_stubs(STUBS)
         parent_tmpdir = os.environ.get("TMPDIR", tempfile.gettempdir())
