@@ -133,9 +133,11 @@ _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/us
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
 
 _PIECE_CHARS_RE = re.compile(r"[A-Za-z0-9+=]+")
-# Words inside a segment: lowercase runs, Capitalized words and acronyms of
-# three or more capitals, as in "Documents", "MyHTTP2Client" or "JSONParser4".
-_WORD_RUN_RE = re.compile(r"[A-Z]?[a-z]{3,}|[A-Z]{3,}(?![a-z])")
+# Words inside a segment: runs of four or more letters in lowercase or
+# Capitalized form, and acronyms of three or more capitals, as in
+# "Documents", "MyHTTP2Client" or "JSONParser4". Shorter runs are common in
+# random base64 and do not count.
+_WORD_RUN_RE = re.compile(r"[A-Z][a-z]{3,}|[a-z]{4,}|[A-Z]{3,}(?![a-z])")
 _CHAIN_MIN_LEN = 32
 _CHAIN_MAX_PIECES = 8
 
@@ -157,16 +159,17 @@ def _short_piece(segment: str) -> bool:
 
 
 def _filler_piece(segment: str) -> bool:
-    """A piece that may sit between strong pieces: short, or a base64 run
-    without the mixed case of a strong piece (such as "mb8n" or "MB8N")."""
-    if _short_piece(segment):
+    """A piece that may sit between strong pieces: empty (from "//"), short,
+    or a base64 run without the mixed case of a strong piece ("mb8n", "MB8N")."""
+    if segment == "" or _short_piece(segment):
         return True
     return (len(segment) >= 4 and _PIECE_CHARS_RE.fullmatch(segment) is not None
             and not _word_like(segment) and not _strong_piece(segment))
 
 
 def _chain_end(segment: str) -> bool:
-    return _strong_piece(segment) or (_short_piece(segment) and not segment.islower())
+    return segment != "" and (_strong_piece(segment)
+                              or (_short_piece(segment) and not segment.islower()))
 
 
 class _Piece(NamedTuple):
