@@ -491,12 +491,18 @@ class PathSegmentWindowTests(unittest.TestCase):
                      # Acronym heavy directory names.
                      "/Users/Dev1/GitHub/JSON2XML/CLI3/ARM64/SDK",
                      "/opt/LLVM17/AArch64/X86/MCJIT/IR/SDKs/iOS17",
-                     "/tmp/x/20261117T120000Z/ab/20261117T130000Z/Ab3Xy9"):
+                     "/tmp/x/20261117T120000Z/ab/20261117T130000Z/Ab3Xy9",
+                     "/Users/Dev1/GitHub/MyHTTP2Client/JSONParser4/XMLHttpRequest2/src"):
             with self.subTest(text=text):
                 self.assertFalse(contains_secret(text))
                 self.assertEqual(Redactor().redact(text), text)
                 self.assertEqual(redaction.redact_text("cwd=" + text + " ok"), "cwd=" + text + " ok")
                 self.assertEqual(redaction.inspection_findings([text]), [])
+
+    def test_camel_case_repo_relative_path_stays_visible(self):
+        text = "see src/GitHub/MyHTTP2Client/JSONParser4/test.py now"
+        self.assertFalse(contains_secret(text))
+        self.assertEqual(redaction.redact_text(text), text)
 
 if __name__ == "__main__":
     unittest.main()

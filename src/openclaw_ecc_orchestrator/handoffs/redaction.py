@@ -133,7 +133,9 @@ _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/us
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
 
 _PIECE_CHARS_RE = re.compile(r"[A-Za-z0-9+=]+")
-_WORD_RUN_RE = re.compile(r"[a-z]{3,}")
+# Words inside a segment: lowercase runs, Capitalized words and acronyms of
+# three or more capitals, as in "Documents", "MyHTTP2Client" or "JSONParser4".
+_WORD_RUN_RE = re.compile(r"[A-Z]?[a-z]{3,}|[A-Z]{3,}(?![a-z])")
 _CHAIN_MIN_LEN = 32
 _CHAIN_MAX_PIECES = 8
 
