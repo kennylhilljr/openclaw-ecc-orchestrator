@@ -256,7 +256,7 @@ The plugin has its own Node suites. The contract suite runs the plugin's decisio
 (cd integrations/openclaw-plugin && npm test && npm run test:contract)
 ```
 
-`npm run test:integration` starts a disposable OpenClaw gateway and needs `openclaw` 2026.9.6 installed. `bin/roundtrip-smoke` runs a live round trip through a real OpenClaw gateway and the launchd inbox processor. Neither is automated: this repository has no CI workflow.
+`npm run test:integration` starts a disposable OpenClaw gateway and needs `openclaw` 2026.9.6 installed. `bin/roundtrip-smoke` runs a live round trip through a real OpenClaw gateway and the launchd inbox processor. Neither is automated: the CI workflow (`.github/workflows/ci.yml`) runs `scripts/check.sh`, which covers the Python tests, the plugin unit tests and the secret scan.
 
 Before opening a pull request, run `scripts/check.sh`, the one command that runs the Python tests, the plugin unit tests and the secret scan ([docs/ci.md](docs/ci.md) has the GitHub Actions workflow that runs it).
 
