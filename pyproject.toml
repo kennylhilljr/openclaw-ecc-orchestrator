@@ -1,6 +1,10 @@
 [project]
 name = "openclaw-ecc-orchestrator"
 version = "0.1.0"
+description = "Local orchestrator that runs coding agents in git worktrees with gates, approvals and a merge queue"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Kenny" }]
 requires-python = ">=3.11"
 dependencies = []
 

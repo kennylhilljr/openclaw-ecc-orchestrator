@@ -19,9 +19,11 @@ files in `docs/`.
 - `tests/`: Python tests, including `tests/adversarial/`.
 - `integrations/openclaw-plugin/`: the OpenClaw plugin, plain ESM with no
   dependencies and its own `README.md` and Node tests.
-- `.kimi-code/`: agent configuration installed by the ECC installer (see
-  `.kimi-code/ecc-install-state.json`). It is not part of this project's code;
-  do not edit it.
+- `.kimi-code/` and `.harnesskit/`: local agent configuration written by the
+  ECC installer and agent harnesses. They are not part of this project's code,
+  are listed in `.gitignore` and are not committed. To install the Kimi Code
+  configuration, run `npx -p ecc-universal@2.2.1 ecc-install --target kimi
+  --profile core` from the repository root.
 
 ## Setup
 
@@ -65,7 +67,10 @@ npm run test:contract
 `openclaw` installed; run it only when asked.
 
 Before opening a pull request, run `scripts/check.sh`, the one command that
-runs the Python tests, the plugin unit tests and the secret scan.
+runs the Python tests, the plugin unit tests and the secret scan. It runs the
+Python tests with `python3`, or with the interpreter named by `PYTHON`
+(for example `PYTHON=python3.12 scripts/check.sh`), and fails the Python step
+if that interpreter is older than 3.11.
 
 ## Conventions
 

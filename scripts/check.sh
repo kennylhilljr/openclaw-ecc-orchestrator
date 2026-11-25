@@ -25,8 +25,18 @@ report() {
   fi
 }
 
-PYTHONPATH=src python3.11 -m unittest discover -s tests -t .
-report python $?
+# PYTHON picks the interpreter; it must be 3.11 or later (pyproject.toml).
+python="${PYTHON:-python3}"
+if ! command -v "$python" >/dev/null 2>&1; then
+  echo "FAIL: Python interpreter '$python' not found, set PYTHON to Python 3.11 or later" >&2
+  report python 1
+elif ! "$python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+  echo "FAIL: '$python' is older than Python 3.11, set PYTHON to Python 3.11 or later" >&2
+  report python 1
+else
+  PYTHONPATH=src "$python" -m unittest discover -s tests -t .
+  report python $?
+fi
 
 (cd integrations/openclaw-plugin && npm test)
 report node $?

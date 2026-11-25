@@ -20,7 +20,7 @@ SKIP_LINE = (
 STUB_TEMPLATE = textwrap.dedent(
     """\
     #!/bin/sh
-    writable=no
+    {version_check}writable=no
     if [ -d "$TMPDIR" ]; then
       probe="$TMPDIR/stub-probe.$$"
       if : > "$probe" 2>/dev/null && rm "$probe"; then
@@ -32,12 +32,23 @@ STUB_TEMPLATE = textwrap.dedent(
     """
 )
 
+# The Python stub answers check.sh's version probe (`-c ...`) without logging,
+# exiting with STUB_PYTHON_VERSION_EXIT (0 means "3.11 or later").
+VERSION_CHECK = textwrap.dedent(
+    """\
+    if [ "$1" = "-c" ]; then
+      printf 'version-probe\\t%s\\n' "$0" >> "$STUB_LOG.probe"
+      exit "${STUB_PYTHON_VERSION_EXIT:-0}"
+    fi
+    """
+)
+
 STUBS = {
-    "python3.11": "STUB_PYTHON_EXIT",
+    "python3": "STUB_PYTHON_EXIT",
     "npm": "STUB_NPM_EXIT",
     "gitleaks": "STUB_GITLEAKS_EXIT",
 }
-CHECK_FOR_STUB = {"python3.11": "python", "npm": "node", "gitleaks": "secrets"}
+CHECK_FOR_STUB = {"python3": "python", "npm": "node", "gitleaks": "secrets"}
 
 
 class CheckScriptTest(unittest.TestCase):
@@ -51,9 +62,22 @@ class CheckScriptTest(unittest.TestCase):
 
     def write_stubs(self, names):
         for name in names:
-            path = self.stub_dir / name
-            path.write_text(STUB_TEMPLATE.format(name=name, env=STUBS[name]))
-            path.chmod(0o755)
+            self.write_stub(name, name, STUBS[name])
+
+    def write_stub(self, filename, name, env):
+        path = self.stub_dir / filename
+        check = VERSION_CHECK if env == "STUB_PYTHON_EXIT" else ""
+        path.write_text(
+            STUB_TEMPLATE.format(name=name, env=env, version_check=check)
+        )
+        path.chmod(0o755)
+
+    def probes(self):
+        probe_log = pathlib.Path(f"{self.log_path}.probe")
+        if not probe_log.exists():
+            return []
+        return [line.split("\t")[1] for line in probe_log.read_text().splitlines()]
+
 
     def run_check(self, extra_env=None):
         env = {
@@ -102,7 +126,7 @@ class CheckScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("OK", result.stdout.splitlines())
 
-        (py,) = self.entries_for("python3.11")
+        (py,) = self.entries_for("python3")
         self.assertEqual(py["args"], "-m unittest discover -s tests -t .")
         self.assertEqual(
             os.path.realpath(py["pwd"]), os.path.realpath(REPO_ROOT)
@@ -141,7 +165,7 @@ class CheckScriptTest(unittest.TestCase):
                 self.assert_tmpdirs_removed()
 
     def test_missing_gitleaks_is_skipped(self):
-        self.write_stubs(["python3.11", "npm"])
+        self.write_stubs(["python3", "npm"])
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(SKIP_LINE, result.stdout.splitlines())
@@ -154,7 +178,7 @@ class CheckScriptTest(unittest.TestCase):
 
         first = self.run_check({"TMPDIR": parent_tmpdir})
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        (py,) = self.entries_for("python3.11")
+        (py,) = self.entries_for("python3")
         self.assertTrue(py["tmpdir"].startswith("/tmp/ecc-check."), py)
         self.assertNotEqual(py["tmpdir"], parent_tmpdir)
         self.assertEqual(py["writable"], "yes")
@@ -162,7 +186,7 @@ class CheckScriptTest(unittest.TestCase):
         self.log_path.unlink()
         second = self.run_check()
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        (py2,) = self.entries_for("python3.11")
+        (py2,) = self.entries_for("python3")
         self.assertNotEqual(py2["tmpdir"], py["tmpdir"])
 
         self.log_path.unlink()
@@ -174,6 +198,43 @@ class CheckScriptTest(unittest.TestCase):
             self.assertTrue(entry["tmpdir"].startswith("/tmp/ecc-check."))
             self.assertEqual(entry["writable"], "yes")
         self.assert_tmpdirs_removed()
+
+    def test_default_interpreter_is_python3(self):
+        self.write_stubs(STUBS)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.probes(), [str(self.stub_dir / "python3")])
+        self.assertEqual(len(self.entries_for("python3")), 1)
+
+    def test_python_env_selects_interpreter(self):
+        self.write_stubs(["npm", "gitleaks"])
+        self.write_stub("python3.13", "python3.13", "STUB_PYTHON_EXIT")
+        result = self.run_check({"PYTHON": "python3.13"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (py,) = self.entries_for("python3.13")
+        self.assertEqual(py["args"], "-m unittest discover -s tests -t .")
+        self.assertEqual(py["pythonpath"], "src")
+
+    def test_old_python_fails_without_running_tests(self):
+        self.write_stubs(STUBS)
+        result = self.run_check({"STUB_PYTHON_VERSION_EXIT": "1"})
+        out = result.stdout.splitlines()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("older than Python 3.11", result.stderr)
+        self.assertIn("FAIL: python", out)
+        self.assertIn("PASS: node", out)
+        self.assertIn("PASS: secrets", out)
+        self.assertEqual(len(self.probes()), 1)
+        self.assertEqual(self.entries_for("python3"), [])
+
+    def test_missing_python_fails(self):
+        self.write_stubs(["npm", "gitleaks"])
+        result = self.run_check({"PYTHON": "no-such-python-xyz"})
+        out = result.stdout.splitlines()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("'no-such-python-xyz' not found", result.stderr)
+        self.assertIn("FAIL: python", out)
+        self.assertIn("PASS: node", out)
 
 
 if __name__ == "__main__":

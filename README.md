@@ -47,7 +47,7 @@ flowchart LR
 | [tests/](tests/) | `unittest` suite, including `tests/adversarial/` |
 | [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md) | Instructions for coding agents working on this repository |
 
-`.kimi-code/` holds agent configuration written by the ECC installer and is not part of this project's code.
+`.kimi-code/` and `.harnesskit/` hold local agent configuration written by the ECC installer and agent harnesses. They are not part of this project's code and are ignored by Git; `npx -p ecc-universal@2.2.1 ecc-install --target kimi --profile core`, run from the repository root, installs the Kimi Code configuration.
 
 The documentation in `docs/` goes deeper than this page:
 
@@ -258,7 +258,7 @@ The plugin has its own Node suites. The contract suite runs the plugin's decisio
 
 `npm run test:integration` starts a disposable OpenClaw gateway and needs `openclaw` 2026.9.6 installed. `bin/roundtrip-smoke` runs a live round trip through a real OpenClaw gateway and the launchd inbox processor. Neither is automated: this repository has no CI workflow.
 
-Before opening a pull request, run `scripts/check.sh`, the one command that runs the Python tests, the plugin unit tests and the secret scan ([docs/ci.md](docs/ci.md) has the GitHub Actions workflow that runs it).
+Before opening a pull request, run `scripts/check.sh`, the one command that runs the Python tests, the plugin unit tests and the secret scan. It uses `python3`, or the interpreter in `PYTHON` (`PYTHON=python3.12 scripts/check.sh`), and fails the Python step on anything older than 3.11 ([docs/ci.md](docs/ci.md) has the GitHub Actions workflow that runs it).
 
 ## Troubleshooting
 

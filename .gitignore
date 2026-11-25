@@ -11,3 +11,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .orchestration/runtime/
+
+# Agent configuration written by the ECC installer; reinstall it locally (see AGENTS.md).
+.kimi-code/
+.harnesskit/
