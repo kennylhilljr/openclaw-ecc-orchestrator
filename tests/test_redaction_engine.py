@@ -447,6 +447,14 @@ class PathSegmentWindowTests(unittest.TestCase):
             ("/tmp/." + self.SPLIT, self.SPLIT_PIECES),
             ("/tmp/ecc-check." + self.SPLIT, self.SPLIT_PIECES),
             ("/tmp/ecc-check.Ab3Xy9/" + self.SPLIT + "/file", self.SPLIT_PIECES),
+            # A short piece at either end of the credential.
+            ("/tmp/Mb8/Xq7Lp2Zr9Vt4Ab/Nc1Kd6Hf3Jg5Ws",  # gitleaks:allow (fake)
+             ["Mb8", "Xq7Lp2Zr9Vt4Ab", "Nc1Kd6Hf3Jg5Ws"]),
+            ("/tmp/Xq7Lp2Zr9Vt4Ab/Nc1Kd6Hf3Jg5Ws/Mb8",  # gitleaks:allow (fake)
+             ["Mb8", "Xq7Lp2Zr9Vt4Ab", "Nc1Kd6Hf3Jg5Ws"]),
+            # Only the full three piece window is random enough.
+            ("/tmp/Ab1Ab1Ab1Ab1Ab1A/Cd2Cd2Cd2Cd2Cd2C/Ef3Gh4Ij5Kl6Mn7Op",  # gitleaks:allow (fake)
+             ["Ab1Ab1Ab1Ab1Ab1A", "Cd2Cd2Cd2Cd2Cd2C", "Ef3Gh4Ij5Kl6Mn7Op"]),
         ]
 
     def test_slash_split_credentials_are_caught(self):

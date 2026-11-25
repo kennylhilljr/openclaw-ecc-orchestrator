@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 REDACTED = "[REDACTED]"
 MASK = REDACTED
@@ -120,10 +120,10 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 # and random is still masked, and the credential prefix rules apply anywhere.
 # A standard base64 credential can contain "/", so its pieces may each be
 # shorter than 32 characters. Adjacent random looking segments (mixed case,
-# only base64 characters, not word like, with at most one 1 to 3 character
-# piece between two longer ones) form a chain. Each short window of a chain
-# that reaches 32 characters is also judged, and when one is random the whole
-# chain is masked. Word like segments and segments with "-", "_" or "." end a
+# only base64 characters, not word like) and 1 to 3 character pieces, never
+# two short pieces in a row, form a chain. Every window of up to 8 pieces of
+# a chain that reaches 32 characters is also judged, and when one is random
+# the whole chain is masked. Word like segments and segments with "-", "_" or "." end a
 # chain, so temp, venv and repository paths stay visible.
 _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/usr/",
                "/Library/", "/Volumes/", "/System/", "/mnt/", "/root/", "/etc/")
@@ -131,6 +131,7 @@ _PATH_ROOTS = ("/private/", "/var/", "/tmp/", "/Users/", "/home/", "/opt/", "/us
 _PIECE_CHARS_RE = re.compile(r"[A-Za-z0-9+=]+")
 _WORD_RUN_RE = re.compile(r"[a-z]{3,}")
 _CHAIN_MIN_LEN = 32
+_CHAIN_MAX_PIECES = 8
 
 
 def _word_like(segment: str) -> bool:
@@ -149,51 +150,51 @@ def _short_piece(segment: str) -> bool:
     return 1 <= len(segment) <= 3 and _PIECE_CHARS_RE.fullmatch(segment) is not None
 
 
-def _chains(pieces: list[tuple[int, int, str]]) -> list[list[tuple[int, int, str]]]:
-    """Maximal runs that start and end on a strong piece, with no two short
-    pieces in a row and every short piece between two strong ones."""
-    chains: list[list[tuple[int, int, str]]] = []
-    current: list[tuple[int, int, str]] = []
-    pending: tuple[int, int, str] | None = None
-    for piece in pieces + [(0, 0, "")]:
-        segment = piece[2]
-        if _strong_piece(segment):
-            if pending is not None:
-                current.append(pending)
-                pending = None
+class _Piece(NamedTuple):
+    start: int
+    end: int
+    text: str
+
+
+def _chains(pieces: list[_Piece]) -> list[list[_Piece]]:
+    """Maximal runs of strong and short pieces with no two short pieces in a
+    row, holding at least two pieces and at least one strong piece."""
+    chains: list[list[_Piece]] = []
+    current: list[_Piece] = []
+
+    def flush() -> None:
+        if len(current) >= 2 and any(_strong_piece(p.text) for p in current):
+            chains.append(list(current))
+        current.clear()
+
+    for piece in pieces:
+        if _strong_piece(piece.text):
             current.append(piece)
-            continue
-        if _short_piece(segment) and current and pending is None:
-            pending = piece
-            continue
-        if len(current) >= 2:
-            chains.append(current)
-        current, pending = [], None
+        elif _short_piece(piece.text):
+            if current and _short_piece(current[-1].text):
+                flush()
+            current.append(piece)
+        else:
+            flush()
+    flush()
     return chains
 
 
-def _chain_spans(m: "re.Match[str]", pieces: list[tuple[int, int, str]]) -> list[tuple[int, int]]:
+def _chain_spans(m: "re.Match[str]", pieces: list[_Piece]) -> list[tuple[int, int]]:
     """Spans of chains holding a random window of at least 32 characters.
 
-    From each strong piece only the shortest window that reaches the minimum
-    length and ends on a strong piece is judged, so padding before or after a
-    credential cannot dilute it. A random window masks its whole chain, so no
-    piece of the credential is left visible.
+    Every window of 2 to _CHAIN_MAX_PIECES adjacent pieces that reaches the
+    minimum length is judged, so padding before or after a credential cannot
+    dilute it. A random window masks its whole chain, so no piece of the
+    credential is left visible.
     """
     spans = []
     for chain in _chains(pieces):
-        for i, first in enumerate(chain):
-            if not _strong_piece(first[2]):
-                continue
-            hit = False
-            for last in chain[i + 1:]:
-                if last[1] - first[0] < _CHAIN_MIN_LEN or not _strong_piece(last[2]):
-                    continue
-                hit = _is_high_entropy(m.string[first[0]:last[1]])
-                break
-            if hit:
-                spans.append((chain[0][0], chain[-1][1]))
-                break
+        if any(_is_high_entropy(m.string[chain[i].start:chain[j].end])
+               for i in range(len(chain))
+               for j in range(i + 1, min(len(chain), i + _CHAIN_MAX_PIECES))
+               if chain[j].end - chain[i].start >= _CHAIN_MIN_LEN):
+            spans.append((chain[0].start, chain[-1].end))
     return spans
 
 
@@ -299,7 +300,7 @@ def _entropy_spans(m: "re.Match[str]") -> list[tuple[int, int]]:
     for segment in token[start:].split("/"):
         if len(segment) >= 32 and _is_high_entropy(segment):
             spans.append((offset, offset + len(segment)))
-        pieces.append((offset, offset + len(segment), segment))
+        pieces.append(_Piece(offset, offset + len(segment), segment))
         offset += len(segment) + 1
     spans.extend(_chain_spans(m, pieces))
     return spans
